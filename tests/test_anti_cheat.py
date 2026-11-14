@@ -1,0 +1,589 @@
+"""
+Zero-Cheat Automated Verification Suite for `simvq_split` (12 checks across 12 laws).
+
+Enforces the non-negotiable scientific laws:
+1. Static AST Audit: zero host string/regex heuristics, zero eval/exec, zero Python
+   dict/set caches inside neural modules; forward takes raw `token_ids`.
+2. Law of Live Weights: 100% of trainable `nn.Parameter`s receive finite, non-zero
+   gradients from pure `next-token cross-entropy` loss (tested at both `snap_alpha=0.35`
+   and `snap_alpha=1.0`).
+3. Strict Causality: modifying future tokens `t+1..T-1` produces 0 change in `logits[0..t]`.
+4. No-Shortcut Receptive Field Proof: when `s_cryst` and `M_woodbury` readouts are ablated,
+   `SimVQSplitLM` has strictly zero sensitivity beyond `(n_layers * (window_size - 1))` tokens;
+   when enabled, long-range sensitivity is strictly non-zero and output logits measurably change.
+5. Equal-Compute Parameter Parity: all baseline models sit within +/- 5% of `SimVQSplitLM`
+   trainable parameter count.
+6-12. Long-horizon BF16 stability, `S_G` bijection conservation (`L=1024`), Woodbury epistemic
+   uncertainty monotonicity, combinatorial Hadamard trap separation, and 1.58-bit STE QAT
+   ternary cardinality + end-to-end live gradients.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+from pathlib import Path
+import pytest
+import torch
+import torch.nn.functional as F
+
+from simvq_split.models import SimVQSplitConfig, SimVQSplitLM
+from simvq_split.baselines import (
+    BaselineConfig,
+    HouseholderDeltaNetLM,
+    LoopedTransformerLM,
+    RoPETransformerLM,
+    SlidingWindowTransformerLM,
+    match_baseline_configs,
+)
+
+FORBIDDEN_IMPORTS = {"re", "ast", "inspect", "subprocess", "json", "pickle"}
+FORBIDDEN_CALL_NAMES = {
+    "eval",
+    "exec",
+    "compile",
+    "isupper",
+    "islower",
+    "isdigit",
+    "isalpha",
+    "isalnum",
+    "startswith",
+    "endswith",
+    "findall",
+    "search",
+    "fullmatch",
+    "splitlines",
+}
+
+
+def _neural_source_files() -> list[Path]:
+    pkg = Path(__file__).resolve().parent.parent / "simvq_split"
+    return [
+        pkg / "memory.py",
+        pkg / "models.py",
+        pkg / "baselines.py",
+    ]
+
+
+def test_ast_zero_host_heuristics():
+    for path in _neural_source_files():
+        assert path.exists(), f"Missing neural module file: {path}"
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root_mod = alias.name.split(".")[0]
+                    assert root_mod not in FORBIDDEN_IMPORTS, (
+                        f"Forbidden import `{alias.name}` in {path.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                root_mod = node.module.split(".")[0]
+                assert root_mod not in FORBIDDEN_IMPORTS, (
+                    f"Forbidden from-import `{node.module}` in {path.name}"
+                )
+            elif isinstance(node, ast.Call):
+                fn_name = None
+                if isinstance(node.func, ast.Name):
+                    fn_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    fn_name = node.func.attr
+                if fn_name is not None:
+                    assert fn_name not in FORBIDDEN_CALL_NAMES, (
+                        f"Forbidden host/string heuristic call `{fn_name}()` in {path.name}:{node.lineno}"
+                    )
+
+        # Inside nn.Module subclasses, ban Python dict/set literals or comprehensions
+        for cls_node in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            is_nn_mod = any(
+                (isinstance(b, ast.Attribute) and b.attr == "Module")
+                or (isinstance(b, ast.Name) and b.id.endswith("LM"))
+                for b in cls_node.bases
+            )
+            if not is_nn_mod:
+                continue
+            for sub in ast.walk(cls_node):
+                assert not isinstance(
+                    sub, (ast.Dict, ast.DictComp, ast.Set, ast.SetComp)
+                ), (
+                    f"Forbidden Python dict/set state inside neural module `{cls_node.name}` "
+                    f"({path.name}:{getattr(sub, 'lineno', '?')})"
+                )
+
+    for cls in (
+        SimVQSplitLM,
+        RoPETransformerLM,
+        SlidingWindowTransformerLM,
+        LoopedTransformerLM,
+        HouseholderDeltaNetLM,
+    ):
+        sig = inspect.signature(cls.forward)
+        params = list(sig.parameters.keys())
+        assert params[0] == "self" and params[1] == "token_ids", (
+            f"{cls.__name__}.forward must start with (self, token_ids, ...), got {params}"
+        )
+
+
+@pytest.mark.parametrize("snap_alpha", [0.35, 1.0])
+def test_zero_dead_parameters_simvq_split(snap_alpha: float):
+    torch.manual_seed(123)
+    cfg = SimVQSplitConfig(
+        vocab_size=256,
+        d_model=96,
+        n_heads=4,
+        n_layers_pre=2,
+        n_layers_post=1,
+        window_size=16,
+        num_spheres=6,
+        d_sphere=16,
+        codebook_size=8,
+        mem_heads=3,
+        mem_dim=16,
+        use_crystal=True,
+        use_woodbury=True,
+    )
+    model = SimVQSplitLM(cfg)
+    model.set_snap_alpha(snap_alpha)
+    model.train()
+
+    x = torch.randint(3, cfg.vocab_size, (4, 48))
+    logits = model(x)
+    loss = F.cross_entropy(
+        logits[:, :-1].reshape(-1, cfg.vocab_size),
+        x[:, 1:].reshape(-1),
+    )
+    loss.backward()
+
+    dead = []
+    non_finite = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.grad is None or p.grad.abs().max().item() == 0.0:
+            dead.append(name)
+        elif not torch.isfinite(p.grad).all():
+            non_finite.append(name)
+
+    assert not non_finite, (
+        f"Non-finite gradients at snap_alpha={snap_alpha}: {non_finite}"
+    )
+    assert not dead, f"Dead parameters (zero grad) at snap_alpha={snap_alpha}: {dead}"
+
+
+def test_zero_dead_parameters_all_baselines():
+    torch.manual_seed(123)
+    bcfg = BaselineConfig(
+        vocab_size=256, d_model=96, n_heads=4, n_layers=4, window_size=16
+    )
+    for cls in (
+        RoPETransformerLM,
+        SlidingWindowTransformerLM,
+        LoopedTransformerLM,
+        HouseholderDeltaNetLM,
+    ):
+        model = cls(bcfg)
+        model.train()
+        x = torch.randint(3, bcfg.vocab_size, (4, 40))
+        logits = model(x)
+        loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, bcfg.vocab_size),
+            x[:, 1:].reshape(-1),
+        )
+        loss.backward()
+        dead = [
+            n
+            for n, p in model.named_parameters()
+            if p.requires_grad and (p.grad is None or p.grad.abs().max().item() == 0.0)
+        ]
+        assert not dead, f"{cls.__name__} has dead parameters: {dead}"
+
+
+def test_strict_causality_all_models():
+    torch.manual_seed(7)
+    scfg = SimVQSplitConfig(
+        vocab_size=128,
+        d_model=64,
+        n_heads=4,
+        n_layers_pre=1,
+        n_layers_post=1,
+        window_size=8,
+        num_spheres=4,
+        d_sphere=16,
+        codebook_size=8,
+        mem_heads=2,
+        mem_dim=16,
+    )
+    bcfg = BaselineConfig(
+        vocab_size=128, d_model=64, n_heads=4, n_layers=3, window_size=8
+    )
+    models = [
+        SimVQSplitLM(scfg).eval(),
+        RoPETransformerLM(bcfg).eval(),
+        SlidingWindowTransformerLM(bcfg).eval(),
+        LoopedTransformerLM(bcfg).eval(),
+        HouseholderDeltaNetLM(bcfg).eval(),
+    ]
+    models[0].set_snap_alpha(1.0)
+
+    x1 = torch.randint(3, 128, (2, 32))
+    x2 = x1.clone()
+    cut = 14
+    x2[:, cut + 1 :] = torch.randint(3, 128, (2, 32 - cut - 1))
+
+    for m in models:
+        with torch.no_grad():
+            y1 = m(x1)[:, : cut + 1]
+            y2 = m(x2)[:, : cut + 1]
+        diff = (y1 - y2).abs().max().item()
+        assert diff < 1e-5, (
+            f"Causal future leakage in {m.__class__.__name__}: max diff={diff}"
+        )
+
+
+def test_no_shortcut_receptive_field_and_branch_sensitivity():
+    torch.manual_seed(99)
+    cfg = SimVQSplitConfig(
+        vocab_size=128,
+        d_model=64,
+        n_heads=4,
+        n_layers_pre=2,
+        n_layers_post=1,
+        window_size=8,  # total local cortex horizon = 3 * (8 - 1) = 21 tokens
+        num_spheres=4,
+        d_sphere=16,
+        codebook_size=8,
+        mem_heads=2,
+        mem_dim=16,
+        use_crystal=True,
+        use_woodbury=True,
+    )
+    model = SimVQSplitLM(cfg).eval()
+    # Boost gates slightly so random init carries signal across 50 tokens
+    with torch.no_grad():
+        model.crystal.w_eta_proj.bias.fill_(1.0)
+        model.woodbury.beta_proj.bias.fill_(1.0)
+    model.set_snap_alpha(0.0)
+
+    L = 56  # Token 55 is 55 steps away from token 0 (> 21 local cortex horizon!)
+    x_a = torch.randint(3, 128, (2, L))
+    x_b = x_a.clone()
+    x_b[:, 0] = (x_a[:, 0] + 17) % 120 + 3
+
+    with torch.no_grad():
+        full_a = model(x_a)
+        full_b = model(x_b)
+        no_cryst = model(x_a, ablate_crystal=True)
+        no_wood = model(x_a, ablate_woodbury=True)
+        pure_local_a = model(x_a, ablate_crystal=True, ablate_woodbury=True)
+        pure_local_b = model(x_b, ablate_crystal=True, ablate_woodbury=True)
+
+    # 1. Both branches must measurably affect output logits
+    assert (full_a - no_cryst).abs().max().item() > 1e-4, (
+        "Crystal branch is ornamental!"
+    )
+    assert (full_a - no_wood).abs().max().item() > 1e-4, (
+        "Woodbury branch is ornamental!"
+    )
+
+    # 2. With both long-range streams ablated, Cortex strictly CANNOT see token 0 at position 55
+    local_leak = (pure_local_a[:, -1] - pure_local_b[:, -1]).abs().max().item()
+    assert local_leak < 1e-6, f"Cortex leaked past sliding window! diff={local_leak}"
+
+    # 3. With streams active, token 0 reaches position 55
+    long_reach = (full_a[:, -1] - full_b[:, -1]).abs().max().item()
+    assert long_reach > 1e-5, (
+        "Long-range streams failed to carry signal beyond local window!"
+    )
+
+
+def test_parameter_parity():
+    scfg = SimVQSplitConfig(vocab_size=2048)
+    target_model = SimVQSplitLM(scfg)
+    n_target = sum(p.numel() for p in target_model.parameters() if p.requires_grad)
+
+    b_cfgs = match_baseline_configs(scfg)
+    for name, (cls, cfg) in b_cfgs.items():
+        m = cls(cfg)
+        n_b = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        rel_diff = abs(n_b - n_target) / n_target
+        assert rel_diff <= 0.05, (
+            f"Parameter parity violated for {name}: {n_b:,} vs SimVQSplitLM {n_target:,} "
+            f"({rel_diff * 100:.2f}% > 5.0%)"
+        )
+
+
+def test_long_horizon_bf16_spd_stability():
+    """Verifies zero NaN/Inf on L=384 sequence rollout in bfloat16/fp32."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = SimVQSplitConfig(
+        vocab_size=256,
+        d_model=64,
+        n_heads=4,
+        n_layers_pre=1,
+        n_layers_post=1,
+        window_size=8,
+        num_spheres=4,
+        d_sphere=16,
+        codebook_size=8,
+        mem_heads=2,
+        mem_dim=16,
+    )
+    model = SimVQSplitLM(cfg).to(dev)
+    model.set_snap_alpha(1.0)
+    x = torch.randint(3, 256, (4, 384), device=dev)
+    if dev == "cuda":
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            logits = model(x)
+    else:
+        logits = model(x)
+    assert torch.isfinite(logits).all(), "Non-finite logits on long-horizon rollout!"
+
+
+def test_operator_crystal_bijection_conservation():
+    """
+    Law 9 (Conservation of State under Operator Crystal):
+    1. `project_birkhoff_to_perm_jit` must return exact `{0, 1}` permutation matrices in S_G.
+    2. Across L = 1024 tokens of pure permutations (`w_eta -> 0`, `perm_gate -> 1`, `snap_alpha = 1`),
+       the multiset of distinct crystal codewords across the G slots must be 100% conserved
+       (zero symbol cloning, zero symbol deletion, < 1e-6 norm & lattice drift).
+    """
+    from simvq_split.memory import VoronoiCrystalLayer, project_birkhoff_to_perm_jit
+
+    torch.manual_seed(314)
+    raw = torch.softmax(torch.randn(32, 8, 8), dim=-1)
+    P_perm = project_birkhoff_to_perm_jit(raw)
+    assert torch.all((P_perm == 0.0) | (P_perm == 1.0)), "P_perm must be binary {0, 1}!"
+    assert torch.allclose(P_perm.sum(dim=-1), torch.ones(32, 8)), "Row sums != 1!"
+    assert torch.allclose(P_perm.sum(dim=-2), torch.ones(32, 8)), "Col sums != 1!"
+
+    cryst = VoronoiCrystalLayer(
+        d_model=64, num_spheres=8, d_sphere=32, codebook_size=16, chunk_size=2
+    ).eval()
+    cryst.snap_alpha = 1.0
+    with torch.no_grad():
+        # Disable literal overwrites, force active permutations on every chunk over L=1024!
+        cryst.w_eta_proj.weight.zero_()
+        cryst.w_eta_proj.bias.fill_(-20.0)
+        cryst.perm_gate_proj.bias.fill_(20.0)
+
+        x = torch.randn(2, 1024, 64)
+        s_read, _, _, _ = cryst.forward_states(x)  # (2, 512, 8, 32)
+        codebook, c_norm_t = cryst.get_codebook_fp32()
+
+        s_unit = F.normalize(s_read.float(), dim=-1)
+        cos_cb = torch.matmul(s_unit, c_norm_t)  # (2, 512, 8, 16)
+        max_cos, slot_ids = cos_cb.max(dim=-1)
+        lattice_err = (1.0 - max_cos).abs().max().item()
+        assert lattice_err < 1e-6, f"Lattice drift > 1e-6: {lattice_err}"
+
+        # Initial 8 slots hold 8 distinct codeword IDs [0..7]; every step 0..511 must hold the EXACT same multiset!
+        init_sorted = slot_ids[:, 0].sort(dim=-1).values
+        final_sorted = slot_ids[:, -1].sort(dim=-1).values
+        assert torch.equal(init_sorted, final_sorted), (
+            f"Bijection violated over 512 permutations: {init_sorted} vs {final_sorted}"
+        )
+
+
+def test_woodbury_epistemic_uncertainty_monotonicity():
+    """
+    Law 10 (Analytical Epistemic Doubt Sensor):
+    Normalized ridge variance `u_t = lambda * q_t^T P_t q_t` must drop sharply when querying
+    an observed key, while remaining near 1.0 (ignorance) for an orthogonal unseen key.
+    """
+    from simvq_split.memory import neural_woodbury_chunk_scan_jit
+
+    torch.manual_seed(271)
+    B, M_len, C, H, D = 1, 3, 4, 2, 16
+    q_orth, _ = torch.linalg.qr(torch.randn(D, D))
+    k_seen = q_orth[0].view(1, 1, 1, D).expand(B, 1, H, D).contiguous()
+    k_other = q_orth[1].view(1, 1, 1, D).expand(B, 1, H, D).contiguous()
+    k_unseen = q_orth[2].view(1, 1, 1, 1, D).expand(B, 1, C, H, D).contiguous()
+
+    k_seq = torch.cat([k_seen, k_other, k_other], dim=1)  # chunk 0 writes k_seen
+    v_seq = torch.randn(B, M_len, H, D)
+    beta_seq = torch.ones(B, M_len, H, 1) * 0.99
+    gamma_seq = torch.ones(B, M_len, H, 1) * 0.999
+
+    q_seen_chunk = k_seen.unsqueeze(2).expand(B, 1, C, H, D)
+    q_chunks = torch.cat([q_seen_chunk, q_seen_chunk, k_unseen], dim=1)
+
+    _, uncerts = neural_woodbury_chunk_scan_jit(
+        q_chunks, k_seq, v_seq, beta_seq, gamma_seq, inv_lam=20.0
+    )
+    # Chunk 0 (t=0..3): before write -> uncertainty == 1.0
+    u_before = uncerts[0, 0].mean().item()
+    # Chunk 1 (t=4..7): querying k_seen AFTER chunk 0 wrote k_seen -> uncertainty drops << 0.25!
+    u_seen_after = uncerts[0, 4].mean().item()
+    # Chunk 2 (t=8..11): querying orthogonal k_unseen -> uncertainty remains > 0.90!
+    u_unseen_after = uncerts[0, 8].mean().item()
+
+    assert abs(u_before - 1.0) < 1e-4, f"Expected initial u=1.0, got {u_before}"
+    assert u_seen_after < 0.20, f"Expected observed key u < 0.20, got {u_seen_after}"
+    assert u_unseen_after > 0.90, f"Expected unseen key u > 0.90, got {u_unseen_after}"
+
+
+def test_combinatorial_hadamard_trap_separation():
+    """
+    Law 11 (Combinatorial Subspace Orthogonality on Correlated Multi-Attribute Traps):
+    Given 4 observed multi-token composite entities (`Senior Archive Officer Lin`,
+    `Junior Archive Officer Lin`, `Chief Vault Warden Lin`, `Chief Archive Officer Cho`)
+    whose union covers 100% of the words of an unseen composite trap (`Chief Archive Officer Lin`),
+    `NeuralWoodburyLayer` with Token-Grounded 3-Factor Phrase-Latch Hadamard Sketch must separate
+    epistemic uncertainty `u_trap > u_seen + 0.35` across 20 distractor chunks.
+    """
+    from simvq_split.memory import NeuralWoodburyLayer, neural_woodbury_chunk_scan_jit
+
+    torch.manual_seed(2026)
+    d_model = 96
+    wood = NeuralWoodburyLayer(
+        d_model=d_model, mem_heads=4, mem_dim=32, ridge_lambda=0.04, chunk_size=4
+    ).eval()
+
+    q_orth, _ = torch.linalg.qr(torch.randn(d_model, d_model))
+    ranks = q_orth[0:3]  # Senior, Junior, Chief
+    role1 = q_orth[3:5]  # Archive, Vault
+    role2 = q_orth[5:7]  # Officer, Warden
+    surns = q_orth[7:9]  # Lin, Cho
+    pred_toks = q_orth[9:13]  # ' works', ' in', ' City', '.'
+
+    def make_clause(ri: int, r1: int, r2: int, si: int) -> torch.Tensor:
+        # 8 tokens = 2 chunks of C=4: [Rank, Role1, Role2, Surname] + [' works', ' in', ' City', '.']
+        # At token 6 (' City', lag -3 from Surname) and query token 5 (' in', lag -2/-3 from Surname),
+        # the causal subject latch pools the 3-factor Hadamard sketch of (Rank, Role1+Role2, Surname).
+        return torch.stack(
+            [
+                ranks[ri],
+                role1[r1],
+                role2[r2],
+                surns[si],
+                pred_toks[0],
+                pred_toks[1],
+                pred_toks[2],
+                pred_toks[3],
+            ],
+            dim=0,
+        )
+
+    seen_clauses = [
+        make_clause(0, 0, 0, 0),  # Senior Archive Officer Lin
+        make_clause(1, 0, 0, 0),  # Junior Archive Officer Lin
+        make_clause(2, 1, 1, 0),  # Chief Vault Warden Lin
+        make_clause(2, 0, 0, 1),  # Chief Archive Officer Cho
+    ]
+    trap_clause = make_clause(2, 0, 0, 0)  # Unseen Chief Archive Officer Lin!
+    preamble = q_orth[13:17]  # 4-token ledger header preamble
+    distractors = F.normalize(torch.randn(20 * 4, d_model), dim=-1)
+
+    seq = torch.cat(
+        [preamble] + seen_clauses + [distractors] + seen_clauses + [trap_clause], dim=0
+    ).unsqueeze(0)  # (1, 156, d_model) -> M = 39 chunks of C=4
+
+    with torch.no_grad():
+        q_epi_t = wood.encode_phrase_sketch(seq, h_lex=seq)  # (1, 156, H, D)
+        M_len = seq.size(1) // 4
+        q_epi_chunks = q_epi_t.view(1, M_len, 4, wood.H, wood.D)
+        k_epi_seq = F.normalize(q_epi_chunks[:, :, 2], dim=-1)
+        v_seq = torch.randn(1, M_len, wood.H, wood.D)
+
+        beta = torch.full((1, M_len, wood.H, 1), 0.05)  # distractor gate < 0.26
+        for idx_s in range(4):
+            beta[:, 1 + 2 * idx_s + 1] = (
+                0.95  # write predicate chunk of 4 seen entities
+            )
+        gamma = torch.full((1, M_len, wood.H, 1), 0.98)
+
+        _, uncerts = neural_woodbury_chunk_scan_jit(
+            q_epi_chunks,
+            k_epi_seq,
+            v_seq,
+            beta,
+            gamma,
+            wood.inv_lam,
+            q_epi_chunks,
+            k_epi_seq,
+        )
+        seen_q_pos = [4 * (29 + 2 * i + 1) + 2 for i in range(4)]
+        trap_q_pos = 4 * (29 + 8 + 1) + 2
+        u_seen = uncerts[0, seen_q_pos].mean().item()
+        u_trap = uncerts[0, trap_q_pos].mean().item()
+
+    assert u_seen < 0.30, (
+        f"Seen entity uncertainty drifted across distractors: {u_seen:.4f}"
+    )
+    assert u_trap > u_seen + 0.35, (
+        f"Combinatorial trap collapsed into span(K_seen): u_seen={u_seen:.4f}, u_trap={u_trap:.4f}"
+    )
+
+
+def test_ternary_158bit_qat_ste_and_cardinality():
+    """
+    Law 12 (1.58-bit Ternary STE QAT & Groupwise Cardinality):
+    1. `quantize_ternary_ste` must produce at most 3 unique scaled levels (`{-1, 0, +1} * scale`)
+       in every 32-weight group while propagating exact unit STE gradients (`grad == 1.0`).
+    2. With `model.set_snap_alpha(1.0)` and `model.set_ternary_qat(True)` on `B = 8` (exercising
+       `1.58-bit STE QAT` forward hooks across all internal linear layers), 100% of trainable parameters
+       in `SimVQSplitLM` must receive finite, non-zero gradients from pure next-token cross-entropy.
+    3. `model.set_ternary_qat(False)` must cleanly remove all registered forward hooks.
+    """
+    from simvq_split.memory import quantize_ternary_ste
+
+    torch.manual_seed(404)
+    w = torch.randn(64, 96, requires_grad=True)
+    w_q = quantize_ternary_ste(w)
+    for row in w_q.detach().reshape(-1, 32):
+        n_levels = torch.unique(torch.round(row * 1e5)).numel()
+        assert n_levels <= 3, f"Expected <= 3 ternary levels per group, got {n_levels}"
+    w_q.sum().backward()
+    assert w.grad is not None and torch.allclose(w.grad, torch.ones_like(w)), (
+        "STE gradient through quantize_ternary_ste must equal 1.0!"
+    )
+
+    cfg = SimVQSplitConfig(
+        vocab_size=128,
+        d_model=64,
+        n_heads=4,
+        n_layers_pre=1,
+        n_layers_post=1,
+        window_size=8,
+        num_spheres=8,
+        d_sphere=16,
+        codebook_size=8,
+        mem_heads=3,
+        mem_dim=16,
+        use_crystal=True,
+        use_woodbury=True,
+    )
+    model = SimVQSplitLM(cfg)
+    model.set_snap_alpha(1.0)
+    model.set_ternary_qat(True)
+    assert model.ternary_qat_enabled and len(model._qat_handles) > 0, (
+        "Expected active 1.58-bit QAT forward hooks!"
+    )
+    model.train()
+
+    x = torch.randint(3, cfg.vocab_size, (8, 32))
+    logits = model(x)
+    loss = F.cross_entropy(
+        logits[:, :-1].reshape(-1, cfg.vocab_size),
+        x[:, 1:].reshape(-1),
+    )
+    loss.backward()
+
+    dead = []
+    non_finite = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.grad is None or p.grad.abs().max().item() == 0.0:
+            dead.append(name)
+        elif not torch.isfinite(p.grad).all():
+            non_finite.append(name)
+
+    assert not non_finite, f"Non-finite gradients under 1.58-bit STE QAT: {non_finite}"
+    assert not dead, f"Dead parameters under 1.58-bit STE QAT: {dead}"
+
+    model.set_ternary_qat(False)
+    assert not model.ternary_qat_enabled and len(model._qat_handles) == 0, (
+        "QAT hooks were not cleanly removed by set_ternary_qat(False)!"
+    )

@@ -1,0 +1,42 @@
+# Python & pytest caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# Internal agent / IDE metadata & scratchpads
+.agents/
+.vscode/
+.idea/
+loop.ipynb
+TEST_INFRA.md
+TEST_READY.md
+comprehension_report.md
+consolidated_review_report.md
+critic_report.md
+implementation_readiness_report.md
+intermediate_zoom_out_report.md
+zoom_out_report.md
+
+# Personal chat exports, AI Studio exports & third-party papers
+*.pdf
+*.markdown
+из гугл коллаба.txt
+из чата.txt
+Анализ рекуррентной архитектуры и экспериментов.md
+
+# Redundant archive zip (unpacked data in benchmarks/arc_agi/ARC-AGI-master/ is tracked)
+benchmarks/arc_agi/arc_agi_master.zip
+
+# Heavy (>50 MB) legacy & auto-unpacked checkpoints (exceeding GitHub 50/100 MB thresholds;
+# c4_b0_a4_coprime_lock.pt and m_nl_transfer_ru_en_py.pt unpack automatically from simvq_champions_compact.pt.xz)
+checkpoints/v15_von_neumann_synthesizer.pt
+checkpoints/v16_compositional_repl_synthesizer.pt
+checkpoints/v14_external_tape_simvq.pt
+checkpoints/v13_turing_simvq.pt
+checkpoints/c4_b0_a4_coprime_lock.pt
+checkpoints/m_nl_transfer_ru_en_py.pt
