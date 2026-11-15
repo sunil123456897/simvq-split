@@ -9,7 +9,8 @@ venv/
 .env.*
 
 # Internal agent / IDE metadata & scratchpads
-.agents/
+.agents/*
+!.agents/skills/
 .vscode/
 .idea/
 loop.ipynb
@@ -40,3 +41,6 @@ checkpoints/v14_external_tape_simvq.pt
 checkpoints/v13_turing_simvq.pt
 checkpoints/c4_b0_a4_coprime_lock.pt
 checkpoints/m_nl_transfer_ru_en_py.pt
+
+# Auto-regenerated GSM8K slot feature cache (recomputed from checkpoints/simvq_split_tournament.pt)
+experiments/cram_gsm8k/checkpoints/simvq_gsm8k_slot_cache.npz

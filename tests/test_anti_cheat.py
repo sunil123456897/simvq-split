@@ -1,5 +1,5 @@
 """
-Zero-Cheat Automated Verification Suite for `simvq_split` (12 checks across 12 laws).
+Zero-Cheat Automated Verification Suite for `simvq_split` (15 checks across 15 laws).
 
 Enforces the non-negotiable scientific laws:
 1. Static AST Audit: zero host string/regex heuristics, zero eval/exec, zero Python
@@ -16,6 +16,12 @@ Enforces the non-negotiable scientific laws:
 6-12. Long-horizon BF16 stability, `S_G` bijection conservation (`L=1024`), Woodbury epistemic
    uncertainty monotonicity, combinatorial Hadamard trap separation, and 1.58-bit STE QAT
    ternary cardinality + end-to-end live gradients.
+13. Woodbury Long-Horizon SPD Spectrum (`L=2048`): exact symmetry and `0 < lambda_min <= lambda_max <= 1/lambda`
+    across both FP (`tern_gate=0.0`) and 1.58-bit ternary (`tern_gate=1.0`) modes.
+14. Crystal Positive Identity Well (`Calcite-5`): `well_scale=1.0` increases distractor self-agreement
+    and shrinks spurious `||T_swap - I||_F` relative to `well_scale=0.0` while preserving live gradients on `id_well_logit`.
+15. Packed `uint8` `2-bit T-MAC LUT` Physical Inference: exact `uint8` encoding, `16.0x` matrix
+   compression vs FP32, zero quantized `nn.Linear` layers outside `lm_head`, and `< 5e-3` logit parity.
 """
 
 from __future__ import annotations
@@ -59,6 +65,9 @@ FORBIDDEN_CALL_NAMES = {
 def _neural_source_files() -> list[Path]:
     pkg = Path(__file__).resolve().parent.parent / "simvq_split"
     return [
+        pkg / "quant_lut.py",
+        pkg / "crystal.py",
+        pkg / "woodbury.py",
         pkg / "memory.py",
         pkg / "models.py",
         pkg / "baselines.py",
@@ -586,4 +595,179 @@ def test_ternary_158bit_qat_ste_and_cardinality():
     model.set_ternary_qat(False)
     assert not model.ternary_qat_enabled and len(model._qat_handles) == 0, (
         "QAT hooks were not cleanly removed by set_ternary_qat(False)!"
+    )
+
+
+def test_woodbury_long_horizon_spd_spectrum():
+    """
+    Law 13 (Woodbury Long-Horizon SPD Spectrum on L=2048):
+    Under mixed writes `beta in [0.05, 0.98]` and active forgetting `gamma in [0.65, 0.99]`
+    across `M = 512` chunks (`L = 2048`), the precision matrix `P_t` must remain strictly symmetric
+    (`< 1e-5`) and bounded in spectrum `0 < min_eig <= max_eig <= inv_lam + 1e-4` for both
+    `tern_gate = 0.0` (FP) and `tern_gate = 1.0` (1.58-bit active-forget blend).
+    """
+    from simvq_split.memory import inspect_woodbury_spd_spectrum
+
+    torch.manual_seed(1313)
+    B, M_len, H, d_k = 2, 512, 4, 32
+    inv_lam = 25.0
+    k_raw = torch.randn(B, M_len, H, d_k)
+    k_epi = F.normalize(k_raw, dim=-1)
+
+    m_idx = torch.arange(M_len).view(1, M_len, 1, 1)
+    beta = torch.where(
+        (m_idx % 7) == 0,
+        torch.full((B, M_len, H, 1), 0.92),
+        torch.full((B, M_len, H, 1), 0.05) + 0.15 * ((m_idx % 11) == 0).float(),
+    )
+    beta[:, ::19] = 0.98
+    gamma = torch.where(
+        (m_idx % 5) == 0,
+        torch.full((B, M_len, H, 1), 0.65),
+        torch.full((B, M_len, H, 1), 0.99),
+    )
+
+    for t_gate in (0.0, 1.0):
+        min_eig, max_eig, max_sym_err = inspect_woodbury_spd_spectrum(
+            k_epi, beta, gamma, inv_lam=inv_lam, sample_every=32, tern_gate=t_gate
+        )
+        assert max_sym_err < 1e-5, (
+            f"Precision matrix lost symmetry at tern_gate={t_gate}: {max_sym_err:.2e}"
+        )
+        assert min_eig > 0.0, (
+            f"Precision matrix became non-SPD at tern_gate={t_gate}: min_eig={min_eig:.3e}"
+        )
+        assert max_eig <= inv_lam + 1e-4, (
+            f"Precision matrix exceeded prior upper bound 1/lam={inv_lam} at tern_gate={t_gate}: "
+            f"max_eig={max_eig:.6f}"
+        )
+
+
+def test_crystal_positive_identity_well_distractor_shield():
+    """
+    Law 14 (Crystal Positive Identity Well `id_well > 0` on Distractors):
+    On noisy single-slot distractor logits, enabling `well_scale=1.0` must strictly
+    increase self-consistency `(pa * pb).sum(-1)` and decrease spurious `||T_swap - I||_F`
+    relative to `well_scale=0.0`, while keeping live gradients on `perm_gate_proj.bias`.
+    """
+    from simvq_split.memory import VoronoiCrystalLayer
+
+    torch.manual_seed(1414)
+    cryst = VoronoiCrystalLayer(d_model=64, num_spheres=8, d_sphere=16, codebook_size=8)
+    B, M_len, H, Gh = 2, 6, cryst.H, cryst.G_h
+    eye = cryst.eye_Gh.float().view(1, 1, 1, Gh, Gh)
+
+    psi_a = torch.full((B, M_len, H, Gh), -1.0)
+    psi_b = torch.full((B, M_len, H, Gh), -1.0)
+    psi_a[..., 1] = 4.0
+    psi_b[..., 1] = 1.15
+    psi_b[..., 2] = 0.95
+
+    pa_off, pb_off, t_off = cryst._compute_ptr_swap(psi_a, psi_b, well_scale=0.0)
+    pa_on, pb_on, t_on = cryst._compute_ptr_swap(psi_a, psi_b, well_scale=1.0)
+
+    agree_off = (pa_off * pb_off).sum(dim=-1).mean().item()
+    agree_on = (pa_on * pb_on).sum(dim=-1).mean().item()
+    dev_off = (t_off - eye).pow(2).sum(dim=(-1, -2)).sqrt().mean().item()
+    dev_on = (t_on - eye).pow(2).sum(dim=(-1, -2)).sqrt().mean().item()
+
+    assert agree_on > agree_off + 0.05, (
+        f"Identity well failed to strengthen self-agreement: off={agree_off:.4f}, on={agree_on:.4f}"
+    )
+    assert dev_on < dev_off - 0.05, (
+        f"Identity well failed to reduce distractor ||T_swap - I||_F: off={dev_off:.4f}, on={dev_on:.4f}"
+    )
+
+    cryst.zero_grad()
+    t_on.pow(2).sum().backward()
+    assert (
+        cryst.perm_gate_proj.bias.grad is not None
+        and torch.isfinite(cryst.perm_gate_proj.bias.grad).all()
+        and cryst.perm_gate_proj.bias.grad.abs().max().item() > 0.0
+    ), "perm_gate_proj.bias received zero or non-finite direct _compute_ptr_swap gradient!"
+
+    cryst.zero_grad()
+    cryst.train()
+    cryst.snap_alpha = 1.0
+    cryst.qat_active_mix = 1.0
+    x = torch.randn(2, 24, 64, requires_grad=True)
+    y = cryst(x)
+    y.pow(2).sum().backward()
+    assert (
+        cryst.perm_gate_proj.bias.grad is not None
+        and torch.isfinite(cryst.perm_gate_proj.bias.grad).all()
+        and cryst.perm_gate_proj.bias.grad.abs().max().item() > 0.0
+    ), "perm_gate_proj.bias received zero or non-finite end-to-end gradient!"
+
+
+def test_packed_uint8_2bit_tmac_lut_equivalence_and_compression():
+    """
+    Law 15 (Packed `uint8` `2-bit T-MAC LUT` Physical Inference & 16x Compression):
+    Quantizes `SimVQSplitLM` weights with `quantize_ternary_weights_ls`, packs every
+    non-`lm_head` linear layer via `pack_model_2bit_lut`, and asserts:
+    1. All packed weight buffers use `torch.uint8` with exact `16.0x` matrix compression vs FP32.
+    2. Zero `nn.Linear` submodules remain except tied `lm_head`.
+    3. Logits from addition/subtraction-only `PackedLUT2BitLinear` match FP32-ternary
+       reference logits within `max_abs_diff < 5e-3`.
+    """
+    import torch.nn as nn
+    from simvq_split.memory import (
+        PackedLUT2BitLinear,
+        compute_2bit_lut_footprint,
+        pack_model_2bit_lut,
+        quantize_ternary_weights_ls,
+    )
+
+    torch.manual_seed(1515)
+    cfg = SimVQSplitConfig(
+        vocab_size=128,
+        d_model=160,
+        n_heads=4,
+        n_layers_pre=2,
+        n_layers_post=1,
+        window_size=12,
+        num_spheres=24,
+        d_sphere=16,
+        codebook_size=16,
+        mem_heads=5,
+        mem_dim=32,
+        use_crystal=True,
+        use_woodbury=True,
+    )
+    model = SimVQSplitLM(cfg)
+    model.eval()
+    model.set_snap_alpha(1.0)
+    with torch.no_grad():
+        for mod in model.modules():
+            if isinstance(mod, nn.Linear) and mod is not model.lm_head:
+                w_q, _, _ = quantize_ternary_weights_ls(mod.weight.data)
+                mod.weight.data.copy_(w_q)
+
+    lut_model = pack_model_2bit_lut(model)
+    remaining_linear = [
+        m
+        for m in lut_model.modules()
+        if isinstance(m, nn.Linear) and m is not lut_model.lm_head
+    ]
+    assert not remaining_linear, "Found unpacked nn.Linear modules outside lm_head!"
+
+    packed_layers = [
+        m for m in lut_model.modules() if isinstance(m, PackedLUT2BitLinear)
+    ]
+    assert len(packed_layers) > 0
+    for pl in packed_layers:
+        assert pl.packed_u8.dtype == torch.uint8, f"Expected uint8 buffer, got {pl.packed_u8.dtype}"
+
+    fp = compute_2bit_lut_footprint(lut_model)
+    assert abs(fp["matrix_compression_vs_fp32"] - 16.0) < 1e-3, (
+        f"Expected 16.0x matrix compression vs FP32, got {fp['matrix_compression_vs_fp32']}"
+    )
+
+    x = torch.randint(3, cfg.vocab_size, (4, 32))
+    with torch.no_grad():
+        logits_ref = model(x)
+        logits_lut = lut_model(x)
+    max_diff = (logits_ref - logits_lut).abs().max().item()
+    assert max_diff < 5e-3, (
+        f"Packed T-MAC uint8 LUT logits diverged from ternary reference: max_abs_diff={max_diff:.5f}"
     )

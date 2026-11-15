@@ -26,13 +26,21 @@ from .memory import (
 )
 
 
-def _ternary_qat_forward_hook(
-    mod: nn.Module, inputs: tuple, _output: torch.Tensor
-) -> torch.Tensor:
-    x = inputs[0]
-    w_q = quantize_ternary_ste(mod.weight).to(x.dtype)
-    b = mod.bias.to(x.dtype) if mod.bias is not None else None
-    return F.linear(x, w_q, b)
+def _make_ternary_qat_hook(parent_model: nn.Module):
+    def _ternary_qat_forward_hook(
+        mod: nn.Module, inputs: tuple, _output: torch.Tensor
+    ) -> torch.Tensor:
+        x = inputs[0]
+        mix = float(getattr(parent_model, "qat_mix", 1.0))
+        w_tern = quantize_ternary_ste(mod.weight)
+        if mix < 0.9999:
+            w_q = ((1.0 - mix) * mod.weight + mix * w_tern).to(x.dtype)
+        else:
+            w_q = w_tern.to(x.dtype)
+        b = mod.bias.to(x.dtype) if mod.bias is not None else None
+        return F.linear(x, w_q, b)
+
+    return _ternary_qat_forward_hook
 
 
 def _configure_model_ternary_qat(
@@ -42,9 +50,10 @@ def _configure_model_ternary_qat(
         h.remove()
     handles.clear()
     if enabled:
+        hook_fn = _make_ternary_qat_hook(model)
         for _, mod in model.named_modules():
             if isinstance(mod, nn.Linear) and mod is not model.lm_head:
-                handles.append(mod.register_forward_hook(_ternary_qat_forward_hook))
+                handles.append(mod.register_forward_hook(hook_fn))
 
 
 @dataclass
@@ -84,7 +93,10 @@ class SimVQSplitLM(nn.Module):
         self.cortex_pre = nn.ModuleList(
             [
                 TransformerBlock(
-                    cfg.d_model, cfg.n_heads, d_ff, window_size=cfg.window_size
+                    cfg.d_model,
+                    cfg.n_heads,
+                    d_ff,
+                    window_size=cfg.window_size,
                 )
                 for _ in range(cfg.n_layers_pre)
             ]
@@ -112,15 +124,15 @@ class SimVQSplitLM(nn.Module):
             if cfg.use_woodbury
             else None
         )
-        # Learned token-level stream gate preventing early random Crystal outputs from polluting Woodbury/prose
-        self.stream_gate = (
-            nn.Linear(cfg.d_model, 2, bias=True)
-            if (cfg.use_crystal and cfg.use_woodbury)
-            else None
-        )
-        if self.stream_gate is not None:
+        if cfg.use_crystal and cfg.use_woodbury:
+            self.stream_gate = nn.Linear(cfg.d_model, 2, bias=True)
             with torch.no_grad():
                 self.stream_gate.bias.copy_(torch.tensor([-1.8, 0.4]))
+        elif cfg.use_crystal:
+            self.stream_gate = nn.Linear(cfg.d_model, 1, bias=True)
+            nn.init.constant_(self.stream_gate.bias, -2.2)
+        else:
+            self.stream_gate = None
 
         self.mid_mlp_norm = RMSNorm(cfg.d_model)
         self.mid_mlp = SwiGLU(cfg.d_model, d_ff)
@@ -138,18 +150,21 @@ class SimVQSplitLM(nn.Module):
             else None
         )
         self.cryst2_gate = (
-            nn.Linear(cfg.d_model, 1, bias=True)
-            if (cfg.use_crystal and cfg.use_woodbury)
-            else None
+            nn.Linear(cfg.d_model, 1, bias=True) if cfg.use_crystal else None
         )
         if self.cryst2_gate is not None:
-            nn.init.constant_(self.cryst2_gate.bias, -1.8)
+            nn.init.constant_(
+                self.cryst2_gate.bias, -1.8 if cfg.use_woodbury else -2.2
+            )
 
         # Upper Continuous Cortex: strictly local window W composing retrieved state into fluent prose
         self.cortex_post = nn.ModuleList(
             [
                 TransformerBlock(
-                    cfg.d_model, cfg.n_heads, d_ff, window_size=cfg.window_size
+                    cfg.d_model,
+                    cfg.n_heads,
+                    d_ff,
+                    window_size=cfg.window_size,
                 )
                 for _ in range(cfg.n_layers_post)
             ]
@@ -160,12 +175,24 @@ class SimVQSplitLM(nn.Module):
         self.lm_head.weight = self.tok_emb.weight
         self._qat_handles: list = []
         self.ternary_qat_enabled: bool = False
+        self.qat_mix: float = 1.0
 
     def set_snap_alpha(self, alpha: float) -> None:
         if self.crystal is not None:
             self.crystal.snap_alpha = float(alpha)
         if self.crystal_2 is not None:
             self.crystal_2.snap_alpha = float(alpha)
+
+    def set_qat_mix(self, mix: float) -> None:
+        m = float(max(0.0, min(1.0, mix)))
+        self.qat_mix = m
+        act = m if self.ternary_qat_enabled else 0.0
+        if self.woodbury is not None:
+            self.woodbury.qat_active_mix = act
+        if self.crystal is not None:
+            self.crystal.qat_active_mix = act
+        if self.crystal_2 is not None:
+            self.crystal_2.qat_active_mix = act
 
     def set_crystal_schedule(self, step: int, total_steps: int) -> None:
         frac = float(step) / float(max(1, total_steps))
@@ -186,6 +213,13 @@ class SimVQSplitLM(nn.Module):
         flag = bool(enabled)
         self.ternary_qat_enabled = flag
         _configure_model_ternary_qat(self, self._qat_handles, flag)
+        act = float(self.qat_mix) if flag else 0.0
+        if self.woodbury is not None:
+            self.woodbury.qat_active_mix = act
+        if self.crystal is not None:
+            self.crystal.qat_active_mix = act
+        if self.crystal_2 is not None:
+            self.crystal_2.qat_active_mix = act
 
     def get_commitment_loss(self) -> torch.Tensor:
         loss = torch.tensor(0.0, device=self.tok_emb.weight.device)
@@ -223,7 +257,10 @@ class SimVQSplitLM(nn.Module):
             delta_long = gates[..., 0:1] * c_out + gates[..., 1:2] * w_out
         else:
             if self.crystal is not None and not ablate_crystal:
-                delta_long = delta_long + self.crystal(h_split, h_lex=e_tok)
+                c_out = self.crystal(h_split, h_lex=e_tok)
+                if self.stream_gate is not None and self.woodbury is None:
+                    c_out = (2.0 * torch.sigmoid(self.stream_gate(h_split))) * c_out
+                delta_long = delta_long + c_out
             if self.woodbury is not None and not ablate_woodbury:
                 delta_long = delta_long + self.woodbury(h_split, h_lex=e_tok)
 
@@ -236,10 +273,8 @@ class SimVQSplitLM(nn.Module):
         ):
             c2_in = self.cryst2_norm(h)
             c2_out = self.crystal_2(c2_in, h_lex=e_tok)
-            if (
-                self.cryst2_gate is not None
-                and self.woodbury is not None
-                and not ablate_woodbury
+            if self.cryst2_gate is not None and (
+                self.woodbury is None or not ablate_woodbury
             ):
                 c2_out = (2.0 * torch.sigmoid(self.cryst2_gate(c2_in))) * c2_out
             h = h + c2_out

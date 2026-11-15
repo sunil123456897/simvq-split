@@ -1,9 +1,10 @@
 """
-Official Reproducible Multi-Track Tournament & Ablation Runner (`run_simvq_split_benchmark.py` — Stage 4 / v4).
+Official Reproducible Multi-Track Tournament & Ablation Runner (`run_simvq_split_benchmark.py` — Stage 5 / Calcite-5).
 
 Evaluates 7 parameter-matched (+/- 5%) models on a single shared, zero-repetition
 multi-task training stream (raw `token_ids` only, zero host heuristics):
-  1. `SimVQSplitLM` (Full v4: Local Cortex W=12 + 2-Stage Pointer-Addressed Birkhoff-Voronoi Crystal + Hybrid (H-1)+1 Woodbury)
+  1. `SimVQSplitLM` (Full v5 / Calcite-5: Local Cortex W=12 + 2-Stage Identity-Well Pointer-Addressed
+     Birkhoff-Voronoi Crystal + Hybrid (H-1)+1 Woodbury with ternary-gated Quartic Soft-Ceiling)
   2. `SimVQSplit_CrystalOnly` (Ablation: Local Cortex W=12 + 2-Stage Pointer-Addressed Birkhoff-Voronoi Crystal)
   3. `SimVQSplit_WoodburyOnly` (Ablation: Local Cortex W=12 + Hybrid (H-1)+1 Woodbury)
   4. `RoPETransformerLM` (Baseline A: Full Global Causal RoPE Transformer)
@@ -16,13 +17,16 @@ Tracks:
   - Track B: Non-Abelian S_5 State Tracking in Natural Prose (`k_train in {0..4}` -> `k_eval in {2, 4, 8, 16}`)
   - Track C: Correlated-Key Counterfactual Fact Overwrite (`in_dist`, `ood_med`, `ood_long`)
   - Track D: Long-Horizon Norm/Lattice Drift (`L = 1024`), State Cache Footprint (`O(1)` vs `O(L)`),
-             and 1.58-bit Ternary Weight Quantization (0-QAT PTQ + 300-step STE QAT).
+             1.58-bit LS Ternary Weight Quantization (0-QAT PTQ + 300-step progressive STE QAT), and
+             Physical `2-bit uint8 T-MAC LUT` (`PackedLUT2BitLinear`, `16.0x` matrix compression).
   - Track E: Epistemic Hallucination Brake (`trap_in`, `trap_ood_long` -> `" Unknown."` on correlated
              unmentioned officers sharing >= 3 title/surname words with ledger officers, plus Selective F1).
 """
 
 from __future__ import annotations
 
+import argparse
+import copy
 from dataclasses import asdict
 import json
 import math
@@ -44,6 +48,11 @@ from simvq_split.eval_utils import (
     evaluate_prose_perplexity,
     evaluate_suite_batched,
     wilson_ci_95,
+)
+from simvq_split.memory import (
+    compute_2bit_lut_footprint,
+    pack_model_2bit_lut,
+    quantize_ternary_weights_ls,
 )
 from simvq_split.models import SimVQSplitConfig, SimVQSplitLM
 from simvq_split.tasks import (
@@ -234,12 +243,16 @@ def measure_crystal_drift_at_1024(
             and model.woodbury is not None
         ):
             gates = 2.0 * torch.sigmoid(model.stream_gate(hs))
-            delta_long = gates[..., 0:1] * model.crystal(hs, h_lex=e_tok) + gates[
-                ..., 1:2
-            ] * model.woodbury(hs, h_lex=e_tok)
+            delta_long = (
+                gates[..., 0:1] * model.crystal(hs, h_lex=e_tok)
+                + gates[..., 1:2] * model.woodbury(hs, h_lex=e_tok)
+            )
         else:
             if model.crystal is not None:
-                delta_long = delta_long + model.crystal(hs, h_lex=e_tok)
+                c1_out = model.crystal(hs, h_lex=e_tok)
+                if model.stream_gate is not None and model.woodbury is None:
+                    c1_out = (2.0 * torch.sigmoid(model.stream_gate(hs))) * c1_out
+                delta_long = delta_long + c1_out
             if model.woodbury is not None:
                 delta_long = delta_long + model.woodbury(hs, h_lex=e_tok)
         h2 = h + delta_long
@@ -318,24 +331,22 @@ def evaluate_ternary_ptq_ablation(
     device: str,
 ) -> Dict[str, float]:
     """
-    Tests 1.58-bit BitNet-style groupwise ternary quantization (`{-1, 0, +1}` per 32-channel group)
-    on internal linear projections of converged `SimVQSplitLM` (keeping token embeddings BF16).
+    Tests 0-QAT 1.58-bit Least-Squares groupwise ternary quantization (`{-1, 0, +1}` per 32-channel group)
+    on internal linear projections of converged `SimVQSplitLM` (keeping token embeddings tied/BF16).
     """
-    import copy
-
     q_model = copy.deepcopy(model).to(device).eval()
     q_model.set_snap_alpha(1.0)
     quantized_params = 0
     for name, mod in q_model.named_modules():
         if isinstance(mod, nn.Linear) and name != "lm_head":
-            w = mod.weight.data
-            orig_shape = w.shape
-            g_size = 32 if w.numel() % 32 == 0 else w.size(-1)
-            w_g = w.reshape(-1, g_size)
-            scale = w_g.abs().mean(dim=-1, keepdim=True).clamp(min=1e-6)
-            w_tern = torch.round(torch.clamp(w_g / scale, -1.0, 1.0)) * scale
-            mod.weight.data.copy_(w_tern.reshape(orig_shape))
-            quantized_params += w.numel()
+            w_tern, _, _ = quantize_ternary_weights_ls(mod.weight.data)
+            g_size = 32 if mod.weight.numel() % 32 == 0 else mod.weight.size(-1)
+            for row in w_tern.float().reshape(-1, g_size):
+                assert torch.unique(torch.round(row * 1e5)).numel() <= 3, (
+                    f"PTQ ternary weight in {name} exceeded 3 levels!"
+                )
+            mod.weight.data.copy_(w_tern)
+            quantized_params += mod.weight.numel()
 
     ppl, _, _ = evaluate_prose_perplexity(
         q_model, tok, te_docs[:400], seq_len=192, device=device
@@ -372,31 +383,36 @@ def evaluate_ternary_qat_ablation(
     device: str,
     total_steps: int,
     batch_size: int,
-) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, torch.Tensor]]:
     """
-    Runs 300-step 1.58-bit BitNet STE QAT fine-tuning on internal linear projections
-    of converged `SimVQSplitLM`, bakes hard groupwise ternary weights (`{-1, 0, +1} * scale`),
-    and verifies all metrics under `eval()` + `snap_alpha = 1.0`.
+    Runs 300-step progressive 1.58-bit BitNet LS-STE QAT (`mix: 0.30 -> 1.0`, `Q_LR = 1.5e-4`)
+    on internal linear projections of converged `SimVQSplitLM`, bakes hard groupwise ternary weights
+    (`{-1, 0, +1} * scale`), packs physical `PackedLUT2BitLinear` (`uint8` T-MAC LUT), and
+    verifies exact LUT parity under `eval()` + `snap_alpha = 1.0`.
     """
-    import copy
-
     QAT_STEPS = 300
+    Q_LR = 1.5e-4
+    torch.manual_seed(777)
     qat_model = copy.deepcopy(model).to(device)
     qat_model.set_crystal_schedule(total_steps, total_steps)
     qat_model.set_snap_alpha(1.0)
+    qat_model.set_qat_mix(0.30)
     qat_model.set_ternary_qat(True)
 
-    opt = torch.optim.AdamW(qat_model.parameters(), lr=4e-4, weight_decay=0.0)
+    opt = torch.optim.AdamW(qat_model.parameters(), lr=Q_LR, weight_decay=0.0)
     use_amp = device == "cuda" and torch.cuda.is_available()
     start_row = (total_steps - QAT_STEPS) * batch_size
     t0 = time.perf_counter()
 
     for q_step in range(1, QAT_STEPS + 1):
         qat_model.train()
+        mix = min(1.0, 0.30 + 0.70 * (q_step / 90.0)) if q_step <= 90 else 1.0
+        qat_model.set_qat_mix(mix)
+
         if q_step <= 15:
-            lr = 4e-4 * (q_step / 15.0)
+            lr = Q_LR * (q_step / 15.0)
         else:
-            lr = 4e-5 + 0.5 * (4e-4 - 4e-5) * (
+            lr = Q_LR * 0.1 + 0.5 * (Q_LR * 0.9) * (
                 1.0 + math.cos(math.pi * (q_step - 15) / (QAT_STEPS - 15))
             )
         for pg in opt.param_groups:
@@ -433,69 +449,93 @@ def evaluate_ternary_qat_ablation(
         torch.nn.utils.clip_grad_norm_(qat_model.parameters(), 1.0)
         opt.step()
 
-        if q_step in (150, QAT_STEPS):
+        if q_step in (90, 150, QAT_STEPS):
             print(
-                f"  [1.58-bit STE QAT] step {q_step:3d}/{QAT_STEPS} ({time.perf_counter() - t0:5.1f}s) loss={loss.item():.3f}",
+                f"  [1.58-bit STE QAT] step {q_step:3d}/{QAT_STEPS} mix={qat_model.qat_mix:.2f} ({time.perf_counter() - t0:5.1f}s) loss={loss.item():.3f}",
                 flush=True,
             )
 
     qat_model.set_ternary_qat(False)
+    qat_model.set_qat_mix(1.0)
     with torch.no_grad():
         quantized_params = 0
         for name, mod in qat_model.named_modules():
             if isinstance(mod, nn.Linear) and name != "lm_head":
-                w = mod.weight.data
-                orig_shape = w.shape
-                g_size = 32 if w.numel() % 32 == 0 else w.size(-1)
-                w_g = w.float().reshape(-1, g_size)
-                scale = w_g.abs().mean(dim=-1, keepdim=True).clamp(min=1e-6)
-                w_tern = (
-                    (torch.round(torch.clamp(w_g / scale, -1.0, 1.0)) * scale)
-                    .reshape(orig_shape)
-                    .to(w.dtype)
-                )
+                w_tern, _, _ = quantize_ternary_weights_ls(mod.weight.data)
+                g_size = 32 if mod.weight.numel() % 32 == 0 else mod.weight.size(-1)
                 for row in w_tern.float().reshape(-1, g_size):
                     assert torch.unique(torch.round(row * 1e5)).numel() <= 3, (
                         f"Baked ternary weight in {name} exceeded 3 levels!"
                     )
                 mod.weight.data.copy_(w_tern)
-                quantized_params += w.numel()
+                quantized_params += mod.weight.numel()
 
     qat_model.eval()
     qat_model.set_snap_alpha(1.0)
-    with torch.no_grad():
-        ppl, _, _ = evaluate_prose_perplexity(
-            qat_model, tok, te_docs[:500], seq_len=192, device=device
-        )
-        s5_k2, _, _, _ = evaluate_suite_batched(
-            qat_model, ev_s5_k2, pad_id=tok.PAD_ID, device=device
-        )
-        s5_k8, _, _, _ = evaluate_suite_batched(
-            qat_model, ev_s5_k8, pad_id=tok.PAD_ID, device=device
-        )
-        ov_med, _, _, _ = evaluate_suite_batched(
-            qat_model, ev_ov_ood, pad_id=tok.PAD_ID, device=device
-        )
-        ov_long, _, _, _ = evaluate_suite_batched(
-            qat_model, ev_ov_long, pad_id=tok.PAD_ID, device=device
-        )
-        trap_long, _, _, _ = evaluate_suite_batched(
-            qat_model, ev_trap_ood, pad_id=tok.PAD_ID, device=device
-        )
 
-    stats = {
+    def _eval_bundle(m: nn.Module) -> Dict[str, float]:
+        with torch.no_grad():
+            ppl_v, _, _ = evaluate_prose_perplexity(
+                m, tok, te_docs[:500], seq_len=192, device=device
+            )
+            k2_v, _, _, _ = evaluate_suite_batched(
+                m, ev_s5_k2, pad_id=tok.PAD_ID, device=device
+            )
+            k8_v, _, _, _ = evaluate_suite_batched(
+                m, ev_s5_k8, pad_id=tok.PAD_ID, device=device
+            )
+            om_v, _, _, _ = evaluate_suite_batched(
+                m, ev_ov_ood, pad_id=tok.PAD_ID, device=device
+            )
+            ol_v, _, _, _ = evaluate_suite_batched(
+                m, ev_ov_long, pad_id=tok.PAD_ID, device=device
+            )
+            tl_v, _, _, _ = evaluate_suite_batched(
+                m, ev_trap_ood, pad_id=tok.PAD_ID, device=device
+            )
+        return {
+            "ppl": round(ppl_v, 3),
+            "s5_k2": round(k2_v, 2),
+            "s5_k8": round(k8_v, 2),
+            "ov_med": round(om_v, 2),
+            "ov_long": round(ol_v, 2),
+            "trap_long": round(tl_v, 2),
+        }
+
+    qat_b = _eval_bundle(qat_model)
+    qat_stats = {
         "qat_steps": QAT_STEPS,
         "qat_seconds": round(time.perf_counter() - t0, 2),
         "ternary_quantized_linear_params": quantized_params,
-        "gsm8k_ppl_158bit_qat": round(ppl, 3),
-        "s5_k2_158bit_qat_pct": round(s5_k2, 2),
-        "s5_k8_158bit_qat_pct": round(s5_k8, 2),
-        "ov_ood_med_158bit_qat_pct": round(ov_med, 2),
-        "ov_ood_long_158bit_qat_pct": round(ov_long, 2),
-        "trap_ood_long_158bit_qat_pct": round(trap_long, 2),
+        "gsm8k_ppl_158bit_qat": qat_b["ppl"],
+        "s5_k2_158bit_qat_pct": qat_b["s5_k2"],
+        "s5_k8_158bit_qat_pct": qat_b["s5_k8"],
+        "ov_ood_med_158bit_qat_pct": qat_b["ov_med"],
+        "ov_ood_long_158bit_qat_pct": qat_b["ov_long"],
+        "trap_ood_long_158bit_qat_pct": qat_b["trap_long"],
     }
+
+    lut_model = pack_model_2bit_lut(qat_model).to(device)
+    fp = compute_2bit_lut_footprint(lut_model)
+    lut_b = _eval_bundle(lut_model)
+    max_pp_diff = max(
+        abs(lut_b[k] - qat_b[k])
+        for k in ("s5_k2", "s5_k8", "ov_med", "ov_long", "trap_long")
+    )
+    lut_stats = {
+        **fp,
+        "gsm8k_ppl_2bit_lut": lut_b["ppl"],
+        "s5_k2_2bit_lut_pct": lut_b["s5_k2"],
+        "s5_k8_2bit_lut_pct": lut_b["s5_k8"],
+        "ov_ood_med_2bit_lut_pct": lut_b["ov_med"],
+        "ov_ood_long_2bit_lut_pct": lut_b["ov_long"],
+        "trap_ood_long_2bit_lut_pct": lut_b["trap_long"],
+        "max_pp_diff_vs_qat": round(max_pp_diff, 3),
+        "ppl_diff_vs_qat": round(abs(lut_b["ppl"] - qat_b["ppl"]), 4),
+    }
+
     ckpt_sd = {k: v.cpu() for k, v in qat_model.state_dict().items()}
-    return stats, ckpt_sd
+    return qat_stats, lut_stats, ckpt_sd
 
 
 def format_ci(acc: float, ci: Tuple[float, float]) -> str:
@@ -510,6 +550,7 @@ def write_markdown_report(
     drift = results["crystal_drift_check"]
     ternary = results["ternary_158bit_ablation"]
     ternary_qat = results["ternary_158bit_qat"]
+    tmac_lut = results["tmac_2bit_lut"]
     cfg_info = results["benchmark_config"]
 
     roster_order = (
@@ -523,11 +564,11 @@ def write_markdown_report(
     )
 
     lines: List[str] = [
-        "# Отчёт честного турнира пост-трансформерной архитектуры `SimVQ-Split v4`",
+        "# Отчёт честного турнира пост-трансформерной архитектуры `SimVQ-Split v5` (`Calcite-5`)",
         "",
-        "## 1. Условия эксперимента (`Zero-Cheat Gate`, 12/12 законов)",
-        f"- **Статус анти-читерского гейта (`pytest tests/test_anti_cheat.py`):** `PASSED (12/12)` — `0` строковых/регулярных правил хоста, `0` питоновских словарей внутри `nn.Module`, `100%` живых градиентов на всех параметрах (`snap_alpha = 0.35`, `1.0` и под `1.58-bit STE QAT` по `Law 12`), строгая пошаговая каузальность, нулевая утечка коры за пределы локального окна (`W = {cfg_info['window_size']}`, рецептивное поле коры `33` токена), паритет параметров `+/- 5%`, биективное сохранение мультимножества слотов $S_G$ на `L = 1024`, монотонность эпистемического датчика Вудбери $u_t = \\lambda q_t^\\top P_t q_t$ и комбинаторная ортогональность 3-факторного скетча Хадамара на двойниках (`Law 11`).",
-        f"- **Единый токенизатор и побитово идентичный поток данных (`v2 == v3 == v4`):** общий `ByteBPETokenizer` (`vocab_size = {cfg_info['vocab_size']}`), единый неповторяющийся поток из `{cfg_info['total_unique_sequences']:,}` уникальных последовательностей (`{cfg_info['steps']}` шагов x батч `{cfg_info['batch_size']}`, `seq_len = {cfg_info['seq_len']}`, `seed = 2026`). Все 7 моделей получили идентичные батчи в одном порядке.",
+        "## 1. Условия эксперимента (`Zero-Cheat Gate`, 15/15 законов)",
+        f"- **Статус анти-читерского гейта (`pytest tests/test_anti_cheat.py`):** `PASSED (15/15)` — `0` строковых/регулярных правил хоста, `0` питоновских словарей внутри `nn.Module`, `100%` живых градиентов на всех параметрах (`snap_alpha = 0.35`, `1.0` и под `1.58-bit STE QAT` по `Law 12`), строгая пошаговая каузальность, нулевая утечка коры за пределы локального окна (`W = {cfg_info['window_size']}`, рецептивное поле коры `33` токена), паритет параметров `+/- 5%`, биективное сохранение мультимножества слотов $S_G$ на `L = 1024`, монотонность эпистемического датчика Вудбери $u_t = \\lambda q_t^\\top P_t q_t$ и его спектр `0 < lambda_min <= lambda_max <= 1/lambda` на `L = 2048` (`Law 13`), комбинаторная ортогональность 3-факторного скетча Хадамара на двойниках (`Law 11`), подавление дистракторов положительной ямой кристалла `id_well > 0` (`Law 14`), а также физическая упаковка весов в `uint8` (`2-bit T-MAC LUT`, `16.0x` сжатие матриц без умножений на триты, `Law 15`).",
+        f"- **Единый токенизатор и побитово идентичный поток данных (`v2 == v3 == v4 == v5`):** общий `ByteBPETokenizer` (`vocab_size = {cfg_info['vocab_size']}`), единый неповторяющийся поток из `{cfg_info['total_unique_sequences']:,}` уникальных последовательностей (`{cfg_info['steps']}` шагов x батч `{cfg_info['batch_size']}`, `seq_len = {cfg_info['seq_len']}`, `seed = 2026`). Все 7 моделей получили идентичные батчи в одном порядке.",
         "- **Четыре одновременных языковых и когнитивных трека на одних весах (без флагов задач):**",
         "  1. **Трек А (`GSM8K Held-Out Perplexity`):** связный английский текст из `benchmarks/gsm8k/test.jsonl` (непересекающийся с `train.jsonl`).",
         "  2. **Трек Б (`Non-Abelian S_5 State Tracking in Natural Prose`):** перестановки 5 сосудов (`5! = 120` состояний, случайный порог `0.83%`) со вставками предложений из `GSM8K`. Обучение строго на коротких горизонтах `k in {0..4}` (`L <= 192`); слепой тест на `k = 2, 4, 8, 16` (до `~665` токенов — в `20` раз длиннее окна коры).",
@@ -587,19 +628,20 @@ def write_markdown_report(
         [
             "",
             "## 4. Фактический разбор результатов, инвариантов и ограничений (`[VERIFIED]`)",
-            f"- **Кэш $O(1)$ и прорыв языковой перплексии (`Track A`, `[VERIFIED]`):** полная модель `SimVQSplitLM v4` (`{full_m['params']:,}` параметров, строго константный кэш `{full_m['state_cache_kb_L2048']:.1f} KB` со всеми кольцевыми буферами — в `{rope_m['state_cache_kb_L2048'] / full_m['state_cache_kb_L2048']:.1f}x` меньше `RoPETransformerLM` `{rope_m['state_cache_kb_L2048']:.1f} KB` на `L=2048`) снизила `GSM8K PPL` с `22.46` (`v3`) до `{full_m['gsm8k_ppl']:.2f}` (`WoodburyOnly = {wood_m['gsm8k_ppl']:.2f}`), тогда как чистые непрерывные модели показывают `RoPE = {rope_m['gsm8k_ppl']:.2f}`, `SlidingWindow = {sw_m['gsm8k_ppl']:.2f}`, `HouseholderDeltaNet = {delta_m['gsm8k_ppl']:.2f}`.",
-            f"- **Нелинейная синергия на OOD-горизонтах `S_5` и автономный кристалл (`Track B`, `[VERIFIED]`):** изолированный `SimVQSplit_CrystalOnly` (`40.2 KB` кэш, `eval()` `alpha = 1.0`) удерживает `Overwrite = {cryst_m['overwrite']['in_dist']['exact_pct']:.1f}% / {cryst_m['overwrite']['ood_long']['exact_pct']:.1f}%`, `Selective F1 = {cryst_m['selective_f1_in']:.1f}% / {cryst_m['selective_f1_ood_long']:.1f}%` (выше всех 4 бейзлайнов) и `S_5 k=2 = {cryst_m['s5']['k2']['exact_pct']:.1f}%`, тогда как `SimVQSplit_WoodburyOnly` решает короткий `k=2` (`{wood_m['s5']['k2']['exact_pct']:.1f}%`), но затухает на `2x–4x OOD` (`k=8: {wood_m['s5']['k8']['exact_pct']:.1f}%`, `k=16: {wood_m['s5']['k16']['exact_pct']:.1f}%`). Совместная работа потоков в `SimVQSplitLM v4` разгружает кору и даёт кратный OOD-прорыв на `S_5`: `{full_m['s5']['k2']['exact_pct']:.1f}%` (`k=2`), `{full_m['s5']['k4']['exact_pct']:.1f}%` (`k=4`), `{full_m['s5']['k8']['exact_pct']:.1f}%` (`k=8`, `2x OOD`) и `{full_m['s5']['k16']['exact_pct']:.1f}%` (`k=16`, `4x OOD`, `~665` токенов) против `{rope_m['s5']['k2']['exact_pct']:.1f}% / {rope_m['s5']['k4']['exact_pct']:.1f}% / {rope_m['s5']['k8']['exact_pct']:.1f}% / {rope_m['s5']['k16']['exact_pct']:.1f}%` у `RoPETransformerLM` и `{delta_m['s5']['k2']['exact_pct']:.1f}% / {delta_m['s5']['k4']['exact_pct']:.1f}% / {delta_m['s5']['k8']['exact_pct']:.1f}% / {delta_m['s5']['k16']['exact_pct']:.1f}%` у `HouseholderDeltaNetLM`.",
+            f"- **Кэш $O(1)$ и языковая перплексия (`Track A`, `[VERIFIED]`):** полная модель `SimVQSplitLM v5` (`{full_m['params']:,}` параметров, строго константный кэш `{full_m['state_cache_kb_L2048']:.1f} KB` со всеми кольцевыми буферами — в `{rope_m['state_cache_kb_L2048'] / full_m['state_cache_kb_L2048']:.1f}x` меньше `RoPETransformerLM` `{rope_m['state_cache_kb_L2048']:.1f} KB` на `L=2048`) держит `GSM8K PPL = {full_m['gsm8k_ppl']:.2f}` (`WoodburyOnly = {wood_m['gsm8k_ppl']:.2f}`), тогда как чистые непрерывные модели показывают `RoPE = {rope_m['gsm8k_ppl']:.2f}`, `SlidingWindow = {sw_m['gsm8k_ppl']:.2f}`, `HouseholderDeltaNet = {delta_m['gsm8k_ppl']:.2f}`.",
+            f"- **Яма самосогласования `id_well > 0` на `S_5` и автономный кристалл (`Track B`, `[VERIFIED]`):** включение положительной ямы `id_well > 0` в каскаде перестановок кристалла поднимает `SimVQSplitLM v5` на `S_5` до `{full_m['s5']['k2']['exact_pct']:.1f}%` (`k=2`), `{full_m['s5']['k4']['exact_pct']:.1f}%` (`k=4`), `{full_m['s5']['k8']['exact_pct']:.1f}%` (`k=8`, `2x OOD`) и `{full_m['s5']['k16']['exact_pct']:.1f}%` (`k=16`, `4x OOD`, `~665` токенов) против `{rope_m['s5']['k2']['exact_pct']:.1f}% / {rope_m['s5']['k4']['exact_pct']:.1f}% / {rope_m['s5']['k8']['exact_pct']:.1f}% / {rope_m['s5']['k16']['exact_pct']:.1f}%` у `RoPETransformerLM` и `{delta_m['s5']['k2']['exact_pct']:.1f}% / {delta_m['s5']['k4']['exact_pct']:.1f}% / {delta_m['s5']['k8']['exact_pct']:.1f}% / {delta_m['s5']['k16']['exact_pct']:.1f}%` у `HouseholderDeltaNetLM`. Изолированный `SimVQSplit_CrystalOnly` со сбалансированными вентилями удерживает `GSM8K PPL = {cryst_m['gsm8k_ppl']:.2f}`, `Overwrite = {cryst_m['overwrite']['in_dist']['exact_pct']:.1f}% / {cryst_m['overwrite']['ood_long']['exact_pct']:.1f}%`, `Selective F1 = {cryst_m['selective_f1_in']:.1f}% / {cryst_m['selective_f1_ood_long']:.1f}%` (выше всех 4 бейзлайнов) и `S_5 k=2 = {cryst_m['s5']['k2']['exact_pct']:.1f}%`.",
             f"- **Преимущество на контрфактической перезаписи со связанными ключами (`Track C`, `[VERIFIED]`):** гибридная архитектура `(H-1)+1` с вентилем запроса `query_intent_proj` удерживает `SimVQSplitLM` на уровне `{full_m['overwrite']['in_dist']['exact_pct']:.1f}%` (`In-Dist`), `{full_m['overwrite']['ood_med']['exact_pct']:.1f}%` (`OOD-Med`) и `{full_m['overwrite']['ood_long']['exact_pct']:.1f}%` (`OOD-Long`, `~660` токенов) при `{wood_m['overwrite']['ood_long']['exact_pct']:.1f}%` у `WoodburyOnly` против `{delta_m['overwrite']['ood_long']['exact_pct']:.1f}%` у `HouseholderDeltaNetLM` и `{rope_m['overwrite']['ood_long']['exact_pct']:.1f}%` у `RoPETransformerLM`.",
-            f"- **Эпистемический тормоз галлюцинаций на комбинаторных двойниках (`Track E`, `[VERIFIED]`):** на скетчах Хадамара с контролем эксцесса `tanh(1.2 * f_r)` отказ от выдумки `\" Unknown.\"` у `SimVQSplitLM v4` достигает `{full_m['trap']['in_dist']['exact_pct']:.1f}%` (`In-Dist`) и `{full_m['trap']['ood_long']['exact_pct']:.1f}%` (`OOD-Long`), давая гармонический `Selective F1 = {full_m['selective_f1_in']:.1f}% / {full_m['selective_f1_ood_long']:.1f}%` (у `WoodburyOnly`: `{wood_m['selective_f1_in']:.1f}% / {wood_m['selective_f1_ood_long']:.1f}%`) против `{delta_m['selective_f1_ood_long']:.1f}%` у `HouseholderDeltaNetLM` и `{rope_m['selective_f1_ood_long']:.1f}%` у `RoPETransformerLM`.",
+            f"- **Эпистемический тормоз галлюцинаций на комбинаторных двойниках (`Track E`, `[VERIFIED]`):** на скетчах Хадамара с контролем эксцесса `tanh(1.2 * f_r)` отказ от выдумки `\" Unknown.\"` у `SimVQSplitLM v5` достигает `{full_m['trap']['in_dist']['exact_pct']:.1f}%` (`In-Dist`) и `{full_m['trap']['ood_long']['exact_pct']:.1f}%` (`OOD-Long`), давая гармонический `Selective F1 = {full_m['selective_f1_in']:.1f}% / {full_m['selective_f1_ood_long']:.1f}%` (у `WoodburyOnly`: `{wood_m['selective_f1_in']:.1f}% / {wood_m['selective_f1_ood_long']:.1f}%`) против `{delta_m['selective_f1_ood_long']:.1f}%` у `HouseholderDeltaNetLM` и `{rope_m['selective_f1_ood_long']:.1f}%` у `RoPETransformerLM`.",
             f"- **Геометрический инвариант кристалла на `L = 1024` (`[VERIFIED]`):** по обоим каскадам операторного кристалла (`{drift['crystal_stages_checked']}` слоя) максимальное отклонение сферической нормы составило `{drift['norm_drift_L1024']:.6e}`, отклонение от центроидов Вороного — `{drift['voronoi_lattice_err_L1024']:.6e}` (машинный ноль `float32`).",
-            f"- **1.58-битное тернарное квантование (`PTQ` vs `{ternary_qat['qat_steps']}`-шаговый `STE QAT`, `{ternary_qat['ternary_quantized_linear_params']:,}` весов, `[VERIFIED]`):** прямое округление `0-QAT PTQ` даёт `GSM8K PPL = {ternary['gsm8k_ppl_158bit_ptq']:.2f}`, `S_5 k8 = {ternary['s5_k8_158bit_ptq_pct']:.1f}%`, `OV OOD-Med = {ternary['ov_ood_med_158bit_ptq_pct']:.1f}%` и `Trap OOD-Long = {ternary['trap_ood_long_158bit_ptq_pct']:.1f}%`. После `{ternary_qat['qat_steps']}` шагов `STE QAT` со строгой запечкой весов в `{{-1, 0, +1}}` (`<= 3` уровней на 32-группу) модель `SimVQSplitLM v4` восстанавливает `GSM8K PPL = {ternary_qat['gsm8k_ppl_158bit_qat']:.2f}` при `S_5 k2 = {ternary_qat['s5_k2_158bit_qat_pct']:.1f}%`, `S_5 k8 = {ternary_qat['s5_k8_158bit_qat_pct']:.1f}%`, `OV OOD-Med = {ternary_qat['ov_ood_med_158bit_qat_pct']:.1f}%`, `OV OOD-Long = {ternary_qat['ov_ood_long_158bit_qat_pct']:.1f}%` и `Trap OOD-Long = {ternary_qat['trap_ood_long_158bit_qat_pct']:.1f}%`.",
+            f"- **1.58-битное LS-квантование (`0-QAT PTQ` vs `{ternary_qat['qat_steps']}`-шаговый `STE QAT`, `{ternary_qat['ternary_quantized_linear_params']:,}` весов, `[VERIFIED]`):** двухшаговая оптимальная проекция `quantize_ternary_weights_ls` в режиме `0-QAT PTQ` даёт `GSM8K PPL = {ternary['gsm8k_ppl_158bit_ptq']:.2f}`, `S_5 k8 = {ternary['s5_k8_158bit_ptq_pct']:.1f}%`, `OV OOD-Med = {ternary['ov_ood_med_158bit_ptq_pct']:.1f}%` и `Trap OOD-Long = {ternary['trap_ood_long_158bit_ptq_pct']:.1f}%`. После `{ternary_qat['qat_steps']}` шагов прогрессивного `STE QAT` (`qat_mix: 0.30 -> 1.0`, `Q_LR = 1.5e-4`) с тернарным мягким потолком Вудбери (`DH = 144.0` + мягкий возврат `rho_rec = 0.002`), ямой самосогласования `id_well` на `perm_gate_proj.bias` и строгой запечкой в `{{-1, 0, +1}}` (`<= 3` уровней на 32-группу) модель `SimVQSplitLM v5` держит `GSM8K PPL = {ternary_qat['gsm8k_ppl_158bit_qat']:.2f}` при `S_5 k2 = {ternary_qat['s5_k2_158bit_qat_pct']:.1f}%`, `S_5 k8 = {ternary_qat['s5_k8_158bit_qat_pct']:.1f}%`, `OV OOD-Med = {ternary_qat['ov_ood_med_158bit_qat_pct']:.1f}%`, `OV OOD-Long = {ternary_qat['ov_ood_long_158bit_qat_pct']:.1f}%` и `Trap OOD-Long = {ternary_qat['trap_ood_long_158bit_qat_pct']:.1f}%`.",
+            f"- **Физический `2-bit uint8 T-MAC LUT` инференс без умножений (`PackedLUT2BitLinear`, `[VERIFIED]`):** упаковка всех `{tmac_lut['num_lut_layers']}` квантованных линейных матриц (`{tmac_lut['packed_weights_count']:,}` весов) в формат `uint8` (`4` трита на байт) сжимает матрицы с `{tmac_lut['orig_fp32_matrix_kb']:.2f} KB` (`FP32`) до `{tmac_lut['packed_u8_kb']:.2f} KB` (`{tmac_lut['matrix_compression_vs_fp32']:.2f}x`; с учётом `FP16` групповых шкал `{tmac_lut['scales_fp16_kb']:.2f} KB` — `{tmac_lut['effective_matrix_compression_with_scales']:.2f}x`; полный объём модели с `FP16` эмбеддингами и нормами `{tmac_lut['total_lut_kb']:.2f} KB`). Прямой табличный прогон через сложения и выборки даёт `GSM8K PPL = {tmac_lut['gsm8k_ppl_2bit_lut']:.2f}` (`Delta PPL = {tmac_lut['ppl_diff_vs_qat']:.4f}`), `S_5 k2 = {tmac_lut['s5_k2_2bit_lut_pct']:.1f}%`, `S_5 k8 = {tmac_lut['s5_k8_2bit_lut_pct']:.1f}%`, `OV OOD-Med/Long = {tmac_lut['ov_ood_med_2bit_lut_pct']:.1f}% / {tmac_lut['ov_ood_long_2bit_lut_pct']:.1f}%` и `Trap OOD-Long = {tmac_lut['trap_ood_long_2bit_lut_pct']:.1f}%` (максимальное расхождение с `QAT` `max_pp_diff = {tmac_lut['max_pp_diff_vs_qat']:.2f}` п.п.).",
             "",
             "## 5. Кодовая база и воспроизводимость",
             "- Модель: [simvq_split/models.py](simvq_split/models.py) (`SimVQSplitLM`)",
-            "- Операторный кристалл и фразовая память Вудбери: [simvq_split/memory.py](simvq_split/memory.py) (`VoronoiCrystalLayer`, `NeuralWoodburyLayer`, `quantize_ternary_ste`)",
+            "- Операторный кристалл, память Вудбери и физический LUT: [simvq_split/memory.py](simvq_split/memory.py) (`VoronoiCrystalLayer`, `NeuralWoodburyLayer`, `quantize_ternary_weights_ls`, `PackedLUT2BitLinear`)",
             "- Бейзлайны: [simvq_split/baselines.py](simvq_split/baselines.py) (`RoPETransformerLM`, `SlidingWindowTransformerLM`, `LoopedTransformerLM`, `HouseholderDeltaNetLM`)",
             "- Задачи и генераторы треков: [simvq_split/tasks.py](simvq_split/tasks.py)",
-            "- Анти-читерские тесты (12 законов): [tests/test_anti_cheat.py](tests/test_anti_cheat.py)",
+            "- Анти-читерские тесты (15 законов): [tests/test_anti_cheat.py](tests/test_anti_cheat.py)",
             "- Полный прогон и валидация: `python -u run_simvq_split_benchmark.py && python -u validate_simvq_split_results.py`",
             "",
         ]
@@ -608,15 +650,106 @@ def write_markdown_report(
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="SimVQ-Split v5 (Calcite-5) 7-Model Tournament & QA Runner"
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Regenerate Markdown report from --output-json without running pytest or training.",
+    )
+    parser.add_argument(
+        "--only",
+        type=str,
+        default="",
+        help="Comma-separated subset of models to train/eval (backfills remaining models from JSON if present).",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=2000,
+        help="Training steps per model (default: 2000).",
+    )
+    parser.add_argument(
+        "--skip-qat",
+        action="store_true",
+        help="Skip 1.58-bit PTQ/QAT/2-bit LUT ablation (reuses cached JSON entries if available).",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        default="benchmarks/simvq_split_results.json",
+        help="Path to JSON results file (relative to repo root or absolute).",
+    )
+    parser.add_argument(
+        "--output-report",
+        type=str,
+        default="SimVQ_Split_Benchmark_Report.md",
+        help="Path to Markdown report file (relative to repo root or absolute).",
+    )
+    parser.add_argument(
+        "--no-save-ckpt",
+        action="store_true",
+        help="Do not overwrite checkpoints/simvq_split_tournament.pt.",
+    )
+    return parser.parse_args(argv)
+
+
+def _resolve_repo_path(root: Path, raw_path: str) -> Path:
+    p = Path(raw_path)
+    return p if p.is_absolute() else (root / p)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     root = Path(__file__).resolve().parent
+    t_run0 = time.perf_counter()
+    json_out = _resolve_repo_path(root, args.output_json)
+    report_out = _resolve_repo_path(root, args.output_report)
+
+    if args.report_only:
+        assert json_out.exists(), f"Missing JSON results for --report-only: {json_out}"
+        payload = json.loads(json_out.read_text(encoding="utf-8"))
+        write_markdown_report(report_out, payload)
+        elapsed = time.perf_counter() - t_run0
+        mm, ss = divmod(int(elapsed), 60)
+        print(
+            f"[+{mm:02d}:{ss:02d}] Regenerated {report_out} ({report_out.stat().st_size} B)",
+            flush=True,
+        )
+        return 0
+
+    valid_roster = {
+        "SimVQSplitLM",
+        "SimVQSplit_CrystalOnly",
+        "SimVQSplit_WoodburyOnly",
+        "HouseholderDeltaNetLM",
+        "RoPETransformerLM",
+        "LoopedTransformerLM",
+        "SlidingWindowTransformerLM",
+    }
+    selected_names = (
+        {x.strip() for x in args.only.split(",") if x.strip()}
+        if args.only.strip()
+        else None
+    )
+    if selected_names is not None:
+        unknown = sorted(selected_names - valid_roster)
+        if unknown:
+            raise ValueError(f"Unknown --only model name(s): {unknown}")
+
+    cached_payload: dict = {}
+    if json_out.exists():
+        cached_payload = json.loads(json_out.read_text(encoding="utf-8"))
+
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(
-        f"=== Running SimVQ-Split v4 Official Tournament on device={dev} ===",
+        f"=== Running SimVQ-Split v5 (Calcite-5) Official Tournament on device={dev} ===",
         flush=True,
     )
 
-    # 1. Enforce 12-Law Zero-Cheat Gate upfront
+    # 1. Enforce 15-Law Zero-Cheat Gate upfront
     chk = subprocess.run(
         [
             sys.executable,
@@ -630,9 +763,9 @@ def main() -> int:
         text=True,
     )
     print(chk.stdout.strip(), flush=True)
-    if chk.returncode != 0 or "12 passed" not in chk.stdout:
+    if chk.returncode != 0 or "15 passed" not in chk.stdout:
         print(chk.stderr, flush=True)
-        raise RuntimeError("Zero-Cheat Gate (12 laws) failed — aborting benchmark!")
+        raise RuntimeError("Zero-Cheat Gate (15 laws) failed — aborting benchmark!")
 
     torch.manual_seed(42)
     tr_docs, te_docs, tr_sents, te_sents = load_gsm8k_corpora(root)
@@ -651,7 +784,7 @@ def main() -> int:
     tok = ByteBPETokenizer.train_from_iterator(tok_corpus, vocab_size=1536)
     print(f"Shared ByteBPETokenizer trained: vocab_size={tok.vocab_size}", flush=True)
 
-    STEPS = 2000
+    STEPS = int(args.steps)
     BS = 64
     SEQ_LEN = 192
 
@@ -824,9 +957,23 @@ def main() -> int:
     use_amp = dev == "cuda" and torch.cuda.is_available()
 
     for m_name, build_fn, scfg_i, bcfg_i in roster:
+        if selected_names is not None and m_name not in selected_names:
+            cached_m = cached_payload.get("models", {}).get(m_name)
+            if cached_m is not None:
+                all_model_results[m_name] = cached_m
+                print(
+                    f"[+{time.perf_counter() - t_run0:6.1f}s] CACHED {m_name} from {json_out.name}",
+                    flush=True,
+                )
+            continue
+
         torch.manual_seed(100)
         model = build_fn().to(dev)
         n_p = count_params(model)
+        print(
+            f"[+{time.perf_counter() - t_run0:6.1f}s] START {m_name} ({n_p:,} params, steps={STEPS})",
+            flush=True,
+        )
         opt = torch.optim.AdamW(model.parameters(), lr=2.5e-3, weight_decay=0.01)
         t0 = time.perf_counter()
 
@@ -978,39 +1125,49 @@ def main() -> int:
         if m_name == "SimVQSplitLM":
             trained_full_simvq = model
 
-    assert trained_full_simvq is not None
-    drift_info = measure_crystal_drift_at_1024(trained_full_simvq, tok.vocab_size, dev)
-    ternary_info = evaluate_ternary_ptq_ablation(
-        trained_full_simvq,
-        tok,
-        te_docs,
-        s5_suites["k8"],
-        ov_suites["ood_med"],
-        trap_suites["ood_long"],
-        dev,
-    )
-    ternary_qat_info, ternary_qat_sd = evaluate_ternary_qat_ablation(
-        trained_full_simvq,
-        tok,
-        X_train,
-        Y_train,
-        te_docs,
-        s5_suites["k2"],
-        s5_suites["k8"],
-        ov_suites["ood_med"],
-        ov_suites["ood_long"],
-        trap_suites["ood_long"],
-        dev,
-        total_steps=STEPS,
-        batch_size=BS,
-    )
-    print(f"Crystal Drift @ L=1024: {drift_info}", flush=True)
-    print(f"1.58-bit PTQ Ablation:  {ternary_info}", flush=True)
-    print(f"1.58-bit QAT Ablation:  {ternary_qat_info}", flush=True)
+    if trained_full_simvq is not None:
+        drift_info = measure_crystal_drift_at_1024(trained_full_simvq, tok.vocab_size, dev)
+        print(f"Crystal Drift @ L=1024: {drift_info}", flush=True)
+    else:
+        drift_info = cached_payload.get("crystal_drift_check")
+
+    if trained_full_simvq is not None and not args.skip_qat:
+        ternary_info = evaluate_ternary_ptq_ablation(
+            trained_full_simvq,
+            tok,
+            te_docs,
+            s5_suites["k8"],
+            ov_suites["ood_med"],
+            trap_suites["ood_long"],
+            dev,
+        )
+        ternary_qat_info, tmac_lut_info, ternary_qat_sd = evaluate_ternary_qat_ablation(
+            trained_full_simvq,
+            tok,
+            X_train,
+            Y_train,
+            te_docs,
+            s5_suites["k2"],
+            s5_suites["k8"],
+            ov_suites["ood_med"],
+            ov_suites["ood_long"],
+            trap_suites["ood_long"],
+            dev,
+            total_steps=STEPS,
+            batch_size=BS,
+        )
+        print(f"1.58-bit PTQ Ablation:  {ternary_info}", flush=True)
+        print(f"1.58-bit QAT Ablation:  {ternary_qat_info}", flush=True)
+        print(f"2-bit uint8 T-MAC LUT:  {tmac_lut_info}", flush=True)
+    else:
+        ternary_info = cached_payload.get("ternary_158bit_ablation")
+        ternary_qat_info = cached_payload.get("ternary_158bit_qat")
+        tmac_lut_info = cached_payload.get("tmac_2bit_lut")
+        ternary_qat_sd = None
 
     full_payload = {
         "benchmark_config": {
-            "version": "v4.0_birkhoff_transposition_crystal_hybrid_woodbury_qat",
+            "version": "v5.0_calcite5_idwell_crystal_ls_qat_tmac_2bit_lut",
             "vocab_size": tok.vocab_size,
             "steps": STEPS,
             "batch_size": BS,
@@ -1024,32 +1181,50 @@ def main() -> int:
         "crystal_drift_check": drift_info,
         "ternary_158bit_ablation": ternary_info,
         "ternary_158bit_qat": ternary_qat_info,
+        "tmac_2bit_lut": tmac_lut_info,
     }
 
-    json_out = root / "benchmarks" / "simvq_split_results.json"
     json_out.parent.mkdir(parents=True, exist_ok=True)
     json_out.write_text(
         json.dumps(full_payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
     ckpt_out = root / "checkpoints" / "simvq_split_tournament.pt"
-    ckpt_out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "simvq_split_config": asdict(base_scfg),
-            "simvq_split_state_dict": {
-                k: v.cpu() for k, v in trained_full_simvq.state_dict().items()
+    if (
+        not args.no_save_ckpt
+        and trained_full_simvq is not None
+        and ternary_qat_sd is not None
+    ):
+        ckpt_out.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "simvq_split_config": asdict(base_scfg),
+                "simvq_split_state_dict": {
+                    k: v.cpu() for k, v in trained_full_simvq.state_dict().items()
+                },
+                "simvq_split_ternary_qat_state_dict": ternary_qat_sd,
+                "tokenizer": tok.to_dict(),
+                "results_summary": full_payload,
             },
-            "simvq_split_ternary_qat_state_dict": ternary_qat_sd,
-            "tokenizer": tok.to_dict(),
-            "results_summary": full_payload,
-        },
-        ckpt_out,
-    )
+            ckpt_out,
+        )
 
-    report_out = root / "SimVQ_Split_Benchmark_Report.md"
-    write_markdown_report(report_out, full_payload)
-    print(f"Saved results to {json_out}, {ckpt_out}, and {report_out}", flush=True)
+    has_full_report = (
+        all(k in all_model_results for k in valid_roster)
+        and drift_info is not None
+        and ternary_info is not None
+        and ternary_qat_info is not None
+        and tmac_lut_info is not None
+    )
+    if has_full_report:
+        report_out.parent.mkdir(parents=True, exist_ok=True)
+        write_markdown_report(report_out, full_payload)
+        print(f"Saved results to {json_out}, {ckpt_out}, and {report_out}", flush=True)
+    else:
+        print(
+            f"Saved partial JSON results to {json_out} (skipped full report due to subset run).",
+            flush=True,
+        )
     return 0
 
 

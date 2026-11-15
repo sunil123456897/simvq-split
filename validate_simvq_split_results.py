@@ -2,11 +2,11 @@
 Standalone Zero-Manual QA Validator (`validate_simvq_split_results.py`).
 
 Verifies integrity of:
-1. `tests/test_anti_cheat.py` (all 12 Zero-Cheat, Bijection, Epistemic & 1.58-bit STE QAT laws must pass)
+1. `tests/test_anti_cheat.py` (all 15 Zero-Cheat, Bijection, Epistemic & 1.58-bit STE QAT / 2-bit LUT laws must pass)
 2. `benchmarks/simvq_split_results.json` (valid UTF-8 JSON, zero NaN/Inf, all expected
-   models & tracks present, parameter parity <= 5%, Wilson CI bounds valid, plus 1.58-bit STE QAT)
+   models & tracks present, parameter parity <= 5%, Wilson CI bounds valid, 1.58-bit STE QAT & 2-bit uint8 T-MAC LUT)
 3. `checkpoints/simvq_split_tournament.pt` (non-empty loadable checkpoint matching
-   reported parameter counts + valid ternary-baked QAT state_dict with <= 3 levels per 32-group)
+   reported parameter counts + strict SimVQSplitLM reload + valid ternary-baked QAT state_dict + 16.00x 2-bit LUT packing)
 4. `SimVQ_Split_Benchmark_Report.md` (UTF-8 integrity, zero broken brackets/tags,
    all reported model rows present, and strict Russian lexical-quarantine compliance)
 """
@@ -16,9 +16,19 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-import subprocess
 import sys
 import torch
+
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.repo_guardrail import (  # noqa: E402
+    check_anti_cheat_pytest,
+    check_baselines_untouched,
+    check_markdown_quarantine,
+    check_ruff_lint,
+)
 
 
 EXPECTED_MODELS = [
@@ -38,23 +48,11 @@ def main() -> int:
     ckpt_path = root / "checkpoints" / "simvq_split_tournament.pt"
     report_path = root / "SimVQ_Split_Benchmark_Report.md"
 
-    print("=== [QA 1/4] Running pytest tests/test_anti_cheat.py ===")
-    res = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(root / "tests" / "test_anti_cheat.py"),
-            "-q",
-        ],
-        cwd=str(root),
-        capture_output=True,
-        text=True,
-    )
-    print(res.stdout.strip())
-    if res.returncode != 0 or "12 passed" not in res.stdout:
-        print(res.stderr)
-        raise AssertionError("Zero-Cheat pytest suite (12 laws) failed!")
+    print("=== [QA 1/4] Running baselines diff, ruff & pytest tests/test_anti_cheat.py ===")
+    check_baselines_untouched(root)
+    check_ruff_lint(root)
+    pytest_out = check_anti_cheat_pytest(root)
+    print(pytest_out)
 
     print("=== [QA 2/4] Validating benchmarks/simvq_split_results.json ===")
     assert json_path.exists(), f"Missing {json_path}"
@@ -100,13 +98,34 @@ def main() -> int:
         val = qat.get(pct_k)
         assert isinstance(val, (int, float)) and 0.0 <= val <= 100.0, f"Invalid {pct_k}: {val}"
 
+    lut = data.get("tmac_2bit_lut", {})
+    assert lut.get("num_lut_layers", 0) > 0, "Missing 2-bit T-MAC LUT layers"
+    comp = lut.get("matrix_compression_vs_fp32")
+    assert isinstance(comp, (int, float)) and abs(comp - 16.0) < 1e-3, f"Invalid LUT compression: {comp}"
+    max_pp_diff = lut.get("max_pp_diff_vs_qat")
+    assert isinstance(max_pp_diff, (int, float)) and max_pp_diff <= 1.5, (
+        f"2-bit LUT drift vs QAT too high: {max_pp_diff}"
+    )
+    lut_ppl = lut.get("gsm8k_ppl_2bit_lut")
+    assert isinstance(lut_ppl, (int, float)) and 1.0 < lut_ppl < 100.0, f"Invalid LUT PPL: {lut_ppl}"
+    for pct_k in (
+        "s5_k2_2bit_lut_pct",
+        "s5_k8_2bit_lut_pct",
+        "ov_ood_med_2bit_lut_pct",
+        "ov_ood_long_2bit_lut_pct",
+        "trap_ood_long_2bit_lut_pct",
+    ):
+        val = lut.get(pct_k)
+        assert isinstance(val, (int, float)) and 0.0 <= val <= 100.0, f"Invalid {pct_k}: {val}"
+
     print("=== [QA 3/4] Validating checkpoints/simvq_split_tournament.pt ===")
     assert ckpt_path.exists() and ckpt_path.stat().st_size > 100_000, (
         f"Invalid ckpt {ckpt_path}"
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     assert (
-        "simvq_split_state_dict" in ckpt
+        "simvq_split_config" in ckpt
+        and "simvq_split_state_dict" in ckpt
         and "simvq_split_ternary_qat_state_dict" in ckpt
         and "tokenizer" in ckpt
     ), "Incomplete checkpoint keys"
@@ -131,35 +150,35 @@ def main() -> int:
             checked_linear_tensors += 1
     assert checked_linear_tensors > 0, "No quantized linear tensors found in ternary QAT state_dict!"
 
-    print("=== [QA 4/4] Validating SimVQ_Split_Benchmark_Report.md ===")
+    from simvq_split.models import SimVQSplitConfig, SimVQSplitLM
+    from simvq_split.memory import PackedLUT2BitLinear, compute_2bit_lut_footprint, pack_model_2bit_lut
+
+    cfg = SimVQSplitConfig(**ckpt["simvq_split_config"])
+    m_fp = SimVQSplitLM(cfg)
+    m_fp.load_state_dict(ckpt["simvq_split_state_dict"], strict=True)
+    m_qat = SimVQSplitLM(cfg)
+    m_qat.load_state_dict(ckpt["simvq_split_ternary_qat_state_dict"], strict=True)
+    lut_m = pack_model_2bit_lut(m_qat)
+    assert any(isinstance(mod, PackedLUT2BitLinear) for mod in lut_m.modules()), (
+        "pack_model_2bit_lut produced zero PackedLUT2BitLinear layers!"
+    )
+    lut_fp = compute_2bit_lut_footprint(lut_m)
+    assert abs(lut_fp["matrix_compression_vs_fp32"] - 16.0) < 1e-3, (
+        f"Unexpected checkpoint LUT compression: {lut_fp['matrix_compression_vs_fp32']}"
+    )
+
+    print("=== [QA 4/4] Validating Markdown reports & lexical quarantine ===")
     assert report_path.exists(), f"Missing {report_path}"
     md_text = report_path.read_text(encoding="utf-8")
     assert len(md_text) > 1500, "Report suspiciously short"
-    assert "\ufffd" not in md_text, "UTF-8 replacement char found in report"
-    assert "12/12" in md_text and "SimVQ-Split v4" in md_text, "Missing v4 / 12/12 header in report"
+    assert (
+        "15/15" in md_text and "SimVQ-Split v5" in md_text and "PackedLUT2BitLinear" in md_text
+    ), "Missing v5 / 15/15 / PackedLUT2BitLinear header in report"
     for m_name in EXPECTED_MODELS:
         assert m_name in md_text, f"Model `{m_name}` missing from Markdown report!"
 
-    md_low = md_text.lower()
-    forbidden_phrases = (
-        "не просто",
-        "является",
-        "являются",
-        "осуществлять",
-        "осуществляется",
-        "в рамках",
-        "симфония",
-        "гобелен",
-        "квантовый скачок",
-        "бесшовная экосистема",
-        "уникальный опыт",
-        "феноменальный",
-        "колоссальный",
-        "в заключение",
-        "таким образом",
-    )
-    for phrase in forbidden_phrases:
-        assert phrase not in md_low, f"Forbidden cliche phrase `{phrase}` found in report!"
+    n_docs = check_markdown_quarantine(root)
+    assert n_docs >= 4, f"Expected >= 4 guarded Markdown files, got {n_docs}"
 
     print(
         f"ALL QA CHECKS PASSED: {len(EXPECTED_MODELS)} models verified | "
