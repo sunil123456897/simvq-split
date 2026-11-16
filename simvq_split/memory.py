@@ -13,11 +13,13 @@ from .chunker import (
     ByteChunkContext,
     SurpriseHNetChunker,
     compute_chunker_state_bytes,
+    enforce_max_chunk_span_vec,
 )
 from .crystal import (
     VoronoiCrystalLayer,
     _sphere_norm_jit,
     causal_refractory_gate_jit,
+    diag_birkhoff_crystal_scan,
     diag_birkhoff_crystal_scan_jit,
     log_sinkhorn_6,
     project_birkhoff_to_perm_jit,
@@ -33,6 +35,8 @@ from .woodbury import (
     NeuralWoodburyLayer,
     _neural_woodbury_chunk_scan_fp_jit,
     _neural_woodbury_chunk_scan_tern_jit,
+    block_checkpointed_tern_scan,
+    block_parallel_wy_fp_scan,
     inspect_woodbury_spd_spectrum,
     neural_woodbury_chunk_scan_jit,
 )
@@ -48,9 +52,12 @@ __all__ = [
     "project_birkhoff_to_perm_jit",
     "log_sinkhorn_6",
     "causal_refractory_gate_jit",
+    "diag_birkhoff_crystal_scan",
     "diag_birkhoff_crystal_scan_jit",
     "_neural_woodbury_chunk_scan_fp_jit",
     "_neural_woodbury_chunk_scan_tern_jit",
+    "block_parallel_wy_fp_scan",
+    "block_checkpointed_tern_scan",
     "neural_woodbury_chunk_scan_jit",
     "inspect_woodbury_spd_spectrum",
     "VoronoiCrystalLayer",
@@ -58,4 +65,5 @@ __all__ = [
     "ByteChunkContext",
     "SurpriseHNetChunker",
     "compute_chunker_state_bytes",
+    "enforce_max_chunk_span_vec",
 ]

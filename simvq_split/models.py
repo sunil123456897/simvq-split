@@ -86,6 +86,9 @@ class SimVQSplitConfig:
     router_lock_frac: float = 0.135
     target_chunk_bytes: float = 4.9
     max_chunk_bytes: int = 10
+    byte_chunk_mode: str = "byte"
+    max_utf8_bytes: int = 16
+    use_static_m_cap: bool = False
     ratio_loss_scale: float = 1.5
     pad_token_id: int = 0
 
@@ -199,6 +202,9 @@ class SimVQSplitLM(nn.Module):
                 target_chunk_bytes=cfg.target_chunk_bytes,
                 max_chunk_bytes=cfg.max_chunk_bytes,
                 pad_token_id=cfg.pad_token_id,
+                byte_chunk_mode=cfg.byte_chunk_mode,
+                max_utf8_bytes=cfg.max_utf8_bytes,
+                use_static_m_cap=cfg.use_static_m_cap,
             )
             if cfg.use_byte_chunker
             else None

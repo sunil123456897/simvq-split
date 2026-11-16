@@ -208,6 +208,427 @@ def _neural_woodbury_chunk_scan_tern_jit(
     )
 
 
+def _wy_fp_block_fwd(
+    M0: torch.Tensor,
+    q_blk: torch.Tensor,
+    k_blk: torch.Tensor,
+    v_blk: torch.Tensor,
+    b_blk: torch.Tensor,
+    g_blk: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    WY / Ut-style exact block-parallel forward step for FP Woodbury scan.
+    Computes `G` products via float64 `log` + `cumsum` masked strictly before `exp`
+    to eliminate `0.0 / 0.0 -> NaN` underflow at arbitrarily small retention `gamma`,
+    and shields all `torch.bmm` calls from outer AMP `BFloat16` downcasting.
+    """
+    with torch.amp.autocast(M0.device.type, enabled=False):
+        M0 = M0.float()
+        q_blk = q_blk.float()
+        k_blk = k_blk.float()
+        v_blk = v_blk.float()
+        b_blk = b_blk.float()
+        g_blk = g_blk.float()
+        BH, dv, _ = M0.shape
+        blen = k_blk.size(-1)
+        C = q_blk.size(-1) // blen
+        a = 1.35 * b_blk
+
+        idx = torch.arange(blen, device=M0.device)
+        strict_lower_bool = (idx.unsqueeze(1) > idx.unsqueeze(0)).unsqueeze(0)
+        log_g = torch.log(g_blk.double().clamp(min=1e-12))
+        cs = F.pad(torch.cumsum(log_g, dim=1), (1, 0))
+        zero_f64 = torch.zeros(1, device=M0.device, dtype=torch.float64)
+        diff_cs = torch.where(
+            strict_lower_bool,
+            cs[:, :blen].unsqueeze(2) - cs[:, 1 : blen + 1].unsqueeze(1),
+            zero_f64,
+        )
+        L_mj = torch.where(
+            strict_lower_bool, torch.exp(diff_cs), zero_f64
+        ).to(M0.dtype)
+        G_m = torch.exp(cs[:, :blen]).to(M0.dtype)
+        G_end = torch.exp(cs[:, blen : blen + 1]).to(M0.dtype)
+        d_end = torch.exp(cs[:, blen : blen + 1] - cs[:, 1 : blen + 1]).to(M0.dtype)
+
+        P0_K = torch.bmm(M0, k_blk)
+        KK = torch.bmm(k_blk.transpose(1, 2), k_blk)
+        ag = a * g_blk
+        A_sys = torch.eye(blen, device=M0.device, dtype=M0.dtype).unsqueeze(0) + (
+            ag.unsqueeze(2) * L_mj * KK
+        )
+        R = a.unsqueeze(1) * (v_blk - (g_blk * G_m).unsqueeze(1) * P0_K)
+        U_T = torch.linalg.solve_triangular(
+            A_sys, R.transpose(1, 2), upper=False, unitriangular=True
+        )
+        U = U_T.transpose(1, 2)
+
+        P0_Q = torch.bmm(M0, q_blk).view(BH, dv, blen, C)
+        read_0 = P0_Q * G_m.view(BH, 1, blen, 1)
+        KQ = torch.bmm(k_blk.transpose(1, 2), q_blk).view(BH, blen, blen, C)
+        LKQ = (L_mj.transpose(1, 2).unsqueeze(-1) * KQ).reshape(BH, blen, blen * C)
+        read_u = torch.bmm(U, LKQ).view(BH, dv, blen, C)
+        read_blk = (read_0 + read_u).reshape(BH, dv, blen * C)
+
+        M_end = G_end.unsqueeze(-1) * M0 + torch.bmm(
+            U * d_end.unsqueeze(1), k_blk.transpose(1, 2)
+        )
+        return read_blk, M_end
+
+
+def block_parallel_wy_fp_scan(
+    q_chunks: torch.Tensor,
+    k_seq: torch.Tensor,
+    v_seq: torch.Tensor,
+    beta_seq: torch.Tensor,
+    gamma_seq: torch.Tensor,
+    inv_lam: float,
+    q_epi_chunks: torch.Tensor | None = None,
+    k_epi_seq: torch.Tensor | None = None,
+    Bc: int = 32,
+    checkpointed: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Zero-Triton Block-Parallel WY + Cholesky Block-Woodbury `P` scan (`Bc=32`)
+    mathematically equivalent to `_neural_woodbury_chunk_scan_fp_jit`.
+    """
+    B, M_len, C, H, d_k = q_chunks.shape
+    d_v = v_seq.size(-1)
+    BH = B * H
+    lam_reg = 1.0 / inv_lam
+    orig_dtype = v_seq.dtype
+    qe_src = q_epi_chunks if q_epi_chunks is not None else q_chunks
+    ke_src = k_epi_seq if k_epi_seq is not None else k_seq
+    use_ckpt = (
+        checkpointed
+        if checkpointed is not None
+        else (torch.is_grad_enabled() and M_len > Bc)
+    )
+
+    with torch.amp.autocast(q_chunks.device.type, enabled=False):
+        q_bh = (
+            q_chunks.float()
+            .permute(0, 3, 1, 2, 4)
+            .reshape(BH, M_len * C, d_k)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        k_bh = (
+            k_seq.float()
+            .permute(0, 2, 1, 3)
+            .reshape(BH, M_len, d_k)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        v_bh = (
+            v_seq.float()
+            .permute(0, 2, 1, 3)
+            .reshape(BH, M_len, d_v)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        b_bh = beta_seq.float().squeeze(-1).permute(0, 2, 1).reshape(BH, M_len).contiguous()
+        g_bh = gamma_seq.float().squeeze(-1).permute(0, 2, 1).reshape(BH, M_len).contiguous()
+
+        with torch.no_grad():
+            qe_bh = (
+                qe_src.detach()
+                .float()
+                .permute(0, 3, 1, 2, 4)
+                .reshape(BH, M_len * C, d_k)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            ke_bh = (
+                ke_src.detach()
+                .float()
+                .permute(0, 2, 1, 3)
+                .reshape(BH, M_len, d_k)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            s_gate = torch.sigmoid((b_bh - 0.26) * 18.0)
+            nov_sqrt = torch.sqrt((s_gate * s_gate * s_gate) * 0.92)
+            eye_dk = torch.eye(d_k, device=k_seq.device, dtype=torch.float32).unsqueeze(0)
+            P = eye_dk.expand(BH, d_k, d_k).clone() * inv_lam
+            eye_bc = torch.eye(Bc, device=k_seq.device, dtype=torch.float32).unsqueeze(0)
+            idx_full = torch.arange(Bc, device=P.device)
+            sl_full = (
+                (idx_full.unsqueeze(1) > idx_full.unsqueeze(0))
+                .float()
+                .view(1, Bc, Bc, 1)
+            )
+            u_blocks: list[torch.Tensor] = []
+            for s in range(0, M_len, Bc):
+                e = min(M_len, s + Bc)
+                blen = e - s
+                ke_b = ke_bh[:, :, s:e]
+                qe_b = qe_bh[:, :, s * C : e * C]
+                ns_b = nov_sqrt[:, s:e]
+                ke_s = ke_b * ns_b.unsqueeze(1)
+                PKe_s = torch.bmm(P, ke_s)
+                PQe = torch.bmm(P, qe_b)
+
+                KPK = torch.bmm(ke_s.transpose(1, 2), PKe_s)
+                G_mat = eye_bc[:, :blen, :blen] + KPK
+                G_mat = 0.5 * (G_mat + G_mat.transpose(1, 2))
+                L_chol = torch.linalg.cholesky(G_mat)
+
+                B_q = torch.bmm(ke_s.transpose(1, 2), PQe)
+                X_q = torch.linalg.solve_triangular(L_chol, B_q, upper=False)
+                X_sq = X_q.square().view(BH, blen, blen, C)
+                corr = (X_sq.transpose(1, 2) * sl_full[:, :blen, :blen]).sum(dim=2)
+                qPq0 = (qe_b * PQe).sum(dim=1).view(BH, blen, C)
+                u_blocks.append(((qPq0 - corr) * lam_reg).clamp(0.0, 1.5))
+
+                # Stabilized Joseph-form precision update (`A P A^T + K K^T >= 0` guarantees PSD!)
+                Z = torch.linalg.solve_triangular(L_chol, PKe_s.transpose(1, 2), upper=False)
+                K_T = torch.linalg.solve_triangular(L_chol.transpose(1, 2), Z, upper=True)
+                K_gain = K_T.transpose(1, 2)
+                A_upd = eye_dk - torch.bmm(K_gain, ke_s.transpose(1, 2))
+                P = torch.bmm(
+                    torch.bmm(A_upd, P), A_upd.transpose(1, 2)
+                ) + torch.bmm(K_gain, K_gain.transpose(1, 2))
+                P = 0.5 * (P + P.transpose(1, 2))
+            uncerts = (
+                torch.cat(u_blocks, dim=1)
+                .view(B, H, M_len * C)
+                .permute(0, 2, 1)
+                .to(orig_dtype)
+            )
+
+        M0 = torch.zeros(BH, d_v, d_k, device=k_seq.device, dtype=torch.float32)
+        reads: list[torch.Tensor] = []
+        for s in range(0, M_len, Bc):
+            e = min(M_len, s + Bc)
+            if use_ckpt:
+                r_blk, M0 = torch.utils.checkpoint.checkpoint(
+                    _wy_fp_block_fwd,
+                    M0,
+                    q_bh[:, :, s * C : e * C],
+                    k_bh[:, :, s:e],
+                    v_bh[:, :, s:e],
+                    b_bh[:, s:e],
+                    g_bh[:, s:e],
+                    use_reentrant=False,
+                )
+            else:
+                r_blk, M0 = _wy_fp_block_fwd(
+                    M0,
+                    q_bh[:, :, s * C : e * C],
+                    k_bh[:, :, s:e],
+                    v_bh[:, :, s:e],
+                    b_bh[:, s:e],
+                    g_bh[:, s:e],
+                )
+            reads.append(r_blk)
+        out_all = (
+            torch.cat(reads, dim=-1)
+            .view(B, H, d_v, M_len, C)
+            .permute(0, 3, 4, 1, 2)
+            .reshape(B, M_len * C, H, d_v)
+            .to(orig_dtype)
+        )
+    return out_all, uncerts
+
+
+@torch.jit.script
+def _tern_p_uncerts_nograd_jit(
+    qe_u_all: torch.Tensor,
+    ke_u_all: torch.Tensor,
+    bt_d_all: torch.Tensor,
+    gt_d_all: torch.Tensor,
+    inv_lam: float,
+    tern_gate: float,
+) -> torch.Tensor:
+    M_len, BH, d_k, C = qe_u_all.shape
+    lam_reg = 1.0 / inv_lam
+    rho_g = 0.002 * tern_gate
+    rho_c = 0.002 * tern_gate
+    P0 = (
+        torch.eye(d_k, device=qe_u_all.device, dtype=torch.float32)
+        .unsqueeze(0)
+        .expand(BH, d_k, d_k)
+        * inv_lam
+    )
+    P = P0.clone()
+    qe_u = qe_u_all.unbind(0)
+    ke_u = ke_u_all.unbind(0)
+    b_u = bt_d_all.unbind(0)
+    g_u = gt_d_all.unbind(0)
+    uncerts = torch.empty(M_len, BH, C, device=qe_u_all.device, dtype=torch.float32)
+    for m in range(M_len):
+        qem = qe_u[m]
+        pq_m = torch.bmm(P, qem)
+        uncerts[m] = ((qem * pq_m).sum(dim=1) * lam_reg).clamp(0.0, 1.5)
+        ket = ke_u[m]
+        s_gate = torch.sigmoid((b_u[m] - 0.26) * 20.0)
+        w_cov = s_gate * s_gate * s_gate
+        pk = torch.bmm(P, ket)
+        quad = (ket * pk).sum(dim=1, keepdim=True).clamp(min=1e-5)
+        nov = w_cov * 0.92
+        denom = 1.0 + nov * quad
+        P_next = P - (nov / denom) * torch.bmm(pk, pk.transpose(1, 2))
+        P_mid = 0.5 * (P_next + P_next.transpose(1, 2))
+        rho_rec = ((1.0 - g_u[m]) * w_cov * rho_g).clamp(0.0, rho_c)
+        P = (1.0 - rho_rec) * P_mid + rho_rec * P0
+        P = 0.5 * (P + P.transpose(1, 2))
+    return uncerts
+
+
+@torch.jit.script
+def _tern_m_block_scan_jit(
+    M0: torch.Tensor,
+    q_blk: torch.Tensor,
+    k_blk: torch.Tensor,
+    v_blk: torch.Tensor,
+    b_blk: torch.Tensor,
+    g_blk: torch.Tensor,
+    inv_dh: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    blen = q_blk.size(0)
+    M_mat = M0
+    q_u = q_blk.unbind(0)
+    k_u = k_blk.unbind(0)
+    v_u = v_blk.unbind(0)
+    b_u = b_blk.unbind(0)
+    g_u = g_blk.unbind(0)
+    outs: list[torch.Tensor] = []
+    for m in range(blen):
+        outs.append(torch.bmm(M_mat, q_u[m]))
+        kt = k_u[m]
+        gt = g_u[m]
+        err = v_u[m] - gt * torch.bmm(M_mat, kt)
+        r_sq = err.pow(2).sum(dim=1, keepdim=True) * inv_dh
+        err_eff = err * torch.rsqrt(torch.sqrt(1.0 + r_sq * r_sq))
+        M_mat = gt * M_mat + (1.35 * b_u[m]) * torch.bmm(err_eff, kt.transpose(1, 2))
+    return torch.stack(outs, dim=0), M_mat
+
+
+class _CheckpointedTernaryJitFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q_m: torch.Tensor,
+        k_m: torch.Tensor,
+        v_m: torch.Tensor,
+        b_m: torch.Tensor,
+        g_m: torch.Tensor,
+        inv_dh: float,
+        Bc: int,
+    ) -> torch.Tensor:
+        M_len, BH, d_k, C = q_m.shape
+        d_v = v_m.size(2)
+        n_blocks = (M_len + Bc - 1) // Bc
+        M_starts = torch.empty(
+            n_blocks, BH, d_v, d_k, device=q_m.device, dtype=torch.float32
+        )
+        M_cur = torch.zeros(BH, d_v, d_k, device=q_m.device, dtype=torch.float32)
+        out_all = torch.empty(M_len, BH, d_v, C, device=q_m.device, dtype=torch.float32)
+        for bi in range(n_blocks):
+            s = bi * Bc
+            e = min(M_len, s + Bc)
+            M_starts[bi].copy_(M_cur)
+            o_b, M_cur = _tern_m_block_scan_jit(
+                M_cur, q_m[s:e], k_m[s:e], v_m[s:e], b_m[s:e], g_m[s:e], inv_dh
+            )
+            out_all[s:e].copy_(o_b)
+        ctx.save_for_backward(q_m, k_m, v_m, b_m, g_m, M_starts)
+        ctx.inv_dh = inv_dh
+        ctx.Bc = Bc
+        return out_all
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        q_m, k_m, v_m, b_m, g_m, M_starts = ctx.saved_tensors
+        inv_dh = ctx.inv_dh
+        Bc = ctx.Bc
+        M_len, BH, d_k, _ = q_m.shape
+        d_v = v_m.size(2)
+        n_blocks = M_starts.size(0)
+
+        dq = torch.zeros_like(q_m)
+        dk = torch.zeros_like(k_m)
+        dv = torch.zeros_like(v_m)
+        db = torch.zeros_like(b_m)
+        dg = torch.zeros_like(g_m)
+        g_M = torch.zeros(BH, d_v, d_k, device=q_m.device, dtype=torch.float32)
+
+        for bi in range(n_blocks - 1, -1, -1):
+            s = bi * Bc
+            e = min(M_len, s + Bc)
+            M0 = M_starts[bi].detach().requires_grad_(True)
+            qb = q_m[s:e].detach().requires_grad_(True)
+            kb = k_m[s:e].detach().requires_grad_(True)
+            vb = v_m[s:e].detach().requires_grad_(True)
+            bb = b_m[s:e].detach().requires_grad_(True)
+            gb = g_m[s:e].detach().requires_grad_(True)
+            go_b = grad_out[s:e]
+            with torch.enable_grad():
+                o_b, M_end = _tern_m_block_scan_jit(M0, qb, kb, vb, bb, gb, inv_dh)
+                g_M, g_qb, g_kb, g_vb, g_bb, g_gb = torch.autograd.grad(
+                    (o_b, M_end), (M0, qb, kb, vb, bb, gb), (go_b, g_M)
+                )
+            dq[s:e].copy_(g_qb)
+            dk[s:e].copy_(g_kb)
+            dv[s:e].copy_(g_vb)
+            db[s:e].copy_(g_bb)
+            dg[s:e].copy_(g_gb)
+
+        return dq, dk, dv, db, dg, None, None
+
+
+def block_checkpointed_tern_scan(
+    q_chunks: torch.Tensor,
+    k_seq: torch.Tensor,
+    v_seq: torch.Tensor,
+    beta_seq: torch.Tensor,
+    gamma_seq: torch.Tensor,
+    inv_lam: float,
+    q_epi_chunks: torch.Tensor | None = None,
+    k_epi_seq: torch.Tensor | None = None,
+    tern_gate: float = 1.0,
+    Bc: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Block-checkpointed scan (`Bc=32`) for nonlinear quartic `DH=144.0` ternary Woodbury
+    memory (`~4x` VRAM reduction vs full unrolled TorchScript scan).
+    """
+    B, M_len, C, H, d_k = q_chunks.shape
+    d_v = v_seq.size(-1)
+    BH = B * H
+    inv_dh = tern_gate / 144.0
+    qe_src = q_epi_chunks if q_epi_chunks is not None else q_chunks
+    ke_src = k_epi_seq if k_epi_seq is not None else k_seq
+
+    with torch.no_grad():
+        qe_m = qe_src.detach().float().permute(1, 0, 3, 4, 2).reshape(M_len, BH, d_k, C)
+        ke_m = ke_src.detach().float().permute(1, 0, 2, 3).reshape(M_len, BH, d_k, 1)
+        bm_d = beta_seq.detach().float().permute(1, 0, 2, 3).reshape(M_len, BH, 1, 1)
+        gm_d = gamma_seq.detach().float().permute(1, 0, 2, 3).reshape(M_len, BH, 1, 1)
+        u_m = _tern_p_uncerts_nograd_jit(qe_m, ke_m, bm_d, gm_d, inv_lam, tern_gate)
+        uncerts = (
+            u_m.reshape(M_len, B, H, C)
+            .permute(1, 0, 3, 2)
+            .reshape(B, M_len * C, H)
+            .to(v_seq.dtype)
+        )
+
+    q_m = q_chunks.float().permute(1, 0, 3, 4, 2).reshape(M_len, BH, d_k, C).contiguous()
+    k_m = k_seq.float().permute(1, 0, 2, 3).reshape(M_len, BH, d_k, 1).contiguous()
+    v_m = v_seq.float().permute(1, 0, 2, 3).reshape(M_len, BH, d_v, 1).contiguous()
+    b_m = beta_seq.float().permute(1, 0, 2, 3).reshape(M_len, BH, 1, 1).contiguous()
+    g_m = gamma_seq.float().permute(1, 0, 2, 3).reshape(M_len, BH, 1, 1).contiguous()
+    out_m = _CheckpointedTernaryJitFn.apply(q_m, k_m, v_m, b_m, g_m, inv_dh, Bc)
+    out_all = (
+        out_m.reshape(M_len, B, H, d_v, C)
+        .permute(1, 0, 4, 2, 3)
+        .reshape(B, M_len * C, H, d_v)
+        .to(v_seq.dtype)
+    )
+    return out_all, uncerts
+
+
 def neural_woodbury_chunk_scan_jit(
     q_chunks: torch.Tensor,
     k_seq: torch.Tensor,
@@ -219,9 +640,36 @@ def neural_woodbury_chunk_scan_jit(
     k_epi_seq: torch.Tensor | None = None,
     tern_gate: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    M_len = q_chunks.size(1)
     if tern_gate <= 0.0:
+        if M_len >= 8:
+            return block_parallel_wy_fp_scan(
+                q_chunks,
+                k_seq,
+                v_seq,
+                beta_seq,
+                gamma_seq,
+                inv_lam,
+                q_epi_chunks,
+                k_epi_seq,
+                Bc=32,
+                checkpointed=torch.is_grad_enabled() and M_len > 32,
+            )
         return _neural_woodbury_chunk_scan_fp_jit(
             q_chunks, k_seq, v_seq, beta_seq, gamma_seq, inv_lam, q_epi_chunks, k_epi_seq
+        )
+    if torch.is_grad_enabled() and M_len > 32:
+        return block_checkpointed_tern_scan(
+            q_chunks,
+            k_seq,
+            v_seq,
+            beta_seq,
+            gamma_seq,
+            inv_lam,
+            q_epi_chunks,
+            k_epi_seq,
+            tern_gate=tern_gate,
+            Bc=32,
         )
     return _neural_woodbury_chunk_scan_tern_jit(
         q_chunks, k_seq, v_seq, beta_seq, gamma_seq, inv_lam, q_epi_chunks, k_epi_seq, tern_gate
@@ -376,22 +824,26 @@ class NeuralWoodburyLayer(nn.Module):
         self.out_proj = nn.Linear(self.total_dim + self.H_epi * 3, d_model, bias=False)
         self.last_epistemic_uncertainty: torch.Tensor | None = None
         self.last_gate_loss: torch.Tensor | None = None
+        self._tern_cache_key: tuple[int, int] | None = None
+        self._tern_cache_val: float = 0.0
 
     def _tern_gate(self) -> float:
         if self.qat_active_mix > 0.0 or isinstance(self.v_proj, PackedLUT2BitLinear):
             return 1.0
+        w = self.v_proj.weight
+        key = (int(w.data_ptr()), int(w._version))
+        if self._tern_cache_key == key:
+            return self._tern_cache_val
         with torch.no_grad():
-            w_s = (
-                self.v_proj.weight[0, : min(32, self.v_proj.weight.size(1))]
-                .detach()
-                .float()
-                .unsqueeze(0)
-            )
+            w_s = w[0, : min(32, w.size(1))].detach().float().unsqueeze(0)
             w_q, _, _ = quantize_ternary_weights_ls(w_s)
-            rel_err = float(
-                (w_s - w_q).norm().item() / w_s.norm().clamp(min=1e-6).item()
+            is_tern = bool(
+                ((w_s - w_q).norm() < 1e-3 * w_s.norm().clamp(min=1e-6)).item()
             )
-        return 1.0 if rel_err < 1e-3 else 0.0
+        val = 1.0 if is_tern else 0.0
+        self._tern_cache_key = key
+        self._tern_cache_val = val
+        return val
 
     def _safe_unit(self, v: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
         vf = v.float()

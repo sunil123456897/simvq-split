@@ -105,6 +105,170 @@ def diag_birkhoff_crystal_scan_jit(
     return torch.stack(s_list, dim=1)
 
 
+@torch.jit.script
+def _diag_birkhoff_crystal_block_jit(
+    s0: torch.Tensor,
+    kw_eff_blk: torch.Tensor,
+    kw_vg_blk: torch.Tensor,
+    v_ste_blk: torch.Tensor,
+    P_eff_blk: torch.Tensor,
+    is_hard: bool,
+    scale_r: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    blen = v_ste_blk.size(1)
+    s = s0.float()
+    kwe_u = kw_eff_blk.float().unbind(1)
+    kwv_u = kw_vg_blk.float().unbind(1)
+    vs_u = v_ste_blk.float().unsqueeze(2).unbind(1)
+    Pe_u = P_eff_blk.float().unbind(1)
+    s_list: list[torch.Tensor] = []
+    for m in range(blen):
+        s_list.append(s)
+        vs = vs_u[m]
+        vs_d = vs.detach()
+        kwe = kwe_u[m]
+        s_w = (1.0 - kwe) * s + kwe * vs_d + kwv_u[m] * (vs - vs_d)
+        s_next = torch.bmm(Pe_u[m], s_w)
+        if is_hard:
+            s = s_next
+        else:
+            s = _sphere_norm_jit(s_next, scale_r)
+    return torch.stack(s_list, dim=1), s
+
+
+class _CheckpointedCrystalScanFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        s0: torch.Tensor,
+        kw_eff_seq: torch.Tensor,
+        kw_vg_seq: torch.Tensor,
+        v_ste_seq: torch.Tensor,
+        P_eff_seq: torch.Tensor,
+        is_hard: bool,
+        scale_r: float,
+        Bc: int,
+    ) -> torch.Tensor:
+        BH, G_h, d_s = s0.shape
+        M_len = v_ste_seq.size(1)
+        n_blocks = (M_len + Bc - 1) // Bc
+        s_starts = torch.empty(
+            n_blocks, BH, G_h, d_s, device=s0.device, dtype=torch.float32
+        )
+        s_cur = s0.float()
+        out_all = torch.empty(
+            BH, M_len, G_h, d_s, device=s0.device, dtype=torch.float32
+        )
+        for bi in range(n_blocks):
+            st = bi * Bc
+            en = min(M_len, st + Bc)
+            s_starts[bi].copy_(s_cur)
+            s_blk, s_cur = _diag_birkhoff_crystal_block_jit(
+                s_cur,
+                kw_eff_seq[:, st:en],
+                kw_vg_seq[:, st:en],
+                v_ste_seq[:, st:en],
+                P_eff_seq[:, st:en],
+                is_hard,
+                scale_r,
+            )
+            out_all[:, st:en].copy_(s_blk)
+        ctx.save_for_backward(
+            s_starts, kw_eff_seq, kw_vg_seq, v_ste_seq, P_eff_seq
+        )
+        ctx.is_hard = bool(is_hard)
+        ctx.scale_r = float(scale_r)
+        ctx.Bc = int(Bc)
+        return out_all
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        s_starts, kw_eff_seq, kw_vg_seq, v_ste_seq, P_eff_seq = ctx.saved_tensors
+        is_hard = ctx.is_hard
+        scale_r = ctx.scale_r
+        Bc = ctx.Bc
+        M_len = v_ste_seq.size(1)
+        n_blocks = s_starts.size(0)
+
+        g_kwe = torch.zeros_like(kw_eff_seq, dtype=torch.float32)
+        g_kwv = torch.zeros_like(kw_vg_seq, dtype=torch.float32)
+        g_vs = torch.zeros_like(v_ste_seq, dtype=torch.float32)
+        g_Pe = torch.zeros_like(P_eff_seq, dtype=torch.float32)
+        g_s_carry = torch.zeros_like(s_starts[0], dtype=torch.float32)
+
+        for bi in range(n_blocks - 1, -1, -1):
+            st = bi * Bc
+            en = min(M_len, st + Bc)
+            s0_b = s_starts[bi].detach().requires_grad_(True)
+            kwe_b = kw_eff_seq[:, st:en].detach().float().requires_grad_(True)
+            kwv_b = kw_vg_seq[:, st:en].detach().float().requires_grad_(True)
+            vs_b = v_ste_seq[:, st:en].detach().float().requires_grad_(True)
+            Pe_b = P_eff_seq[:, st:en].detach().float().requires_grad_(True)
+            go_b = grad_out[:, st:en].float()
+            with torch.enable_grad():
+                s_blk, s_end = _diag_birkhoff_crystal_block_jit(
+                    s0_b, kwe_b, kwv_b, vs_b, Pe_b, is_hard, scale_r
+                )
+                grads = torch.autograd.grad(
+                    (s_blk, s_end),
+                    (s0_b, kwe_b, kwv_b, vs_b, Pe_b),
+                    (go_b, g_s_carry),
+                    allow_unused=True,
+                )
+            g_s_carry = grads[0] if grads[0] is not None else torch.zeros_like(s0_b)
+            if grads[1] is not None:
+                g_kwe[:, st:en].copy_(grads[1])
+            if grads[2] is not None:
+                g_kwv[:, st:en].copy_(grads[2])
+            if grads[3] is not None:
+                g_vs[:, st:en].copy_(grads[3])
+            if grads[4] is not None:
+                g_Pe[:, st:en].copy_(grads[4])
+
+        return (
+            g_s_carry.to(s_starts.dtype),
+            g_kwe.to(kw_eff_seq.dtype),
+            g_kwv.to(kw_vg_seq.dtype),
+            g_vs.to(v_ste_seq.dtype),
+            g_Pe.to(P_eff_seq.dtype),
+            None,
+            None,
+            None,
+        )
+
+
+def diag_birkhoff_crystal_scan(
+    s0: torch.Tensor,
+    kw_eff_seq: torch.Tensor,
+    kw_vg_seq: torch.Tensor,
+    v_ste_seq: torch.Tensor,
+    P_eff_seq: torch.Tensor,
+    is_hard: bool,
+    scale_r: float,
+    Bc: int = 32,
+) -> torch.Tensor:
+    """
+    Dispatches `VoronoiCrystalLayer` scan to `_CheckpointedCrystalScanFn` (`Bc=32`)
+    during training when `M_len > Bc` (cutting autograd saved VRAM by `~4x+`), and
+    uses `diag_birkhoff_crystal_scan_jit` directly in `eval()` / short sequences.
+    """
+    M_len = v_ste_seq.size(1)
+    if torch.is_grad_enabled() and M_len > Bc:
+        return _CheckpointedCrystalScanFn.apply(
+            s0.float(),
+            kw_eff_seq.float(),
+            kw_vg_seq.float(),
+            v_ste_seq.float(),
+            P_eff_seq.float(),
+            bool(is_hard),
+            float(scale_r),
+            int(Bc),
+        )
+    return diag_birkhoff_crystal_scan_jit(
+        s0, kw_eff_seq, kw_vg_seq, v_ste_seq, P_eff_seq, is_hard, scale_r
+    )
+
+
 class VoronoiCrystalLayer(nn.Module):
     """
     Stream B of SimVQ-Split v4: 2-Head Pointer-Addressed Birkhoff-Voronoi Operator Crystal.
@@ -505,7 +669,7 @@ class VoronoiCrystalLayer(nn.Module):
         )
 
         BH = B * H
-        s_bh = diag_birkhoff_crystal_scan_jit(
+        s_bh = diag_birkhoff_crystal_scan(
             s0_bh,
             kw_eff.permute(0, 2, 1, 3, 4).reshape(BH, M_len, Gh, 1),
             kw_vg.permute(0, 2, 1, 3, 4).reshape(BH, M_len, Gh, 1),

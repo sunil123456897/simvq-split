@@ -59,11 +59,103 @@ def _enforce_max_chunk_span_jit(
     return out
 
 
+def enforce_max_chunk_span_vec(
+    raw_b: torch.Tensor,
+    valid_mask: torch.Tensor,
+    max_span: int,
+) -> torch.Tensor:
+    """
+    Vectorized O(1)-span causal boundary guard (`cummax` + modulo), bit-for-bit identical
+    to `_enforce_max_chunk_span_jit` with zero Python loop over `T`.
+    """
+    if max_span <= 1:
+        return valid_mask.clone()
+    raw_v = (raw_b & valid_mask).clone()
+    raw_v[:, 0] = valid_mask[:, 0]
+    v_step = (valid_mask.long().cumsum(dim=1) - 1).clamp(min=0)
+    fire_v = torch.where(raw_v, v_step, torch.zeros_like(v_step))
+    last_fire_v, _ = torch.cummax(fire_v, dim=1)
+    span_v = v_step - last_fire_v
+    forced = (span_v > 0) & ((span_v % max_span) == 0)
+    return valid_mask & (raw_v | forced)
+
+
+def _utf8_tensor_flags(
+    token_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure bitwise tensor extraction of UTF-8 continuation & leading-byte lengths."""
+    is_byte = token_ids >= 3
+    raw_v = (token_ids - 3).clamp(min=0)
+    is_cont = is_byte & (torch.bitwise_and(raw_v, 0xC0) == 0x80)
+    is_4 = is_byte & (torch.bitwise_and(raw_v, 0xF8) == 0xF0)
+    is_3 = is_byte & (torch.bitwise_and(raw_v, 0xF0) == 0xE0)
+    is_2 = is_byte & (torch.bitwise_and(raw_v, 0xE0) == 0xC0)
+    char_len = torch.ones_like(token_ids, dtype=torch.long)
+    char_len = torch.where(is_2, torch.full_like(char_len, 2), char_len)
+    char_len = torch.where(is_3, torch.full_like(char_len, 3), char_len)
+    char_len = torch.where(is_4, torch.full_like(char_len, 4), char_len)
+    return is_byte, is_cont, char_len
+
+
+@torch.jit.script
+def _enforce_utf8_chunk_span_jit(
+    raw_cand: torch.Tensor,
+    valid_mask: torch.Tensor,
+    can_fire_mask: torch.Tensor,
+    is_lead: torch.Tensor,
+    char_len: torch.Tensor,
+    max_cp_span: int,
+    max_byte_span: int,
+    refill_int: int,
+    cost_int: int,
+    burst_int: int,
+) -> torch.Tensor:
+    """
+    Device-resident strictly causal O(1)-state UTF-8 boundary guard (exact integer leaky bucket):
+    1. Continuation bytes (`cont_streak < 3`) are pre-masked via `can_fire_mask`.
+    2. Checks `byte_run + char_len <= max_byte_span` causally at each leading byte.
+    3. Bounds chunk rate via integer leaky-bucket credits without host-CPU syncs.
+    """
+    B, T = raw_cand.shape
+    byte_run = torch.zeros(B, device=raw_cand.device, dtype=torch.long)
+    cp_run = torch.zeros(B, device=raw_cand.device, dtype=torch.long)
+    credits = torch.full((B,), burst_int, device=raw_cand.device, dtype=torch.long)
+
+    rc_u = raw_cand.unbind(1)
+    cf_u = can_fire_mask.unbind(1)
+    vt_u = valid_mask.unbind(1)
+    ld_u = is_lead.unbind(1)
+    cl_u = char_len.unbind(1)
+    outs: list[torch.Tensor] = []
+
+    for t in range(T):
+        vt = vt_u[t]
+        ld = ld_u[t]
+        if t == 0:
+            fire = vt
+        else:
+            credits = torch.where(
+                vt, torch.clamp(credits + refill_int, max=burst_int), credits
+            )
+            can_soft = (credits >= cost_int) & rc_u[t]
+            must_span = (cp_run >= max_cp_span) | ((byte_run + cl_u[t]) > max_byte_span)
+            fire = cf_u[t] & (can_soft | must_span)
+            credits = torch.where(
+                fire, torch.clamp(credits - cost_int, min=0), credits
+            )
+        outs.append(fire)
+        fire_l = fire.long()
+        byte_run = torch.where(vt, (1 - fire_l) * byte_run + 1, byte_run)
+        cp_run = torch.where(vt, (1 - fire_l) * cp_run + ld, cp_run)
+    return torch.stack(outs, dim=1)
+
+
 def compute_chunker_state_bytes(
     d_model: int,
     d_byte: int = 32,
     d_rchar: int = 16,
     router_dim: int = 32,
+    byte_chunk_mode: str = "byte",
 ) -> int:
     """
     Exact O(1) streaming state footprint (bytes) of `SurpriseHNetChunker` independent of L:
@@ -73,8 +165,9 @@ def compute_chunker_state_bytes(
     - `prev_h_ent` predictive entropy scalar `FP32`: `4` (`4 B`)
     - `prev_z_hat` 2-chunk smoother vector `FP32`: `d_model * 4` (`640 B`)
     - `run_len` causal span counter `int32`: `4` (`4 B`)
+    Total in `"byte"` mode = `1,256 B`; in `"utf8"` mode (`+12 B` for `cp_run`, `cont_streak`, `credits` `int32`) = `1,268 B`.
     """
-    return (
+    base = (
         7 * d_byte * 2
         + 3 * d_rchar * 2
         + router_dim * 2
@@ -82,6 +175,7 @@ def compute_chunker_state_bytes(
         + d_model * 4
         + 4
     )
+    return base + (12 if byte_chunk_mode == "utf8" else 0)
 
 
 class SurpriseHNetChunker(nn.Module):
@@ -101,12 +195,18 @@ class SurpriseHNetChunker(nn.Module):
         target_chunk_bytes: float = 4.9,
         max_chunk_bytes: int = 10,
         pad_token_id: int = 0,
+        byte_chunk_mode: str = "byte",
+        max_utf8_bytes: int = 16,
+        rate_refill: float = 0.30,
+        burst_cap: float = 25.0,
+        use_static_m_cap: bool = False,
     ):
         super().__init__()
         assert (8 * d_byte) % 32 == 0, "8 * d_byte must divide cleanly into 32-weight LUT groups."
         assert (4 * d_rchar) % 32 == 0, "4 * d_rchar must divide cleanly into 32-weight LUT groups."
         assert r_hidden % 32 == 0, "r_hidden must divide cleanly into 32-weight LUT groups."
         assert d_model % 32 == 0, "d_model must divide cleanly into 32-weight LUT groups."
+        assert byte_chunk_mode in ("byte", "utf8"), f"Unsupported byte_chunk_mode: {byte_chunk_mode}"
 
         self.vocab_size = int(vocab_size)
         self.d_model = int(d_model)
@@ -117,6 +217,14 @@ class SurpriseHNetChunker(nn.Module):
         self.target_chunk_bytes = float(target_chunk_bytes)
         self.max_chunk_bytes = int(max_chunk_bytes)
         self.pad_token_id = int(pad_token_id)
+        self.byte_chunk_mode = str(byte_chunk_mode)
+        self.max_utf8_bytes = int(max(4, max_utf8_bytes))
+        self.rate_refill = float(rate_refill)
+        self.burst_cap = float(burst_cap)
+        self.refill_int = int(round(self.rate_refill * 10.0))
+        self.cost_int = 10
+        self.burst_int = int(round(self.burst_cap * 10.0))
+        self.use_static_m_cap = bool(use_static_m_cap)
         self.router_locked: bool = False
 
         # 8-byte causal character slice encoder & word-scale lexical anchor (Zero SubLN)
@@ -150,7 +258,34 @@ class SurpriseHNetChunker(nn.Module):
         self.dec_mlp = SwiGLU(d_model, byte_d_ff)
 
         self.last_ratio_loss: torch.Tensor | None = None
-        self.last_chunk_ratio: float = float(target_chunk_bytes)
+        self._last_chunk_ratio_val: float = float(target_chunk_bytes)
+        self._last_chunk_ratio_t: torch.Tensor | None = None
+        self.last_m_cap_used: int = 0
+
+    @property
+    def last_chunk_ratio(self) -> float:
+        if self._last_chunk_ratio_t is not None:
+            self._last_chunk_ratio_val = float(self._last_chunk_ratio_t.item())
+            self._last_chunk_ratio_t = None
+        return self._last_chunk_ratio_val
+
+    @last_chunk_ratio.setter
+    def last_chunk_ratio(self, value: float) -> None:
+        self._last_chunk_ratio_t = None
+        self._last_chunk_ratio_val = float(value)
+
+    def static_m_cap_for_T(self, T: int) -> int:
+        if T <= 1:
+            return max(1, T)
+        if self.byte_chunk_mode != "utf8":
+            return T
+        k_paid = min(
+            T - 1,
+            (self.burst_int + self.refill_int * (T - 1)) // self.cost_int,
+        )
+        s_min = min(self.max_chunk_bytes, max(1, self.max_utf8_bytes - 3))
+        m_cap = 1 + k_paid + ((T - 1 - k_paid) // s_min)
+        return min(T, m_cap)
 
     def _r_lin(self, lin: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if isinstance(lin, nn.Linear):
@@ -276,35 +411,88 @@ class SurpriseHNetChunker(nn.Module):
 
         valid_mask = token_ids != self.pad_token_id
         valid_mask[:, 0] = True
-        raw_b = (p_prob >= 0.5) & valid_mask
-        raw_b[:, 0] = True
-        b_mask = _enforce_max_chunk_span_jit(raw_b, valid_mask, self.max_chunk_bytes)
+        if self.byte_chunk_mode == "utf8":
+            _, is_cont, char_len = _utf8_tensor_flags(token_ids)
+            is_cont_v = is_cont & valid_mask
+            if T > 1:
+                c1 = F.pad(is_cont_v[:, :-1], (1, 0), value=False)
+            else:
+                c1 = torch.zeros_like(is_cont_v)
+            if T > 2:
+                c2 = F.pad(is_cont_v[:, :-2], (2, 0), value=False)
+            else:
+                c2 = torch.zeros_like(is_cont_v)
+            if T > 3:
+                c3 = F.pad(is_cont_v[:, :-3], (3, 0), value=False)
+            else:
+                c3 = torch.zeros_like(is_cont_v)
+            shielded = is_cont_v & (~(c1 & c2 & c3))
+            can_fire_mask = valid_mask & (~shielded)
+            is_lead = (valid_mask & (~is_cont)).long()
+            raw_cand = (p_prob >= 0.5) & can_fire_mask
+            b_mask = _enforce_utf8_chunk_span_jit(
+                raw_cand,
+                valid_mask,
+                can_fire_mask,
+                is_lead,
+                char_len,
+                self.max_chunk_bytes,
+                self.max_utf8_bytes,
+                self.refill_int,
+                self.cost_int,
+                self.burst_int,
+            )
+            ratio_mask = (valid_mask[:, 1:] & (~is_cont[:, 1:])) if T > 1 else valid_mask[:, 1:]
+        else:
+            raw_b = (p_prob >= 0.5) & valid_mask
+            raw_b[:, 0] = True
+            b_mask = enforce_max_chunk_span_vec(raw_b, valid_mask, self.max_chunk_bytes)
+            ratio_mask = valid_mask[:, 1:]
 
         if T > 1:
-            mask_r = valid_mask[:, 1:]
-            if bool(mask_r.any().item()):
-                f_hard = b_mask[:, 1:][mask_r].float().mean().detach()
-                self.last_chunk_ratio = float(1.0 / max(1e-4, float(f_hard.item())))
-                if not self.router_locked:
-                    g_soft = p_prob[:, 1:][mask_r].mean()
-                    n_comp = max(1.5, float(self.target_chunk_bytes))
-                    l_ratio = (n_comp / (n_comp - 1.0)) * (
-                        (n_comp - 1.0) * f_hard * g_soft + (1.0 - f_hard) * (1.0 - g_soft)
-                    )
-                    l_ent = F.cross_entropy(loc_logits[:, :-1][mask_r], token_ids[:, 1:][mask_r])
-                    self.last_ratio_loss = l_ratio + 0.25 * l_ent
-                else:
-                    self.last_ratio_loss = None
+            ratio_mask_f = ratio_mask.float()
+            r_sum = ratio_mask_f.sum()
+            has_valid = r_sum > 0.0
+            denom_r = r_sum.clamp(min=1.0)
+            f_hard = ((b_mask[:, 1:].float() * ratio_mask_f).sum() / denom_r).detach()
+            ratio_t = 1.0 / f_hard.clamp(min=1e-4)
+            self._last_chunk_ratio_t = torch.where(
+                has_valid, ratio_t, torch.ones_like(ratio_t)
+            )
+            if not self.router_locked:
+                g_soft = (p_prob[:, 1:] * ratio_mask_f).sum() / denom_r
+                n_comp = max(1.5, float(self.target_chunk_bytes))
+                l_ratio = (n_comp / (n_comp - 1.0)) * (
+                    (n_comp - 1.0) * f_hard * g_soft + (1.0 - f_hard) * (1.0 - g_soft)
+                )
+                ent_mask_f = valid_mask[:, 1:].float()
+                ent_per_tok = F.cross_entropy(
+                    loc_logits[:, :-1].reshape(-1, self.vocab_size),
+                    token_ids[:, 1:].reshape(-1),
+                    reduction="none",
+                ).view(B, T - 1)
+                l_ent = (ent_per_tok * ent_mask_f).sum() / ent_mask_f.sum().clamp(min=1.0)
+                self.last_ratio_loss = torch.where(
+                    has_valid, l_ratio + 0.25 * l_ent, 0.0 * p_prob.sum()
+                )
             else:
-                self.last_chunk_ratio = 1.0
-                self.last_ratio_loss = None if self.router_locked else (0.0 * p_prob.sum())
+                self.last_ratio_loss = None
         else:
-            self.last_chunk_ratio = 1.0
+            self._last_chunk_ratio_val = 1.0
+            self._last_chunk_ratio_t = None
             self.last_ratio_loss = None if self.router_locked else (0.0 * p_prob.sum())
 
         chunk_counts = b_mask.long().sum(dim=1)
-        M_max = int(chunk_counts.max().item())
-        slot_idx = (b_mask.long().cumsum(dim=1) - 1).clamp(min=0, max=M_max - 1)
+        if self.use_static_m_cap:
+            M_max = self.static_m_cap_for_T(T)
+        else:
+            raw_m = int(chunk_counts.max().item())
+            if self.byte_chunk_mode == "utf8" and T >= 32:
+                M_max = min(T, ((raw_m + 31) // 32) * 32)
+            else:
+                M_max = raw_m
+        self.last_m_cap_used = int(M_max)
+        slot_idx = (b_mask.long().cumsum(dim=1) - 1).clamp(min=0, max=max(0, M_max - 1))
 
         t_arange = torch.arange(T, device=e_tok.device, dtype=torch.long).unsqueeze(0)
         rank_key = (~b_mask).long() * (T + 1) + t_arange
@@ -397,6 +585,23 @@ class SurpriseHNetChunker(nn.Module):
             )
             // B
         )
+        is_utf8 = self.byte_chunk_mode == "utf8"
+        if is_utf8:
+            cp_run = torch.zeros(B, device=dev, dtype=torch.int32)
+            cont_streak = torch.zeros(B, device=dev, dtype=torch.int32)
+            credits = torch.full((B,), self.burst_int, device=dev, dtype=torch.int32)
+            state_bytes += int(
+                (
+                    cp_run.numel() * cp_run.element_size()
+                    + cont_streak.numel() * cont_streak.element_size()
+                    + credits.numel() * credits.element_size()
+                )
+                // B
+            )
+        else:
+            cp_run = run_len
+            cont_streak = run_len
+            credits = run_len
 
         p_list = []
         b_list = []
@@ -410,7 +615,8 @@ class SurpriseHNetChunker(nn.Module):
                 [ct] + [ring_char[:, 6 - k].to(dt) for k in range(7)],
                 dim=-1,
             )
-            rc_t = self.router_emb(token_ids[:, t]).to(dt)
+            tid_t = token_ids[:, t]
+            rc_t = self.router_emb(tid_t).to(dt)
             r_win4_t = torch.cat(
                 [rc_t] + [ring_rchar[:, 2 - k].to(dt) for k in range(3)],
                 dim=-1,
@@ -443,12 +649,49 @@ class SurpriseHNetChunker(nn.Module):
                 w_feat[0] * d_cos_t + w_feat[1] * h_norm_t + w_feat[2] * dh_t + ctx_t
             )
 
-            vt = token_ids[:, t] != self.pad_token_id
-            if t == 0:
-                vt = torch.ones_like(vt)
-                fire_t = vt
+            vt = tid_t != self.pad_token_id
+            if is_utf8:
+                _, is_cont_t, cl_t = _utf8_tensor_flags(tid_t)
+                if t == 0:
+                    vt = torch.ones_like(vt)
+                    fire_t = vt
+                else:
+                    credits = torch.where(
+                        vt,
+                        torch.clamp(credits + self.refill_int, max=self.burst_int),
+                        credits,
+                    )
+                    is_cont_vt_pre = is_cont_t & vt
+                    shielded_t = is_cont_vt_pre & (cont_streak.long() < 3)
+                    can_fire_t = vt & (~shielded_t)
+                    can_soft_t = (credits >= self.cost_int) & can_fire_t & (p_t >= 0.5)
+                    must_span_t = (cp_run.long() >= self.max_chunk_bytes) | (
+                        (run_len.long() + cl_t) > self.max_utf8_bytes
+                    )
+                    fire_t = can_fire_t & (can_soft_t | must_span_t)
+                    credits = torch.where(
+                        fire_t,
+                        torch.clamp(credits - self.cost_int, min=0),
+                        credits,
+                    )
+                is_cont_vt = is_cont_t & vt
+                is_lead_t = (vt & (~is_cont_t)).to(cp_run.dtype)
+                cp_run = torch.where(
+                    vt,
+                    torch.where(fire_t, is_lead_t, cp_run + is_lead_t),
+                    cp_run,
+                )
+                cont_streak = torch.where(
+                    is_cont_vt,
+                    cont_streak + 1,
+                    torch.zeros_like(cont_streak),
+                )
             else:
-                fire_t = vt & ((p_t >= 0.5) | (run_len.long() >= self.max_chunk_bytes))
+                if t == 0:
+                    vt = torch.ones_like(vt)
+                    fire_t = vt
+                else:
+                    fire_t = vt & ((p_t >= 0.5) | (run_len.long() >= self.max_chunk_bytes))
 
             run_len = torch.where(
                 vt,

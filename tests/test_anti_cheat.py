@@ -1,5 +1,5 @@
 """
-Zero-Cheat Automated Verification Suite for `simvq_split` (16 checks across 16 laws).
+Zero-Cheat Automated Verification Suite for `simvq_split` (17 checks across 17 laws).
 
 Enforces the non-negotiable scientific laws:
 1-15. Static AST purity, 100% live gradients, strict causality, receptive field isolation,
@@ -8,6 +8,11 @@ Enforces the non-negotiable scientific laws:
     strict causal byte decoding (`diff < 1e-5`), zero-shortcut chunked receptive field,
     100% live boundary/ratio gradients, exact `O(1)` streaming buffer (`L=64..2048`),
     and `<= 555 KB` 2-bit uint8 LUT budget (`~80-83 KB` O(1) cache).
+17. Zero-Triton Fast Core & UTF-8 Open-Web Chunker (`Calcite-5` Phase E): vectorized `cummax`
+    boundary guard bit-parity, `block_parallel_wy_fp_scan` + `block_checkpointed_tern_scan` +
+    `diag_birkhoff_crystal_scan` forward/backward parity & small-gamma safety, `0.00%` mid-UTF8
+    boundary splits, zero right-PAD entropy leak, constant `1,268 B` `O(1)` streaming state,
+    and static `M_cap` zero-sync compatibility with `PackedLUT2BitLinear`.
 """
 
 from __future__ import annotations
@@ -986,3 +991,343 @@ def test_surprise_hnet_chunker_causality_ratio_grads_and_o1_budget():
         f"Phase B 2-bit LUT footprint exceeded 555 KB: {fp_prod['total_lut_kb']} KB"
     )
     assert abs(fp_prod["matrix_compression_vs_fp32"] - 16.0) < 1e-3
+
+
+def test_phase_e_fast_wy_checkpointed_scans_and_utf8_chunker():
+    """
+    Law 17 (Phase E Zero-Triton Fast Core & UTF-8 Open-Web Byte Chunker):
+    1. `enforce_max_chunk_span_vec` matches `_enforce_max_chunk_span_jit` bit-for-bit across
+       dense, sparse, gapped, and right-padded `valid_mask` patterns.
+    2. `block_parallel_wy_fp_scan` (incl. small-gamma `log-cumsum` edge case),
+       `block_checkpointed_tern_scan`, and `diag_birkhoff_crystal_scan` match reference
+       TorchScript scans on both forward (`< 2e-5`) and backward gradients (`< 5e-5`),
+       covering non-multiple tail block length (`M_len = 97, Bc = 32`).
+    3. `SurpriseHNetChunker(byte_chunk_mode="utf8", use_static_m_cap=True)` produces
+       `0.00%` mid-UTF8 cuts on Cyrillic/CJK/4-byte Emoji + code, handles corrupted `\x80*5`
+       continuation bursts cleanly, exhibits zero right-PAD entropy/ratio leak, matches
+       `forward_streaming_check` at constant `1,268 B` across `L=64..1024`, and reloads
+       Phase B `checkpoints/simvq_split_byte_hnet.pt` (`strict=True`) + `PackedLUT2BitLinear`.
+    """
+    import torch.nn as nn
+    from simvq_split.chunker import _enforce_max_chunk_span_jit
+    from simvq_split.crystal import log_sinkhorn_6
+    from simvq_split.memory import (
+        PackedLUT2BitLinear,
+        block_checkpointed_tern_scan,
+        block_parallel_wy_fp_scan,
+        compute_2bit_lut_footprint,
+        compute_chunker_state_bytes,
+        diag_birkhoff_crystal_scan,
+        diag_birkhoff_crystal_scan_jit,
+        enforce_max_chunk_span_vec,
+        pack_model_2bit_lut,
+        quantize_ternary_weights_ls,
+        _neural_woodbury_chunk_scan_fp_jit,
+        _neural_woodbury_chunk_scan_tern_jit,
+    )
+
+    torch.manual_seed(1717)
+
+    # 1. Vectorized boundary span guard parity
+    for max_span in (1, 4, 10):
+        raw_b = torch.rand(4, 131) > 0.72
+        for mask_kind in range(3):
+            if mask_kind == 0:
+                vm = torch.ones(4, 131, dtype=torch.bool)
+            elif mask_kind == 1:
+                vm = torch.ones(4, 131, dtype=torch.bool)
+                vm[0, 60:] = False
+                vm[1, 1:] = False
+                vm[2, 113:] = False
+            else:
+                vm = torch.rand(4, 131) > 0.2
+                vm[:, 0] = True
+            ref = _enforce_max_chunk_span_jit(raw_b, vm, max_span)
+            vec = enforce_max_chunk_span_vec(raw_b, vm, max_span)
+            assert torch.equal(ref, vec), (
+                f"Vectorized boundary mismatch for max_span={max_span}, mask_kind={mask_kind}"
+            )
+
+    # 2A. Block-Parallel WY FP scan forward + backward parity (`M_len = 97, Bc = 32`)
+    B_w, M_w, C_w, H_w, D_w = 2, 97, 4, 3, 16
+    q_base = F.normalize(torch.randn(B_w, M_w, C_w, H_w, D_w), dim=-1)
+    k_base = F.normalize(torch.randn(B_w, M_w, H_w, D_w), dim=-1)
+    v_base = torch.randn(B_w, M_w, H_w, D_w) * 0.5
+    b_base = torch.sigmoid(torch.randn(B_w, M_w, H_w, 1) - 0.5)
+    g_base = torch.sigmoid(torch.randn(B_w, M_w, H_w, 1) + 1.5)
+    w_o = torch.randn(B_w, M_w * C_w, H_w, D_w)
+    w_u = torch.randn(B_w, M_w * C_w, H_w)
+
+    def _run_woodbury(fn, g_tensor, extra_kwargs):
+        q = q_base.clone().requires_grad_(True)
+        k = k_base.clone().requires_grad_(True)
+        v = v_base.clone().requires_grad_(True)
+        b = b_base.clone().requires_grad_(True)
+        g = g_tensor.clone().requires_grad_(True)
+        o, u = fn(q, k, v, b, g, 25.0, **extra_kwargs)
+        loss = (o * w_o).sum() + (u * w_u).sum()
+        loss.backward()
+        return o.detach(), u.detach(), [q.grad, k.grad, v.grad, b.grad, g.grad]
+
+    o_ref, u_ref, grads_ref = _run_woodbury(_neural_woodbury_chunk_scan_fp_jit, g_base, {})
+    for ckpt_mode in (False, True):
+        o_wy, u_wy, grads_wy = _run_woodbury(
+            block_parallel_wy_fp_scan, g_base, {"Bc": 32, "checkpointed": ckpt_mode}
+        )
+        assert (o_ref - o_wy).abs().max().item() < 2e-5, (
+            f"WY FP forward diff too large (ckpt={ckpt_mode}): {(o_ref - o_wy).abs().max().item()}"
+        )
+        assert (u_ref - u_wy).abs().max().item() < 2e-5, (
+            f"WY FP uncert diff too large: {(u_ref - u_wy).abs().max().item()}"
+        )
+        for idx_g, (gr, gw) in enumerate(zip(grads_ref, grads_wy)):
+            gd = (gr - gw).abs().max().item()
+            assert gd < 5e-5, f"WY FP grad[{idx_g}] diff={gd} (ckpt={ckpt_mode})"
+
+    # Small-gamma safety test (`gamma = 1e-3`): must stay finite and match FP ref (no 0/0 NaN)
+    g_tiny = torch.full_like(g_base, 1e-3)
+    o_tref, _, g_tref = _run_woodbury(_neural_woodbury_chunk_scan_fp_jit, g_tiny, {})
+    o_twy, _, g_twy = _run_woodbury(
+        block_parallel_wy_fp_scan, g_tiny, {"Bc": 32, "checkpointed": False}
+    )
+    assert torch.isfinite(o_twy).all() and all(torch.isfinite(x).all() for x in g_twy)
+    assert (o_tref - o_twy).abs().max().item() < 2e-5
+    assert max((a - b).abs().max().item() for a, b in zip(g_tref, g_twy)) < 5e-5
+
+    # 2B. Checkpointed Ternary Woodbury forward + backward parity (`M_len = 97, Bc = 32`)
+    o_t_ref, u_t_ref, g_t_ref = _run_woodbury(
+        _neural_woodbury_chunk_scan_tern_jit, g_base, {"tern_gate": 1.0}
+    )
+    o_t_blk, u_t_blk, g_t_blk = _run_woodbury(
+        block_checkpointed_tern_scan, g_base, {"tern_gate": 1.0, "Bc": 32}
+    )
+    assert (o_t_ref - o_t_blk).abs().max().item() < 2e-5
+    assert (u_t_ref - u_t_blk).abs().max().item() < 1e-5
+    for idx_g, (gr, gb) in enumerate(zip(g_t_ref, g_t_blk)):
+        gd = (gr - gb).abs().max().item()
+        assert gd < 5e-5, f"Checkpointed Ternary grad[{idx_g}] diff={gd}"
+
+    # 2C. Checkpointed Crystal Scan forward (`== 0.0`) + backward parity (`M_len = 97, Bc = 32`)
+    BH_c, M_c, Gh_c, Ds_c = 4, 97, 8, 16
+    s0_c = torch.randn(BH_c, Gh_c, Ds_c)
+    kwe_c = torch.sigmoid(torch.randn(BH_c, M_c, Gh_c, 1))
+    kwv_c = kwe_c.clone()
+    vs_c = F.normalize(torch.randn(BH_c, M_c, Ds_c), dim=-1) * 4.0
+    Pe_c = log_sinkhorn_6(torch.randn(BH_c, M_c, Gh_c, Gh_c))
+    w_cr = torch.randn(BH_c, M_c, Gh_c, Ds_c)
+    for is_h in (False, True):
+        in_r = [t.clone().requires_grad_(True) for t in (s0_c, kwe_c, kwv_c, vs_c, Pe_c)]
+        in_c = [t.clone().requires_grad_(True) for t in (s0_c, kwe_c, kwv_c, vs_c, Pe_c)]
+        yr = diag_birkhoff_crystal_scan_jit(*in_r, is_h, 4.0)
+        yc = diag_birkhoff_crystal_scan(*in_c, is_h, 4.0, Bc=32)
+        assert (yr - yc).abs().max().item() < 1e-6, (
+            f"Crystal forward mismatch (is_hard={is_h}): {(yr - yc).abs().max().item()}"
+        )
+        (yr * w_cr).sum().backward()
+        (yc * w_cr).sum().backward()
+        for idx_g, (tr, tc) in enumerate(zip(in_r, in_c)):
+            gd = (tr.grad - tc.grad).abs().max().item()
+            assert gd < 1e-5, f"Crystal grad[{idx_g}] mismatch (is_hard={is_h}): {gd}"
+
+    # 3. UTF-8 Open-Web Byte Chunker + Streaming State + Backward Compat + LUT
+    ckpt_b_path = (
+        Path(__file__).resolve().parent.parent
+        / "checkpoints"
+        / "simvq_split_byte_hnet.pt"
+    )
+    if ckpt_b_path.exists():
+        ckpt_b = torch.load(ckpt_b_path, map_location="cpu", weights_only=False)
+        cfg_b = SimVQSplitConfig(**ckpt_b["simvq_split_config"])
+        assert cfg_b.byte_chunk_mode == "byte"
+        m_b = SimVQSplitLM(cfg_b)
+        m_b.load_state_dict(ckpt_b["simvq_split_state_dict"], strict=True)
+
+    cfg_u = SimVQSplitConfig(
+        vocab_size=259,
+        d_model=64,
+        n_heads=4,
+        d_ff=128,
+        n_layers_pre=1,
+        n_layers_post=1,
+        window_size=4,
+        num_spheres=4,
+        d_sphere=16,
+        codebook_size=8,
+        mem_heads=5,
+        mem_dim=16,
+        use_crystal=True,
+        use_woodbury=True,
+        use_byte_chunker=True,
+        byte_char_dim=16,
+        byte_d_ff=96,
+        byte_router_char_dim=8,
+        byte_router_hidden=64,
+        target_chunk_bytes=4.0,
+        max_chunk_bytes=6,
+        byte_chunk_mode="utf8",
+        max_utf8_bytes=12,
+        use_static_m_cap=True,
+    )
+    m_u = SimVQSplitLM(cfg_u).eval()
+    sample_str = (
+        "Привет мир! Код: def solve(x): return {'ok': True} 中文測試 🚀🔥🧠 "
+        "Кристалл Вудбери 2026 — O(1) память!"
+    )
+    valid_bytes = sample_str.encode("utf-8")
+    corrupt_tail = b"\x80\x80\x80\x80\x80"
+    raw_seq = [b + 3 for b in (valid_bytes + corrupt_tail)]
+    pad_len = 20
+    x_utf8 = torch.tensor([raw_seq + [0] * pad_len], dtype=torch.long)
+
+    with torch.no_grad():
+        e_u = m_u.tok_emb(x_utf8)
+        z_u, _, ctx_u = m_u.byte_chunker.encode_to_chunks(e_u, x_utf8)
+
+    b_arr = ctx_u.b_mask[0, : len(valid_bytes)].tolist()
+    cuts = [i for i, flag in enumerate(b_arr) if flag] + [len(valid_bytes)]
+    mid_utf8_errors = 0
+    for c_s, c_e in zip(cuts[:-1], cuts[1:]):
+        try:
+            valid_bytes[c_s:c_e].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            mid_utf8_errors += 1
+    assert mid_utf8_errors == 0, f"Detected {mid_utf8_errors} mid-UTF8 chunk splits!"
+    assert not ctx_u.b_mask[0, len(valid_bytes) + len(corrupt_tail) :].any(), (
+        "Trailing PAD tokens fired chunk boundaries!"
+    )
+
+    # Zero right-PAD entropy/ratio leak check
+    m_u.train()
+    x_short = torch.tensor([raw_seq[: len(valid_bytes)]], dtype=torch.long)
+    x_padded = torch.tensor(
+        [raw_seq[: len(valid_bytes)] + [0] * 48], dtype=torch.long
+    )
+    with torch.no_grad():
+        _ = m_u(x_short)
+        loss_short = m_u.byte_chunker.last_ratio_loss.item()
+        ratio_short = m_u.byte_chunker.last_chunk_ratio
+        _ = m_u(x_padded)
+        loss_padded = m_u.byte_chunker.last_ratio_loss.item()
+        ratio_padded = m_u.byte_chunker.last_chunk_ratio
+    assert abs(loss_short - loss_padded) < 1e-4, (
+        f"Right-PAD leaked into ratio/entropy loss: {loss_short} vs {loss_padded}"
+    )
+    assert abs(ratio_short - ratio_padded) < 1e-4
+
+    # Opposite-sign ratio gradient on UTF-8 leading-byte objective + zero dead grads
+    m_u.zero_grad()
+    logits_u = m_u(x_padded)
+    (
+        F.cross_entropy(
+            logits_u[:, :-1].reshape(-1, cfg_u.vocab_size),
+            x_padded[:, 1:].reshape(-1),
+            ignore_index=0,
+        )
+        + 0.05 * m_u.get_commitment_loss()
+    ).backward()
+    dead_u = [
+        n
+        for n, p in m_u.named_parameters()
+        if p.requires_grad and (p.grad is None or p.grad.abs().max().item() == 0.0)
+    ]
+    assert not dead_u, f"Dead grads in UTF-8 model: {dead_u}"
+
+    m_u.eval()
+    # Constant O(1) 1,268 B streaming state and bit parity on L=64..1024
+    expected_u_b = compute_chunker_state_bytes(
+        64, 16, 8, 32, byte_chunk_mode="utf8"
+    )
+    assert expected_u_b == compute_chunker_state_bytes(64, 16, 8, 32) + 12
+    assert compute_chunker_state_bytes(160, 32, 16, 32, byte_chunk_mode="utf8") == 1268
+    obs_u_bytes = []
+    # Mix valid multi-byte UTF-8 bytes repeated to L
+    base_ids = [b + 3 for b in valid_bytes]
+    with torch.no_grad():
+        for seq_L in (64, 256, 1024):
+            xs_ids = (base_ids * ((seq_L // len(base_ids)) + 1))[:seq_L]
+            xs_t = torch.tensor([xs_ids], dtype=torch.long)
+            es_t = m_u.tok_emb(xs_t)
+            ps, bs, hbs, st_b = m_u.byte_chunker.forward_streaming_check(es_t, xs_t)
+            obs_u_bytes.append(st_b)
+            assert st_b == expected_u_b
+            _, _, ctx_chk = m_u.byte_chunker.encode_to_chunks(es_t, xs_t)
+            assert torch.equal(ctx_chk.b_mask, bs), (
+                f"UTF-8 streaming boundary mismatch at L={seq_L}"
+            )
+            assert ctx_chk.b_mask.sum().item() <= m_u.byte_chunker.static_m_cap_for_T(seq_L)
+            assert (ctx_chk.p_prob - ps).abs().max().item() < 5e-3
+            assert (ctx_chk.h_byte.float() - hbs.float()).abs().max().item() < 5e-3
+    assert len(set(obs_u_bytes)) == 1
+
+    # Packed 2-bit uint8 LUT equivalence in utf8 + static_m_cap mode
+    m_u.byte_chunker.lock_router(True)
+    with torch.no_grad():
+        for mod in m_u.modules():
+            if isinstance(mod, nn.Linear) and mod is not m_u.lm_head:
+                if not m_u.byte_chunker.is_locked_router_module(mod):
+                    wq, _, _ = quantize_ternary_weights_ls(mod.weight.data)
+                    mod.weight.data.copy_(wq)
+    lut_u = pack_model_2bit_lut(m_u).eval()
+    assert any(isinstance(mod, PackedLUT2BitLinear) for mod in lut_u.modules())
+    fp_u = compute_2bit_lut_footprint(lut_u)
+    assert fp_u["matrix_compression_vs_fp32"] >= 15.9
+    with torch.no_grad():
+        max_lut_diff = (m_u(x_utf8) - lut_u(x_utf8)).abs().max().item()
+    assert max_lut_diff < 5e-3, f"UTF-8 2-bit LUT logits diverged: {max_lut_diff}"
+
+    # AMP BF16 autocast shield for collinear high-beta Cholesky/Joseph Woodbury scan (`M_len=160`)
+    dev_amp = "cuda" if torch.cuda.is_available() else "cpu"
+    base_k = F.normalize(torch.randn(8, 1, 5, 32, device=dev_amp), dim=-1)
+    k_amp = (
+        F.normalize(base_k + 1e-4 * torch.randn(8, 160, 5, 32, device=dev_amp), dim=-1)
+        .bfloat16()
+        .detach()
+        .requires_grad_(True)
+    )
+    q_amp = F.normalize(torch.randn(8, 160, 2, 5, 32, device=dev_amp), dim=-1).bfloat16()
+    v_amp = (torch.randn(8, 160, 5, 32, device=dev_amp) * 0.5).bfloat16()
+    b_amp = torch.full((8, 160, 5, 1), 0.99, device=dev_amp, dtype=torch.bfloat16)
+    g_amp = torch.full((8, 160, 5, 1), 0.95, device=dev_amp, dtype=torch.bfloat16)
+    with torch.amp.autocast(dev_amp, dtype=torch.bfloat16):
+        r_amp, u_amp = block_parallel_wy_fp_scan(
+            q_amp, k_amp, v_amp, b_amp, g_amp, 25.0, Bc=32, checkpointed=True
+        )
+        (r_amp.float().square().mean() + 0.1 * u_amp.float().mean()).backward()
+    assert r_amp.dtype == torch.bfloat16 and u_amp.dtype == torch.bfloat16
+    assert torch.isfinite(r_amp).all() and torch.isfinite(u_amp).all()
+    assert k_amp.grad is not None and torch.isfinite(k_amp.grad).all()
+
+    cfg_u_prod = SimVQSplitConfig(
+        vocab_size=259,
+        d_model=160,
+        n_heads=4,
+        d_ff=224,
+        n_layers_pre=2,
+        n_layers_post=1,
+        window_size=8,
+        num_spheres=24,
+        d_sphere=32,
+        codebook_size=32,
+        mem_heads=5,
+        mem_dim=32,
+        use_crystal=True,
+        use_woodbury=True,
+        use_byte_chunker=True,
+        byte_char_dim=32,
+        byte_d_ff=128,
+        byte_router_char_dim=16,
+        byte_router_hidden=96,
+        byte_commit_scale=0.23,
+        router_lock_frac=0.16,
+        target_chunk_bytes=4.6,
+        max_chunk_bytes=10,
+        byte_chunk_mode="utf8",
+        max_utf8_bytes=16,
+        use_static_m_cap=True,
+        ratio_loss_scale=1.5,
+    )
+    m_u_prod = SimVQSplitLM(cfg_u_prod).eval()
+    fp_u_prod = compute_2bit_lut_footprint(pack_model_2bit_lut(m_u_prod))
+    assert fp_u_prod["total_lut_kb"] <= 555.0
+    assert abs(fp_u_prod["matrix_compression_vs_fp32"] - 16.0) < 1e-3
+

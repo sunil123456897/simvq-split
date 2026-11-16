@@ -11,6 +11,7 @@ Shared deterministic checks used by `.git/hooks/pre-commit` and `validate_simvq_
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -23,7 +24,11 @@ RUFF_TARGETS = (
     "validate_simvq_split_results.py",
     "run_phase_b_byte_benchmark.py",
     "validate_phase_b_byte_results.py",
+    "run_phase_e_fast_utf8_benchmark.py",
+    "validate_phase_e_results.py",
 )
+
+OPTIONAL_RUFF_TARGETS = ()
 
 FORBIDDEN_PHRASES = (
     "не просто",
@@ -50,6 +55,7 @@ def collect_guarded_markdown_paths(root: Path) -> list[Path]:
         root / "README.md",
         root / "SimVQ_Split_Benchmark_Report.md",
         root / "Phase_B_Byte_Chunker_Report.md",
+        root / "Phase_E_Fast_UTF8_Report.md",
         root / "Post_Transformer_Architecture_v5_Blueprint.md",
         root / "AGENTS.md",
         root / "CODING_STANDARDS.md",
@@ -75,6 +81,7 @@ def check_baselines_untouched(root: Path) -> None:
 
 def check_ruff_lint(root: Path) -> None:
     """Run ruff fatal lint checks (`E9,F63,F7,F82`) across Python sources."""
+    targets = list(RUFF_TARGETS) + [t for t in OPTIONAL_RUFF_TARGETS if (root / t).exists()]
     res = subprocess.run(
         [
             sys.executable,
@@ -83,7 +90,7 @@ def check_ruff_lint(root: Path) -> None:
             "check",
             "--select",
             "E9,F63,F7,F82",
-            *RUFF_TARGETS,
+            *targets,
         ],
         cwd=str(root),
         capture_output=True,
@@ -95,7 +102,7 @@ def check_ruff_lint(root: Path) -> None:
 
 
 def check_anti_cheat_pytest(root: Path) -> str:
-    """Run `pytest tests/test_anti_cheat.py -q` and require at least 16 passing laws."""
+    """Run `pytest tests/test_anti_cheat.py -q` and require at least 17 passing laws."""
     res = subprocess.run(
         [
             sys.executable,
@@ -108,9 +115,10 @@ def check_anti_cheat_pytest(root: Path) -> str:
         capture_output=True,
         text=True,
     )
-    if res.returncode != 0 or "16 passed" not in res.stdout:
+    m = re.search(r"(\d+)\s+passed", res.stdout)
+    if res.returncode != 0 or m is None or int(m.group(1)) < 17 or "failed" in res.stdout:
         detail = (res.stdout + "\n" + res.stderr).strip()
-        raise AssertionError(f"Zero-Cheat pytest suite (16 laws) failed!\n{detail}")
+        raise AssertionError(f"Zero-Cheat pytest suite (>= 17 laws) failed!\n{detail}")
     return res.stdout.strip()
 
 

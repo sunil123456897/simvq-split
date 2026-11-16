@@ -326,6 +326,7 @@ def compute_state_cache_kb(
             scfg.d_model,
             getattr(scfg, "byte_char_dim", 32),
             getattr(scfg, "byte_router_char_dim", 16),
+            byte_chunk_mode=getattr(scfg, "byte_chunk_mode", "byte"),
         )
         if getattr(scfg, "use_byte_chunker", False)
         else 0
