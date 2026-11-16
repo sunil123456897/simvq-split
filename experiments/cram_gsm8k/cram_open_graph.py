@@ -42,7 +42,7 @@ except ImportError:
     from spherical_alu import SphericalBase10RegisterALU
 
 
-MAX_GRAPH_STEPS = 10
+MAX_GRAPH_STEPS = 12
 DU_HASH = 2048
 DP_HASH = 2304
 DR_HASH = 640
@@ -496,6 +496,239 @@ class CRAMzOperatorGraphEBM(nn.Module):
         e_z = -0.5 * (z_cands * F.linear(psi_sum_cands, W_zy_b)).sum(dim=-1)
         return e_unary + e_pair + e_group + e_z
 
+    def conditional_pair_energies_2opt(
+        self,
+        psi_seq_true: torch.Tensor,
+        t1: int,
+        t2: int,
+        cand_pairs_psi: torch.Tensor,
+        couplings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """2-Opt парный Besag без утечки (`0 BPTT`): оценивает все парные перестановки `(t1, t2)`
+        при полном исключении истинных состояний `t1, t2` и замкнутом пересчёте поля `z*`."""
+        M_z, W_zy_b, W_e_b, V_g_b = self._bounded_couplings() if couplings is None else couplings
+        n_total = int(psi_seq_true.size(0))
+        lo, hi = (int(t1), int(t2)) if int(t1) < int(t2) else (int(t2), int(t1))
+        if lo == hi or lo < 0 or hi >= n_total:
+            raise ValueError(f"Expected distinct valid node indices in 0..{n_total - 1}, got ({t1}, {t2})")
+        n_nodes = float(max(2, n_total))
+        other_psis = torch.cat(
+            [psi_seq_true[:lo], psi_seq_true[lo + 1 : hi], psi_seq_true[hi + 1 :]],
+            dim=0,
+        )
+        other_scaled = other_psis / n_nodes
+        cand1 = cand_pairs_psi[:, 0, :] / n_nodes
+        cand2 = cand_pairs_psi[:, 1, :] / n_nodes
+        cand_pair_sum = cand1 + cand2
+
+        psi_rest = other_scaled.sum(dim=0)
+        psi_tot = psi_rest.unsqueeze(0) + cand_pair_sum
+        z_cands = F.linear(psi_tot, M_z)
+
+        e_unary = -self.step_unary_head(cand_pair_sum).squeeze(-1)
+        e_pair_ext = -F.linear(cand_pair_sum, W_e_b) @ psi_rest
+        e_pair_int = -(F.linear(cand1, W_e_b) * cand2).sum(dim=-1)
+        e_pair = e_pair_ext + e_pair_int
+
+        if other_scaled.size(0) > 0:
+            v_other = torch.einsum("gkd,nd->gnk", V_g_b, other_scaled)
+            s_rest = v_other.sum(dim=1)
+            v_rest_sq = v_other.square().sum(dim=(1, 2))
+        else:
+            s_rest = torch.zeros(self.n_groups, self.group_k, device=cand_pairs_psi.device, dtype=cand_pairs_psi.dtype)
+            v_rest_sq = torch.zeros(self.n_groups, device=cand_pairs_psi.device, dtype=cand_pairs_psi.dtype)
+
+        v1 = torch.einsum("gkd,md->gmk", V_g_b, cand1)
+        v2 = torch.einsum("gkd,md->gmk", V_g_b, cand2)
+        v_tot = s_rest.unsqueeze(1) + v1 + v2
+        v_cand_sq = v1.square().sum(dim=-1) + v2.square().sum(dim=-1)
+        cross_g = (v_tot.square().sum(dim=-1) - v_rest_sq.unsqueeze(1) - v_cand_sq).t()
+
+        alpha = F.softmax(self.U_z(z_cands), dim=-1)
+        e_group = -0.5 * (alpha * cross_g).sum(dim=-1)
+        e_z = -0.5 * (z_cands * F.linear(psi_tot, W_zy_b)).sum(dim=-1)
+        return e_unary + e_pair + e_group + e_z
+
+    def _total_discrete_graph_energy(
+        self,
+        y_idx: torch.Tensor,
+        node_cand_bank: torch.Tensor,
+        pair_edges: torch.Tensor,
+        unary_node_bias: Optional[torch.Tensor],
+        pair_edge_pot: Optional[torch.Tensor],
+        couplings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, float]:
+        """Собирает `psi_seq` по индексам `y_idx` и считает точную полную энергию графа ограничений."""
+        n_nodes = int(node_cand_bank.size(0))
+        node_ar = torch.arange(n_nodes, device=node_cand_bank.device, dtype=torch.long)
+        psi_cur = node_cand_bank[node_ar, y_idx]
+        e_cram, _ = self.energy_from_psi_stack(psi_cur, couplings=couplings)
+        e_tot = float(e_cram.item())
+        if unary_node_bias is not None:
+            e_tot += float(unary_node_bias[node_ar, y_idx].sum().item())
+        if pair_edge_pot is not None and pair_edges.numel() > 0:
+            eu = pair_edges[:, 0]
+            ev = pair_edges[:, 1]
+            edge_ar = torch.arange(pair_edges.size(0), device=node_cand_bank.device, dtype=torch.long)
+            e_tot += float(pair_edge_pot[edge_ar, y_idx[eu], y_idx[ev]].sum().item())
+        return psi_cur, e_tot
+
+    @staticmethod
+    def _build_edge_adjacency_lists(
+        n_nodes: int, pair_edges: torch.Tensor
+    ) -> Tuple[List[List[Tuple[int, int, int]]], List[Tuple[int, int, int]]]:
+        """Строит списки смежности `inc[node] = [(edge_idx, nbr, side)]` без `dict`/`set`."""
+        inc: List[List[Tuple[int, int, int]]] = [[] for _ in range(n_nodes)]
+        edge_list: List[Tuple[int, int, int]] = []
+        if pair_edges.numel() > 0:
+            edges_cpu = pair_edges.detach().cpu().tolist()
+            for e_idx, uv in enumerate(edges_cpu):
+                u = int(uv[0])
+                v = int(uv[1])
+                if u == v:
+                    continue
+                inc[u].append((e_idx, v, 0))
+                inc[v].append((e_idx, u, 1))
+                edge_list.append((e_idx, u, v))
+        return inc, edge_list
+
+    @torch.no_grad()
+    def _one_flip_sweep(
+        self,
+        y_cur: torch.Tensor,
+        psi_cur: torch.Tensor,
+        node_cand_bank: torch.Tensor,
+        inc: List[List[Tuple[int, int, int]]],
+        unary_node_bias: Optional[torch.Tensor],
+        pair_edge_pot: Optional[torch.Tensor],
+        couplings: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Один координатный 1-flip проход Бесага по всем узлам без dict/set."""
+        n_nodes = int(node_cand_bank.size(0))
+        changed = False
+        for t in range(n_nodes):
+            e_cands = self.conditional_candidate_energies_no_leak(
+                psi_cur, t, node_cand_bank[t], couplings=couplings
+            )
+            if unary_node_bias is not None:
+                e_cands = e_cands + unary_node_bias[t]
+            if pair_edge_pot is not None and inc[t]:
+                for e_idx, nbr, side in inc[t]:
+                    yn = int(y_cur[nbr].item())
+                    if side == 0:
+                        e_cands = e_cands + pair_edge_pot[e_idx, :, yn]
+                    else:
+                        e_cands = e_cands + pair_edge_pot[e_idx, yn, :]
+            cur_c = int(y_cur[t].item())
+            best_c = int(torch.argmin(e_cands).item())
+            if float(e_cands[best_c].item()) < float(e_cands[cur_c].item()) - 1e-8:
+                y_cur[t] = best_c
+                psi_cur[t] = node_cand_bank[t, best_c]
+                changed = True
+        return changed
+
+    @torch.no_grad()
+    def besag_1flip_relax(
+        self,
+        y_init: torch.Tensor,
+        node_cand_bank: torch.Tensor,
+        pair_edges: torch.Tensor,
+        unary_node_bias: Optional[torch.Tensor] = None,
+        pair_edge_pot: Optional[torch.Tensor] = None,
+        max_sweeps: int = 6,
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Одноузловая координатная релаксация Бесага (`1-flip`, `0 BPTT`)."""
+        couplings = self._bounded_couplings()
+        n_nodes = int(node_cand_bank.size(0))
+        y_cur = y_init.clone().long().to(node_cand_bank.device)
+        psi_cur, _ = self._total_discrete_graph_energy(
+            y_cur, node_cand_bank, pair_edges, unary_node_bias, pair_edge_pot, couplings=couplings
+        )
+        inc, _ = self._build_edge_adjacency_lists(n_nodes, pair_edges)
+
+        for _ in range(max_sweeps):
+            if not self._one_flip_sweep(
+                y_cur, psi_cur, node_cand_bank, inc, unary_node_bias, pair_edge_pot, couplings
+            ):
+                break
+
+        psi_fin, e_fin = self._total_discrete_graph_energy(
+            y_cur, node_cand_bank, pair_edges, unary_node_bias, pair_edge_pot, couplings=couplings
+        )
+        return y_cur, psi_fin, e_fin
+
+    @torch.no_grad()
+    def block_gibbs_2opt_relax(
+        self,
+        y_init: torch.Tensor,
+        node_cand_bank: torch.Tensor,
+        pair_edges: torch.Tensor,
+        unary_node_bias: Optional[torch.Tensor] = None,
+        pair_edge_pot: Optional[torch.Tensor] = None,
+        max_sweeps: int = 6,
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Детерминированная `0-BPTT 2-Opt Block-Gibbs` релаксация по связанным парам `(u, v)`.
+        Чередует 1-узловой шаг и полную совместную оценку пары состояний на каждом ребре."""
+        couplings = self._bounded_couplings()
+        n_nodes, n_cands, _ = node_cand_bank.shape
+        y_cur = y_init.clone().long().to(node_cand_bank.device)
+        psi_cur, _ = self._total_discrete_graph_energy(
+            y_cur, node_cand_bank, pair_edges, unary_node_bias, pair_edge_pot, couplings=couplings
+        )
+        inc, edge_list = self._build_edge_adjacency_lists(n_nodes, pair_edges)
+
+        for _ in range(max_sweeps):
+            changed = self._one_flip_sweep(
+                y_cur, psi_cur, node_cand_bank, inc, unary_node_bias, pair_edge_pot, couplings
+            )
+
+            # Парный 2-opt блочный проход по связанным рёбрам (u, v)
+            for _, u, v in edge_list:
+                b_u = node_cand_bank[u].unsqueeze(1).expand(n_cands, n_cands, self.d_step)
+                b_v = node_cand_bank[v].unsqueeze(0).expand(n_cands, n_cands, self.d_step)
+                cand_pairs = torch.stack([b_u, b_v], dim=2).reshape(n_cands * n_cands, 2, self.d_step)
+                grid_e = self.conditional_pair_energies_2opt(
+                    psi_cur, u, v, cand_pairs, couplings=couplings
+                ).view(n_cands, n_cands)
+
+                if unary_node_bias is not None:
+                    grid_e = grid_e + unary_node_bias[u].unsqueeze(1) + unary_node_bias[v].unsqueeze(0)
+
+                if pair_edge_pot is not None:
+                    for e2, nbr, side in inc[u]:
+                        if nbr == v:
+                            pot_uv = pair_edge_pot[e2] if side == 0 else pair_edge_pot[e2].t()
+                            grid_e = grid_e + pot_uv
+                        else:
+                            yn = int(y_cur[nbr].item())
+                            vec_u = pair_edge_pot[e2, :, yn] if side == 0 else pair_edge_pot[e2, yn, :]
+                            grid_e = grid_e + vec_u.unsqueeze(1)
+                    for e2, nbr, side in inc[v]:
+                        if nbr != u:
+                            yn = int(y_cur[nbr].item())
+                            vec_v = pair_edge_pot[e2, :, yn] if side == 0 else pair_edge_pot[e2, yn, :]
+                            grid_e = grid_e + vec_v.unsqueeze(0)
+
+                cur_u = int(y_cur[u].item())
+                cur_v = int(y_cur[v].item())
+                flat_best = int(torch.argmin(grid_e.reshape(-1)).item())
+                best_u = flat_best // n_cands
+                best_v = flat_best % n_cands
+                if float(grid_e[best_u, best_v].item()) < float(grid_e[cur_u, cur_v].item()) - 1e-8:
+                    y_cur[u] = best_u
+                    y_cur[v] = best_v
+                    psi_cur[u] = node_cand_bank[u, best_u]
+                    psi_cur[v] = node_cand_bank[v, best_v]
+                    changed = True
+
+            if not changed:
+                break
+
+        psi_fin, e_fin = self._total_discrete_graph_energy(
+            y_cur, node_cand_bank, pair_edges, unary_node_bias, pair_edge_pot, couplings=couplings
+        )
+        return y_cur, psi_fin, e_fin
+
     def _score_psi_batched(
         self,
         psi_pad: torch.Tensor,
@@ -645,6 +878,19 @@ class OpenGraphCRAMSolver:
         self.cert_bias: float = 0.0
         self.theta_epi: float = 0.85
         self.tau_energy: float = -0.35
+
+        # Опциональный внешний переранжировщик System-1 (teacher-forced скоринг топ-кандидатов)
+        self._sys1_reranker: Optional[object] = None
+        self._sys1_use_lut: bool = False
+
+    def attach_system1_reranker(
+        self,
+        sys1_encoder: Optional[object],
+        use_lut: bool = False,
+    ) -> None:
+        """Прикрепляет `Calcite5MathSystem1` для оценки топ-кандидатов в одиночном `solve_blind`."""
+        self._sys1_reranker = sys1_encoder
+        self._sys1_use_lut = bool(use_lut)
 
     def state_dict(self) -> Dict[str, object]:
         """Возвращает полный сериализуемый словарь состояния решателя, памяти прецедентов и порогов."""
@@ -1194,6 +1440,7 @@ class OpenGraphCRAMSolver:
         ng = len(gr)
         gr_set = set(gr)
         min_ug = max(1, ng - 1 if ng <= 5 else ng - 2)
+        eff_min_ug = max(2, min(5, ng - 3)) if ng >= 8 else min_ug
         pmap: Dict[Tuple[int, int], int] = pf["pm"]  # type: ignore[assignment]
         by_sg: Dict[float, List[object]] = {}
 
@@ -1204,7 +1451,7 @@ class OpenGraphCRAMSolver:
             ul = {x for _, a, b in cd for x in (a, b) if x < k}
             ug = len(ul & gr_set)
             uc = len(ul) - ug
-            if ug < min_ug or uc > 1:
+            if ug < eff_min_ug or uc > 1:
                 return
             sg = _dag_rational_sig(cd, k)
             rv = _eval_dag_fast(vals, cd)
@@ -1229,6 +1476,24 @@ class OpenGraphCRAMSolver:
             for s1_lp, st_b in pf["beams"]:  # type: ignore[attr-defined]
                 _add_dag(st_b, is_bm=0.0, s1_lp=float(s1_lp), in_s1=1.0)
 
+        def _sub_bond_e(op: int, h1: int, l1: Tuple[int, ...], h2: int, l2: Tuple[int, ...], hd1: bool, hd2: bool) -> float:
+            prs = [(u, v) for u in l1 for v in l2 if u != v]
+            if not prs:
+                return 0.4
+            def _pe(u: int, v: int) -> float:
+                lo, hi = (u, v) if u < v else (v, u)
+                if op == 0:
+                    oc = 0
+                elif op == 1:
+                    oc = 1 if u < v else 2
+                elif op == 2:
+                    oc = 4 if (hd1 or hd2) else 3
+                else:
+                    oc = 5 if u < v else 6
+                return float(p_pot[pmap[(lo, hi)], oc])
+            e_head = _pe(h1, h2) if h1 != h2 else 0.0
+            return 0.55 * e_head + 0.45 * sum(_pe(u, v) for u, v in prs) / float(len(prs))
+
         if ng <= 3:
             act_all = gr + cn
             for i in act_all:
@@ -1248,25 +1513,7 @@ class OpenGraphCRAMSolver:
                                     _add_dag([s0, (o1, sa, sb)], is_bm=1.0)
                                     if o1 in (1, 3):
                                         _add_dag([s0, (o1, c, k)], is_bm=1.0)
-        else:
-            def _sub_bond_e(op: int, h1: int, l1: Tuple[int, ...], h2: int, l2: Tuple[int, ...], hd1: bool, hd2: bool) -> float:
-                prs = [(u, v) for u in l1 for v in l2 if u != v]
-                if not prs:
-                    return 0.4
-                def _pe(u: int, v: int) -> float:
-                    lo, hi = (u, v) if u < v else (v, u)
-                    if op == 0:
-                        oc = 0
-                    elif op == 1:
-                        oc = 1 if u < v else 2
-                    elif op == 2:
-                        oc = 4 if (hd1 or hd2) else 3
-                    else:
-                        oc = 5 if u < v else 6
-                    return float(p_pot[pmap[(lo, hi)], oc])
-                e_head = _pe(h1, h2) if h1 != h2 else 0.0
-                return 0.55 * e_head + 0.45 * sum(_pe(u, v) for u, v in prs) / float(len(prs))
-
+        elif ng <= 7:
             seeds: List[Tuple[Tuple[Tuple[int, float, int, Tuple[int, ...], bool], ...], Tuple[Tuple[int, int, int], ...], float]] = [
                 (tuple((i, vals[i], i, (i,), False) for i in gr), (), 0.0)
             ]
@@ -1331,6 +1578,121 @@ class OpenGraphCRAMSolver:
             done_forest.sort(key=lambda x: x[0])
             for _, d_fin in done_forest[:24]:
                 _add_dag(d_fin, is_bm=1.0)
+        else:
+            # Снятие обрыва на глубоких задачах (`ng >= 8`): ранжирование по информативности слотов + Iterative Register Folding
+            sal_map = {i: float(u_pot[i, 0] - np.min(u_pot[i, 1:])) for i in gr}
+            gr_by_sal = sorted(gr, key=lambda i: (sal_map[i], i), reverse=True)
+            core_subsets: List[Tuple[List[int], float]] = []
+            seen_cores: Set[Tuple[int, ...]] = set()
+            for k_sub in (4, 5, 6, 7, 8, min(10, ng)):
+                if k_sub <= ng:
+                    sub_s = tuple(sorted(gr_by_sal[:k_sub]))
+                    if sub_s not in seen_cores:
+                        seen_cores.add(sub_s)
+                        core_subsets.append((list(sub_s), 0.0))
+                    sub_p = tuple(gr[:k_sub])
+                    if k_sub <= 7 and sub_p not in seen_cores:
+                        seen_cores.add(sub_p)
+                        core_subsets.append((list(sub_p), 0.12))
+                    sub_t = tuple(gr[-k_sub:])
+                    if k_sub <= 7 and sub_t not in seen_cores:
+                        seen_cores.add(sub_t)
+                        core_subsets.append((list(sub_t), 0.15))
+
+            seeds_hi: List[Tuple[Tuple[Tuple[int, float, int, Tuple[int, ...], bool], ...], Tuple[Tuple[int, int, int], ...], float]] = []
+            for sub_gr, base_sc in core_subsets:
+                if len(sub_gr) <= 8:
+                    seeds_hi.append((tuple((i, vals[i], i, (i,), False) for i in sub_gr), (), base_sc))
+
+            beam_hi = seeds_hi[:6]
+            done_hi: List[Tuple[float, Tuple[Tuple[int, int, int], ...]]] = []
+            max_rounds_hi = min(MAX_GRAPH_STEPS, max(7, min(len(gr_by_sal), 9)))
+            for _ in range(max_rounds_hi):
+                nxt_hi = []
+                for ws, d, sc in beam_hi:
+                    mw = len(ws)
+                    if mw <= 1 or len(d) >= MAX_GRAPH_STEPS:
+                        continue
+                    nid = k + len(d)
+                    for ia in range(mw):
+                        na, va, ha, la, hda = ws[ia]
+                        for ib in range(ia + 1, mw):
+                            nb, vb, hb, lb, hdb = ws[ib]
+                            rws = tuple(ws[x] for x in range(mw) if x != ia and x != ib)
+                            lv = la + tuple(x for x in lb if x not in la)
+                            cand_ops = (
+                                (0, (na, va, ha, la, hda, nb, vb, hb, lb, hdb)),
+                                (1, (na, va, ha, la, hda, nb, vb, hb, lb, hdb)),
+                                (1, (nb, vb, hb, lb, hdb, na, va, ha, la, hda)),
+                                (2, (na, va, ha, la, hda, nb, vb, hb, lb, hdb)),
+                                (3, (na, va, ha, la, hda, nb, vb, hb, lb, hdb)),
+                                (3, (nb, vb, hb, lb, hdb, na, va, ha, la, hda)),
+                            )
+                            for op, (i1, v1, h1, l1, d1, i2, v2, h2, l2, d2) in cand_ops:
+                                if (op == 1 and v1 < v2 - 1e-6) or (op == 2 and (abs(v1 - 1.0) < 1e-6 or abs(v2 - 1.0) < 1e-6)) or (op == 3 and (abs(v2) < 1e-6 or abs(v2 - 1.0) < 1e-6)):
+                                    continue
+                                rv = v1 + v2 if op == 0 else (v1 - v2 if op == 1 else (v1 * v2 if op == 2 else v1 / v2))
+                                if (not math.isfinite(rv)) or abs(rv) > 1e8:
+                                    continue
+                                sa, sb = (min(i1, i2), max(i1, i2)) if op in (0, 2) else (i1, i2)
+                                nd_d = d + ((op, sa, sb),)
+                                be = _sub_bond_e(op, h1, l1, h2, l2, d1, d2)
+                                nn_t = (nid, rv, h1, lv, (op in (0, 1)) or d1 or d2)
+                                ws2 = rws + (nn_t,)
+                                if len(ws2) == 1:
+                                    done_hi.append((sc + be, nd_d))
+                                else:
+                                    nxt_hi.append((ws2, nd_d, sc + be))
+                if not nxt_hi:
+                    break
+                nxt_hi.sort(key=lambda x: x[2])
+                seen_hi: Set[Tuple[float, ...]] = set()
+                beam_hi = []
+                for itm in nxt_hi:
+                    sw = tuple(sorted(round(nd[1] * 1.137 + len(nd[3]) * 0.31, 3) for nd in itm[0]))
+                    if sw not in seen_hi:
+                        seen_hi.add(sw)
+                        beam_hi.append(itm)
+                        if len(beam_hi) >= 14:
+                            break
+            done_hi.sort(key=lambda x: x[0])
+            for _, d_fin in done_hi[:24]:
+                _add_dag(d_fin, is_bm=1.0)
+
+            # Быстрая жадная регистровая свёртка (`Iterative Register Folding`) для гарантии 100% непустого пула до ng<=16
+            for sub_gr, _ in core_subsets:
+                work = [(i, vals[i], i, (i,), False) for i in sub_gr]
+                fold_steps: List[Tuple[int, int, int]] = []
+                while len(work) > 1 and len(fold_steps) < MAX_GRAPH_STEPS:
+                    best_fold = None
+                    nid = k + len(fold_steps)
+                    for ia in range(len(work)):
+                        na, va, ha, la, hda = work[ia]
+                        for ib in range(ia + 1, len(work)):
+                            nb, vb, hb, lb, hdb = work[ib]
+                            for op in (0, 1, 2, 3):
+                                for (i1, v1, h1, l1, d1, i2, v2, h2, l2, d2) in (
+                                    (na, va, ha, la, hda, nb, vb, hb, lb, hdb),
+                                    (nb, vb, hb, lb, hdb, na, va, ha, la, hda),
+                                )[: (1 if op in (0, 2) else 2)]:
+                                    if (op == 1 and v1 < v2 - 1e-6) or (op == 3 and abs(v2) < 1e-6):
+                                        continue
+                                    rv = v1 + v2 if op == 0 else (v1 - v2 if op == 1 else (v1 * v2 if op == 2 else v1 / v2))
+                                    if (not math.isfinite(rv)) or rv <= 0.0 or rv > 1e8:
+                                        continue
+                                    be = _sub_bond_e(op, h1, l1, h2, l2, d1, d2)
+                                    if best_fold is None or be < best_fold[0]:
+                                        sa, sb = (min(i1, i2), max(i1, i2)) if op in (0, 2) else (i1, i2)
+                                        lv = l1 + tuple(x for x in l2 if x not in l1)
+                                        nn_t = (nid, rv, h1, lv, (op in (0, 1)) or d1 or d2)
+                                        best_fold = (be, ia, ib, (op, sa, sb), nn_t)
+                    if best_fold is None:
+                        break
+                    _, ia_b, ib_b, st_b, nn_b = best_fold
+                    fold_steps.append(st_b)
+                    work = [work[x] for x in range(len(work)) if x != ia_b and x != ib_b] + [nn_b]
+                    if len(work) == 1:
+                        _add_dag(fold_steps, is_bm=1.0)
 
         buckets: List[Tuple[Tuple[int, int], List[List[int]], int, float]] = [((ng, 0), [gr], 80, 1.0)]
         if 2 <= ng <= 7:
@@ -1339,6 +1701,15 @@ class OpenGraphCRAMSolver:
             buckets.append(((ng, 1), [gr + [ci] for ci in cn], 44, 0.65))
             if 2 <= ng <= 6:
                 buckets.append(((ng - 1, 1), [list(c) + [ci] for c in itertools.combinations(gr, ng - 1) for ci in cn[:1]], 24, 0.30))
+        if ng >= 8:
+            sal_map_b = {i: float(u_pot[i, 0] - np.min(u_pot[i, 1:])) for i in gr}
+            gr_by_sal_b = sorted(gr, key=lambda i: (sal_map_b[i], i), reverse=True)
+            for k_sub in (8, 7, 6, 5, 4):
+                if k_sub < ng:
+                    mps = [sorted(gr_by_sal_b[:k_sub]), gr[-k_sub:]]
+                    buckets.append(((k_sub, 0), mps, 36, 0.55))
+                    if cn:
+                        buckets.append(((k_sub, 1), [m + [cn[0]] for m in mps], 24, 0.35))
 
         q_ctx: np.ndarray = pf["ctx"]  # type: ignore[assignment]
         for kb, mp_list, top_n, b_scale in buckets:
@@ -1544,7 +1915,7 @@ class OpenGraphCRAMSolver:
         parsed: List[Tuple[Sequence[ExtractedSlot], Dict[str, object], float, Optional[float], Optional[np.ndarray]]] = []
 
         for it, sl, lmf in zip(train_items, slots_list, lm_feats_list):
-            if len(sl) < 2 or len(sl) > 14:
+            if len(sl) < 2 or len(sl) > 22:
                 continue
             pf = self._featurize_problem(str(it["question"]), sl, lmf)
             st, _, ok = self.extractor.compile_train_dag(sl, str(it["answer"]))
@@ -1565,7 +1936,7 @@ class OpenGraphCRAMSolver:
                 rX.append(pf["Rf"])
                 rY.append(int(rtop))
                 sk, u_gr, u_cn = _to_narrative_skeleton(stc, sl)
-                if len(u_cn) <= 1 and 1 <= len(u_gr) <= 8:
+                if len(u_cn) <= 1 and 1 <= len(u_gr) <= 10:
                     kb = (len(u_gr), len(u_cn))
                     self.sk_cnt.setdefault(kb, Counter())[sk] += 1
                     ep_vecs_list.setdefault(kb, []).append(pf["ctx"])  # type: ignore[arg-type]
@@ -1753,10 +2124,15 @@ class OpenGraphCRAMSolver:
         e_unary = e_unary_t.cpu().numpy().astype(np.float64)
         meta_m: np.ndarray = pk["meta_m"]  # type: ignore[assignment]
 
+        tf_map: Dict[Tuple[Tuple[int, int, int], ...], float] = (
+            lm_feat.get("cand_tf_lp", {}) if lm_feat is not None else {}  # type: ignore[assignment]
+        )
         max_drift = 0.0
         records: List[Dict[str, object]] = []
         for idx, c in enumerate(cands):
             dag: Tuple[Tuple[int, int, int], ...] = c[0]  # type: ignore[assignment]
+            has_tf = dag in tf_map
+            s1_lp_val = float(tf_map[dag]) if has_tf else float(c[7])
             records.append(
                 {
                     "steps": dag,
@@ -1767,7 +2143,8 @@ class OpenGraphCRAMSolver:
                     "e_unary": float(e_unary[idx]),
                     "meta": meta_m[idx],
                     "in_sys1": float(c[6]),
-                    "sys1_lp": float(c[7]),
+                    "sys1_lp": s1_lp_val,
+                    "has_tf": has_tf,
                 }
             )
         return records, max_drift
@@ -1777,7 +2154,12 @@ class OpenGraphCRAMSolver:
         e_u = np.array([float(r["e_unary"]) for r in cands], dtype=np.float64)
         in_b = np.array([float(r["in_sys1"]) for r in cands], dtype=np.float64)
         s1_lp = np.array([float(r["sys1_lp"]) for r in cands], dtype=np.float64)
-        s1_rel = np.maximum(-8.0, s1_lp - float(np.max(s1_lp))) if np.max(in_b) > 0.0 else np.zeros_like(s1_lp)
+        valid_mask = [float(r["in_sys1"]) > 0.0 or bool(r.get("has_tf", False)) for r in cands]
+        if any(valid_mask):
+            max_lp = max(float(r["sys1_lp"]) for r, flg in zip(cands, valid_mask) if flg)
+            s1_rel = np.maximum(-8.0, s1_lp - max_lp)
+        else:
+            s1_rel = np.zeros_like(s1_lp)
         meta = np.stack([r["meta"] for r in cands], axis=0).astype(np.float64)  # type: ignore[arg-type]
         return np.stack(
             [
@@ -1790,6 +2172,45 @@ class OpenGraphCRAMSolver:
             ],
             axis=-1,
         )
+
+    def enrich_lm_feats_with_system1_tf(
+        self,
+        items: Sequence[Dict[str, str]],
+        slots_list: Sequence[Sequence[ExtractedSlot]],
+        lm_feats_list: Sequence[Dict[str, object]],
+        sys1_encoder: object,
+        top_k: int = 16,
+        use_lut: bool = False,
+        batch_size: int = 64,
+    ) -> List[Dict[str, object]]:
+        """Оценивает топ-`top_k` кандидатов `CRAM+z` батчевым teacher-forced скорингом `System-1`."""
+        questions: List[str] = []
+        top_cands_per_q: List[List[Tuple[Tuple[int, int, int], ...]]] = []
+        for it, sl, lmf in zip(items, slots_list, lm_feats_list):
+            q_str = str(it["question"])
+            questions.append(q_str)
+            cands, _ = self._assemble_and_score_candidates(q_str, sl, lmf)
+            if len(sl) <= 1 or not cands:
+                top_cands_per_q.append([])
+                continue
+            top_recs = sorted(cands, key=lambda r: float(r["e_cram"]))[: max(1, int(top_k))]
+            top_cands_per_q.append([r["steps"] for r in top_recs if r["steps"]])  # type: ignore[misc]
+
+        tf_scores = sys1_encoder.score_candidate_dags_teacher_forced(  # type: ignore[attr-defined]
+            questions=questions,
+            slots_per_q=slots_list,
+            cands_per_q=top_cands_per_q,
+            extractor=self.extractor,
+            alu=self.alu,
+            use_lut=use_lut,
+            batch_size=batch_size,
+        )
+        enriched: List[Dict[str, object]] = []
+        for lmf, c_dags, c_scs in zip(lm_feats_list, top_cands_per_q, tf_scores):
+            rec = dict(lmf) if lmf is not None else {}
+            rec["cand_tf_lp"] = {dag: float(sc) for dag, sc in zip(c_dags, c_scs)}
+            enriched.append(rec)
+        return enriched
 
     def _boltzmann_rank(
         self, cands: Sequence[Dict[str, object]], e_vec: np.ndarray
@@ -1923,65 +2344,66 @@ class OpenGraphCRAMSolver:
             packed.append((cands, rmat, u_epi, gt, len(slots)))
 
         n_cal = max(1, len(cal_items))
+        has_sys1_signals = any(
+            (lmf is not None) and (bool(lmf.get("cand_tf_lp")) or bool(lmf.get("beam_plans")))
+            for lmf in lm_feats_list
+        )
         w_grid = [
             np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
         ]
+        if has_sys1_signals:
+            for w_in in (0.0, 0.15, 0.30):
+                for w_lp in (0.0, 0.25, 0.45, 0.70):
+                    if w_in == 0.0 and w_lp == 0.0:
+                        continue
+                    w_grid.append(np.array([1.0, 0.0, w_in, w_lp, 0.0, 0.0], dtype=np.float64))
 
         n_folds = 5 if len(packed) >= 25 else 1
+        base_w = w_grid[0]
+        if len(w_grid) > 1 and any(packed[i][0] for i in range(len(packed))):
+            wg_hits: List[int] = []
+            for wg in w_grid:
+                sc_tot = 0
+                for cands, rmat, _, gt, _ in packed:
+                    if not cands:
+                        continue
+                    _, top_v, _, _, _ = self._boltzmann_rank(cands, rmat @ wg)
+                    sc_tot += int(abs(top_v - gt) <= 1e-2)
+                wg_hits.append(sc_tot)
+            base_sc = wg_hits[0]
+            best_wi = 0
+            best_sc = base_sc
+            for wi in range(1, len(w_grid)):
+                if wg_hits[wi] > best_sc:
+                    best_sc = wg_hits[wi]
+                    best_wi = wi
+            chosen_w = w_grid[best_wi] if best_sc >= base_sc + 2 else base_w
+        else:
+            chosen_w = base_w
+        self.rerank_weights = chosen_w.copy()
+
         oof_rows: List[Tuple[int, float, np.ndarray, int]] = []
         p1_hits = 0
         p5_hits = 0
         un_hits = 0
-
-        for fold in range(n_folds):
-            best_w = w_grid[0]
-            if n_folds > 1:
-                best_tr = -1
-                for wg in w_grid:
-                    sc_tr = 0
-                    for idx, (cands, rmat, _, gt, _) in enumerate(packed):
-                        if idx % n_folds == fold or not cands:
-                            continue
-                        _, top_v, _, _, _ = self._boltzmann_rank(cands, rmat @ wg)
-                        sc_tr += int(abs(top_v - gt) <= 1e-2)
-                    if sc_tr > best_tr:
-                        best_tr = sc_tr
-                        best_w = wg
-
-            for idx, (cands, rmat, u_epi, gt, k_sl) in enumerate(packed):
-                if n_folds > 1 and idx % n_folds != fold:
-                    continue
-                if not cands:
-                    oof_rows.append((fold, u_epi, np.zeros(N_CERT_FEATS, dtype=np.float64), 0))
-                    continue
-                e_vec = rmat @ best_w
-                ranked, top_v, margin_e, ent_v, best_rec = self._boltzmann_rank(cands, e_vec)
-                h1 = int(abs(top_v - gt) <= 1e-2)
-                h5 = int(any(abs(kv - gt) <= 1e-2 for kv, _ in ranked[:5]))
-                e_un = np.array([float(r["e_unary"]) for r in cands], dtype=np.float64)
-                rk_u, top_u, _, _, _ = self._boltzmann_rank(cands, e_un)
-                h_un = int(abs(top_u - gt) <= 1e-2)
-                p1_hits += h1
-                p5_hits += h5
-                un_hits += h_un
-                p_top = float(ranked[0][1]) if ranked else 0.0
-                cf = self._cert_feature_vec(e_vec, margin_e, p_top, ent_v, best_rec, k_sl)
-                oof_rows.append((fold, u_epi, cf, h1))
-
-        # Выбираем единые веса ранжирования по полному `cal` из безопасной сетки `w_grid`
-        best_full_w = w_grid[0]
-        best_full_sc = -1
-        for wg in w_grid:
-            sc = 0
-            for cands, rmat, _, gt, _ in packed:
-                if not cands:
-                    continue
-                _, top_v, _, _, _ = self._boltzmann_rank(cands, rmat @ wg)
-                sc += int(abs(top_v - gt) <= 1e-2)
-            if sc > best_full_sc:
-                best_full_sc = sc
-                best_full_w = wg
-        self.rerank_weights = best_full_w.copy()
+        for idx, (cands, rmat, u_epi, gt, k_sl) in enumerate(packed):
+            fold = idx % n_folds if n_folds > 1 else 0
+            if not cands:
+                oof_rows.append((fold, u_epi, np.zeros(N_CERT_FEATS, dtype=np.float64), 0))
+                continue
+            e_vec = rmat @ self.rerank_weights
+            ranked, top_v, margin_e, ent_v, best_rec = self._boltzmann_rank(cands, e_vec)
+            h1 = int(abs(top_v - gt) <= 1e-2)
+            h5 = int(any(abs(kv - gt) <= 1e-2 for kv, _ in ranked[:5]))
+            e_un = np.array([float(r["e_unary"]) for r in cands], dtype=np.float64)
+            _, top_u, _, _, _ = self._boltzmann_rank(cands, e_un)
+            h_un = int(abs(top_u - gt) <= 1e-2)
+            p1_hits += h1
+            p5_hits += h5
+            un_hits += h_un
+            p_top = float(ranked[0][1]) if ranked else 0.0
+            cf = self._cert_feature_vec(e_vec, margin_e, p_top, ent_v, best_rec, k_sl)
+            oof_rows.append((fold, u_epi, cf, h1))
 
         # 2-й уровень OOF для калибровки логита сертификата E_cert
         eval_rows: List[Tuple[float, float, int]] = []
@@ -2047,6 +2469,7 @@ class OpenGraphCRAMSolver:
             "tau_energy": self.tau_energy,
             "cal_cert_prec_pct": 100.0 * best_prec,
             "cal_cert_cov_pct": 100.0 * max(0.0, best_cov),
+            "rerank_weights": [float(x) for x in self.rerank_weights],
         }
 
     def solve_blind(
@@ -2076,6 +2499,24 @@ class OpenGraphCRAMSolver:
                 "dual_certified": False,
                 "norm_drift": init_drift,
             }
+
+        if self._sys1_reranker is not None and (lm_feat is None or "cand_tf_lp" not in lm_feat) and len(slots) >= 2:
+            top_idx = sorted(range(len(cands)), key=lambda i: float(cands[i]["e_cram"]))[:16]
+            top_dags = [cands[i]["steps"] for i in top_idx if cands[i]["steps"]]
+            top_i_filt = [i for i in top_idx if cands[i]["steps"]]
+            if top_dags:
+                tf_sc = self._sys1_reranker.score_candidate_dags_teacher_forced(  # type: ignore[attr-defined]
+                    questions=[question_text],
+                    slots_per_q=[slots],
+                    cands_per_q=[top_dags],  # type: ignore[arg-type]
+                    extractor=self.extractor,
+                    alu=self.alu,
+                    use_lut=self._sys1_use_lut,
+                    batch_size=16,
+                )[0]
+                for idx_c, sc_val in zip(top_i_filt, tf_sc):
+                    cands[idx_c]["sys1_lp"] = float(sc_val)
+                    cands[idx_c]["has_tf"] = True
 
         slot_regs = [self.alu.encode(float(s.val)) for s in slots]
         rmat = self._build_rerank_matrix(cands)

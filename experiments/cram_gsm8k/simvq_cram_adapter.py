@@ -144,6 +144,23 @@ def align_slots_to_bpe_tokens(
     return token_ids, num_spans, post_spans, q_tok_idx
 
 
+def align_slots_to_utf8_bytes(
+    question_text: str,
+    slots: Sequence[ExtractedSlot],
+    bos_offset: int = 1,
+) -> List[Tuple[int, int]]:
+    """Напрямую сопоставляет `ExtractedSlot(b0, b1)` позициям сырого UTF-8 потока (`vocab=259`, `+<bos>`)."""
+    raw_len = len(question_text.encode("utf-8"))
+    q_idx = bos_offset + max(0, raw_len - 1)
+    spans: List[Tuple[int, int]] = []
+    for sl in slots:
+        if 0 <= sl.b0 < sl.b1 <= raw_len:
+            spans.append((bos_offset + int(sl.b0), bos_offset + int(sl.b1)))
+        else:
+            spans.append((q_idx, q_idx + 1))
+    return spans
+
+
 def extract_tournament_checkpoint_features(
     ckpt_path: Path,
     items: Sequence[Dict[str, str]],
@@ -222,29 +239,43 @@ def verify_alignment_and_sparsemax_without_torch() -> None:
     ext = TrainInducedQuantityExtractor()
     ext.fit(all_tr[:6000])
     tok = ByteBPETokenizer.train_from_iterator([str(it["question"]) for it in all_tr[:1500]], vocab_size=1536)
+    utf8_tok = ByteBPETokenizer(merges=[])
+    assert int(utf8_tok.vocab_size) == 259, f"Expected raw UTF-8 vocab_size=259, got {utf8_tok.vocab_size}"
 
     checked_slots = 0
     explicit_total = 0
     explicit_digit_matches = 0
+    utf8_digit_matches = 0
 
     for it in all_tr:
         q_str = str(it["question"])
         slots, _, _ = ext.extract_slots(q_str, include_aux_consts=True)
         t_ids, n_sp, p_sp, q_idx = align_slots_to_bpe_tokens(q_str, slots, tok, post_window=5)
+        u_ids, u_sp, u_post, u_q_idx = align_slots_to_bpe_tokens(q_str, slots, utf8_tok, post_window=16)
+        u_direct = align_slots_to_utf8_bytes(q_str, slots, bos_offset=1)
         assert len(n_sp) == len(slots) == len(p_sp)
-        assert 0 < q_idx < len(t_ids)
-        for sl, (s0, s1), (p0, p1) in zip(slots, n_sp, p_sp):
+        assert len(u_sp) == len(slots) == len(u_post) == len(u_direct)
+        assert 0 < q_idx < len(t_ids) and 0 < u_q_idx < len(u_ids)
+        for sl, (s0, s1), (p0, p1), (us0, us1), (ud0, ud1) in zip(slots, n_sp, p_sp, u_sp, u_direct):
             assert 0 <= s0 < s1 <= len(t_ids)
             assert 0 <= p0 < p1 <= len(t_ids)
+            assert 0 <= us0 < us1 <= len(u_ids)
+            if sl.b1 > sl.b0:
+                assert (us0, us1) == (ud0, ud1), f"UTF-8 span mismatch: {(us0, us1)} != {(ud0, ud1)}"
             checked_slots += 1
             if sl.kind == "EXPLICIT":
                 explicit_total += 1
                 decoded_piece = tok.decode(t_ids[s0:s1])
                 if any("0" <= ch <= "9" for ch in decoded_piece):
                     explicit_digit_matches += 1
+                utf8_piece = utf8_tok.decode(u_ids[us0:us1])
+                if any("0" <= ch <= "9" for ch in utf8_piece):
+                    utf8_digit_matches += 1
 
     match_rate = 100.0 * explicit_digit_matches / max(1, explicit_total)
+    utf8_rate = 100.0 * utf8_digit_matches / max(1, explicit_total)
     assert match_rate > 99.9, f"Потеря точности BPE-привязки: {match_rate:.2f}%"
+    assert utf8_rate == 100.0, f"Потеря точности UTF-8 привязки: {utf8_rate:.2f}%"
 
     rng = np.random.default_rng(2026)
     z = rng.standard_normal((8, 32))
@@ -270,6 +301,7 @@ def verify_alignment_and_sparsemax_without_torch() -> None:
     print(
         f"[VERIFY OK] Проверено {len(all_tr)} задач train.jsonl ({checked_slots} слотов, test.jsonl закрыт)!\n"
         f"            Точность BPE-привязки явных чисел: {explicit_digit_matches}/{explicit_total} ({match_rate:.2f}%)\n"
+        f"            Точность UTF-8 привязки явных чисел: {utf8_digit_matches}/{explicit_total} ({utf8_rate:.2f}%)\n"
         f"            Ошибка аналитического якобиана Sparsemax: {max_grad_err:.2e}"
     )
 
@@ -411,6 +443,7 @@ __all__ = [
     "ADAPTER_KNOBS",
     "ByteBPETokenizer",
     "align_slots_to_bpe_tokens",
+    "align_slots_to_utf8_bytes",
     "extract_tournament_checkpoint_features",
     "run_pytorch_adapter_pipeline",
     "sparsemax_numpy",

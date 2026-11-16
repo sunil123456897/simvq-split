@@ -1,11 +1,12 @@
 # `Calcite-5` (`SimVQ-Split v5`): Пост-трансформерная архитектура с `O(1)` кэшем, `548 KB` байтовым `2-bit LUT` и `CRAM+z`
 
-> **English Summary:** Pure neural post-Transformer `System-1 + System-2` architecture (`Calcite-5` / `SimVQ-Split v5`) verified across all 5 roadmap phases (**Phases A–E**). Combines a local continuous window cortex (`W = 12` BPE / `W = 8` chunked bytes), a 2-stage pointer-addressed Birkhoff–Voronoi permutation crystal on $S_G$ with an `id_well > 0` self-consistency attractor, a hybrid `(H-1)+1` RLS Neural Woodbury phrase latch with analytic hallucination brake $u_t = \lambda q_t^\top P_t q_t$, and multiplication-free `PackedLUT2BitLinear` (`2-bit uint8 T-MAC LUT`, `16.00x` matrix compression):
+> **English Summary:** Pure neural post-Transformer `System-1 + System-2` architecture (`Calcite-5` / `SimVQ-Split v5`) verified across all 6 roadmap phases (**Phases A–F**). Combines a local continuous window cortex (`W = 12` BPE / `W = 8` chunked bytes), a 2-stage pointer-addressed Birkhoff–Voronoi permutation crystal on $S_G$ with an `id_well > 0` self-consistency attractor, a hybrid `(H-1)+1` RLS Neural Woodbury phrase latch with analytic hallucination brake $u_t = \lambda q_t^\top P_t q_t$, and multiplication-free `PackedLUT2BitLinear` (`2-bit uint8 T-MAC LUT`, `16.00x` matrix compression):
 > - **Phase A (`ByteBPE-1536`):** `1,742,477` params, strictly `O(1)` `89.0 KB` inference state cache at `L = 2048` (`57.5x` smaller than `RoPETransformerLM`), **`954.55 KB`** full `2-bit LUT` footprint.
 > - **Phase B (`SurpriseHNetChunker` over `256` raw UTF-8 bytes, `vocab = 259`):** `1,483,841` params, word-scale pre-compression (`4.01` B/chunk) strictly before the core with constant `O(1)` **`82.72 KB`** total cache (`1,256 B` chunker buffer on `L = 64..2048`), **`548.34 KB`** full `2-bit LUT` footprint via frozen `FP16`-aligned router & two-group `500`-step `STE QAT`.
 > - **Phase C (`Open-Graph CRAM+z` + `SphericalBase10RegisterALU` + `DualCert`):** zero regex/`ast`/`288`-template host code, `0`-BPTT contrastive Besag PL equilibrium inference achieving **`63.23%`** `Oracle@Pool` and **`13.57%`** exact `Sealed Test` (`0.00` pp parity between `FP` and `954.55 KB` `2-bit LUT`).
 > - **Phase D (`Zero-Cheat & Invariant Gates`):** **`22`** automated pytest laws (`16/16` in `tests/test_anti_cheat.py` + `6/6` in `tests/test_cram_phase_c.py`), 7-model QA validators for Phases A and B, and Russian lexical quarantine across all Markdown docs.
 > - **Phase E (`Zero-Triton Fast Core & Open-Web UTF-8 Safety`):** **`654.44x`** vectorized `cummax` chunk span guard (`L = 2048`), **`5.44x`** block-parallel `WY + Cholesky` Woodbury scan (Joseph-form $P_t$, `float64` `log-cumsum`, and `AMP BF16` `torch.bmm` shield) + `Bc = 32` checkpointing cutting activation VRAM by **`4.67x / 4.74x / 2.98x`** (`1.51x` E2E `ByteHNet_FP_byte` speedup), **`0.00%`** mid-UTF8 cuts across all `6` open-web regimes (`1,268 B` constant streaming buffer / `82.73 KB` cache), and orthogonal `SeenMask` `STE QAT` preserving **`548.34 KB`** `2-bit LUT` at `45.67 EqPPL`, `80.5% S_5 k2`, `99.5% SelF1 Long`.
+> - **Phase F (`UTF-8 ByteHNet 548.34 KB` <-> `Interleaved SphericalALU + CRAM+z` & `2-Opt Block-Gibbs`):** closes Scaling Barrier #3 across `N = 16..256` (`z*` `max_pair_Linf = 0.00e+00`) and coupled discrete constraints (`2-Opt Block-Gibbs = 100.0%` vs `1-Flip Besag = 0.0%` at `N = 16..128`), breaks the `ng >= 8` pool cliff (`100%` pools up to `ng = 16`), unifies tokenizer-free `vocab = 259` `System-1` with interleaved `SphericalBase10RegisterALU` traces, and reaches **`14.40%`** (`FP`) / **`14.03%`** (`548.34 KB` `2-bit LUT`, `0.38` pp delta, `-42.56%` footprint vs Phase C `954.55 KB`) exact `Sealed Test` (`Pass@5 = 32.22% / 31.99%`, `27/27` Zero-Cheat laws).
 
 ## Архитектура трёх потоков, байтовый чанкер и мост `System-2`
 
@@ -118,10 +119,25 @@ flowchart LR
 
 ---
 
-## Анти-читерские гейты (Фазы D–E: `17 + 6 = 23` законов)
+## Фаза F — Бестокенизаторный `UTF-8 ByteHNet` (`548.34 KB`) + Итеративный `CRAM+z` и `2-Opt Block-Gibbs`
+
+Закрыт Инженерный барьер №3 масштабирования графов `CRAM+z` (`N = 16..256` и `ng = 4..16`), а `System-2` полностью переведён со словаря `BPE-1536` (`954.55 KB`) на бестокенизаторный поток сырого `UTF-8` (`vocab = 259`, `548.34 KB` `2-bit LUT`, сжатие `-42.56%`) с итеративным обменом `System-1 <-> SphericalBase10RegisterALU` (`w_mask = 0` на байтах `=val`). Подробности: [`Phase_F_UTF8_Iterative_CRAM_Report.md`](Phase_F_UTF8_Iterative_CRAM_Report.md), [`10_phase_f_utf8_iterative_cram_ledger.md`](research/post_transformer_synthesis/10_phase_f_utf8_iterative_cram_ledger.md), JSON: [`benchmarks/phase_f_utf8_iterative_cram_results.json`](benchmarks/phase_f_utf8_iterative_cram_results.json).
+
+| Метрика Фазы F (`Barrier #3` & `GSM8K`) | Базовый уровень (`1-Flip` / Фаза C BPE) | Фаза F (`2-Opt` / `UTF-8 548.34 KB`) | Эффект / Точность |
+| :--- | ---: | ---: | :--- |
+| Единственность `z*(Y)` (`N = 16..256`, `16` стартов) | — | `max_pair_Linf = 0.00e+00` | `err <= 2.79e-09`, Гершгорин `4.621` |
+| Сцепленные ловушки (`N = 16 / 32 / 64 / 128`, `0` BPTT) | `0.0%` (`1-Flip Besag`) | **`100.0%`** (`2-Opt Block-Gibbs`) | `40/40` на всех глубинах (`13.5..100.6 ms`) |
+| Высокослотовый синтез (`ng = 4..16` слотов) | обрыв `0.0%` (`ng >= 9`) | **`100.0%`** пул и `Oracle` | `2.67..17.37 ms/task`, `ng <= 7` без изменений |
+| `BlindDev` (`N = 737`): `FP` / `2-bit LUT` | `16.01%` / `16.42%` (`954.55 KB`) | **`17.37%`** / **`17.23%`** (`548.34 KB`) | `2.21x`/`2.23x` к `Unary`, `DualCert = 41.07%`/`33.86%` |
+| `Sealed Test` (`N = 1,319`, `1/1`): `FP` / `2-bit LUT` | `13.57%` / `13.57%` (`954.55 KB`) | **`14.40%`** / **`14.03%`** (`548.34 KB`) | `Pass@5 = 32.22%`/`31.99%`, `-42.56%` веса, `Δ=0.38 п.п.` |
+
+---
+
+## Анти-читерские гейты (Фазы D–F: `17 + 6 + 4 = 27` законов)
 
 1. **[`tests/test_anti_cheat.py`](tests/test_anti_cheat.py) (`17/17` законов ядра `simvq_split/`):** AST-запрет хост-эвристик по всем `7` файлам пакета, `100%` живых градиентов (включая `snap_alpha = 1.0`, `1.58-bit STE QAT` и границы `SurpriseHNetChunker`), строгая каузальность, изоляция окна коры, паритет параметров `<= 5%`, биекция $S_G$ и `id_well > 0` (`Law 14`), `BF16` SPD на `L = 2048` (`Law 13`), `PackedLUT2BitLinear` (`Law 15`), постоянный буфер чанкера `1,256 B` на `L = 64..2048` (`Law 16`), побитовый паритет `cummax`, устойчивость `WY+Cholesky` под `AMP BF16`, чекпоинт-сканы и `0.00%` разрывов UTF-8 с буфером `1,268 B` (`Law 17`).
 2. **[`tests/test_cram_phase_c.py`](tests/test_cram_phase_c.py) (`6/6` законов `c1..c6` Фазы C):** AST-чистота всех `6` модулей `experiments/cram_gsm8k/`, точность и дрейф `SphericalBase10RegisterALU`, диагональная доминантность `m - ||W_zz||_1 >= 4.0` + `0` BPTT + `20` живых параметров Бесага, data-driven экстрактор, `Sparsemax` якобиан и отсев ловушек `DualCert`.
+3. **[`tests/test_cram_phase_f.py`](tests/test_cram_phase_f.py) (`4/4` законов `f1..f4` Фазы F):** совместная градиентная чистота `20` параметров + `conditional_pair_energies_2opt`, загрузка `548.34 KB` `UTF-8` `2-bit LUT` (`70` слоёв, `vocab = 259`) с интерливингом АЛУ и побайтовым сбором Вудбери на длине `L >= 500`, единственность $z^*$ на `N = 128`, `100%` выход `2-Opt Block-Gibbs` из парных ловушек против `0%` `1-Flip Besag` и инвариантность пула на `ng <= 7` при непустой свёртке на `ng >= 10`.
 
 ## Быстрый старт и воспроизводимость (`Quickstart`)
 
@@ -129,24 +145,27 @@ flowchart LR
    ```bash
    python -X utf8 -u scripts/repo_guardrail.py
    ```
-2. Запустить полный пакет `Zero-Cheat` автотестов (ядро Фаз A/B/E + конвейер Фазы C, `23 passed`):
+2. Запустить полный пакет `Zero-Cheat` автотестов (ядро Фаз A/B/E + конвейер Фаз C и F, `27 passed`):
    ```bash
-   python -m pytest tests/test_anti_cheat.py tests/test_cram_phase_c.py -q
+   python -m pytest tests/test_anti_cheat.py tests/test_cram_phase_c.py tests/test_cram_phase_f.py -q
    ```
-3. Проверить артефакты, чекпоинты и пересобрать отчёты Фаз A, B и E без обучения:
+3. Проверить артефакты, чекпоинты и пересобрать отчёты Фаз A, B, E и F без обучения:
    ```bash
    python -u validate_simvq_split_results.py
    python -u validate_phase_b_byte_results.py
    python -X utf8 -u validate_phase_e_results.py
+   python -X utf8 -u validate_phase_f_results.py
    python -u run_simvq_split_benchmark.py --report-only
    python -X utf8 -u run_phase_b_byte_benchmark.py --report-only
    python -X utf8 -u run_phase_e_fast_utf8_benchmark.py --report-only
+   python -X utf8 -u run_phase_f_utf8_cram_benchmark.py --report-only
    ```
-4. Повторить полный прогон (Фаза A BPE, Фаза B ByteHNet или Фаза E Fast Core + UTF-8) и проверку выравнивания адаптера Фазы C:
+4. Повторить полный прогон (Фаза A BPE, Фаза B ByteHNet, Фаза E Fast Core + UTF-8 или Фаза F UTF-8 CRAM+z) и проверку выравнивания адаптера Фаз C/F:
    ```bash
    python -u run_simvq_split_benchmark.py
    python -X utf8 -u run_phase_b_byte_benchmark.py
    python -X utf8 -u run_phase_e_fast_utf8_benchmark.py
+   python -X utf8 -u run_phase_f_utf8_cram_benchmark.py
    python -X utf8 -u experiments/cram_gsm8k/simvq_cram_adapter.py --verify-alignment
    ```
 5. Проверить ранних чемпионов `SimVQCoprimeGPT` (`v10.4` из `checkpoints/simvq_champions_compact.pt.xz`):
@@ -157,10 +176,10 @@ flowchart LR
 ## Карта репозитория (`Calcite-5` и архив `v1`–`v36`)
 
 - **Ядро `simvq_split/` (`Calcite-5`):** [`models.py`](simvq_split/models.py) (`SimVQSplitLM`), [`chunker.py`](simvq_split/chunker.py) (`SurpriseHNetChunker`, `byte`/`utf8`), [`crystal.py`](simvq_split/crystal.py) (`VoronoiCrystalLayer`, `diag_birkhoff_crystal_scan`), [`woodbury.py`](simvq_split/woodbury.py) (`NeuralWoodburyLayer`, `block_parallel_wy_fp_scan`, `block_checkpointed_tern_scan`), [`quant_lut.py`](simvq_split/quant_lut.py) (`PackedLUT2BitLinear`, `quantize_ternary_weights_ls`), фасад реэкспорта [`memory.py`](simvq_split/memory.py), [`baselines.py`](simvq_split/baselines.py), [`tasks.py`](simvq_split/tasks.py), [`tokenizer.py`](simvq_split/tokenizer.py), [`eval_utils.py`](simvq_split/eval_utils.py).
-- **Архитектура `Calcite-5` и журналы:** [`Post_Transformer_Architecture_v5_Blueprint.md`](Post_Transformer_Architecture_v5_Blueprint.md), [`research/post_transformer_synthesis/`](research/post_transformer_synthesis/) (доклады `01`–`05` и журналы Фаз A/C/B/E: `06`–`09`).
-- **Конвейер `System-2` (`CRAM+z`, Фаза C) и прототипы:** [`experiments/cram_gsm8k/`](experiments/cram_gsm8k/) (`spherical_alu.py`, `slot_extractor.py`, `system1_encoder.py`, `cram_open_graph.py`, `gsm8k_cram_solver.py`, `simvq_cram_adapter.py`) и [`experiments/v5_proto/`](experiments/v5_proto/) (`smoke_v5_invariants.py`, `smoke_phase_b_chunker.py`, `probe_phase_b_byte_hnet.py`).
-- **Тесты, гардрейлы и стандарты:** [`tests/test_anti_cheat.py`](tests/test_anti_cheat.py), [`tests/test_cram_phase_c.py`](tests/test_cram_phase_c.py), [`scripts/repo_guardrail.py`](scripts/repo_guardrail.py), [`CODING_STANDARDS.md`](CODING_STANDARDS.md), [`AGENTS.md`](AGENTS.md), [`.agents/skills/calcite-phase-runner/SKILL.md`](.agents/skills/calcite-phase-runner/SKILL.md).
-- **Отчёты и метрики:** [`SimVQ_Split_Benchmark_Report.md`](SimVQ_Split_Benchmark_Report.md), [`Phase_B_Byte_Chunker_Report.md`](Phase_B_Byte_Chunker_Report.md), [`Phase_E_Fast_UTF8_Report.md`](Phase_E_Fast_UTF8_Report.md), [`benchmarks/simvq_split_results.json`](benchmarks/simvq_split_results.json), [`benchmarks/phase_b_byte_chunker_results.json`](benchmarks/phase_b_byte_chunker_results.json), [`benchmarks/phase_c_cram_gsm8k_results.json`](benchmarks/phase_c_cram_gsm8k_results.json), [`benchmarks/phase_e_fast_utf8_results.json`](benchmarks/phase_e_fast_utf8_results.json).
+- **Архитектура `Calcite-5` и журналы:** [`Post_Transformer_Architecture_v5_Blueprint.md`](Post_Transformer_Architecture_v5_Blueprint.md), [`research/post_transformer_synthesis/`](research/post_transformer_synthesis/) (доклады `01`–`05` и журналы Фаз A/C/B/E/F: `06`–`10`).
+- **Конвейер `System-2` (`CRAM+z`, Фазы C и F) и прототипы:** [`experiments/cram_gsm8k/`](experiments/cram_gsm8k/) (`spherical_alu.py`, `slot_extractor.py`, `system1_encoder.py`, `cram_open_graph.py`, `gsm8k_cram_solver.py`, `simvq_cram_adapter.py`) и [`experiments/v5_proto/`](experiments/v5_proto/) (`smoke_v5_invariants.py`, `smoke_phase_b_chunker.py`, `probe_phase_b_byte_hnet.py`).
+- **Тесты, гардрейлы и стандарты:** [`tests/test_anti_cheat.py`](tests/test_anti_cheat.py), [`tests/test_cram_phase_c.py`](tests/test_cram_phase_c.py), [`tests/test_cram_phase_f.py`](tests/test_cram_phase_f.py), [`scripts/repo_guardrail.py`](scripts/repo_guardrail.py), [`CODING_STANDARDS.md`](CODING_STANDARDS.md), [`AGENTS.md`](AGENTS.md), [`.agents/skills/calcite-phase-runner/SKILL.md`](.agents/skills/calcite-phase-runner/SKILL.md).
+- **Отчёты и метрики:** [`SimVQ_Split_Benchmark_Report.md`](SimVQ_Split_Benchmark_Report.md), [`Phase_B_Byte_Chunker_Report.md`](Phase_B_Byte_Chunker_Report.md), [`Phase_E_Fast_UTF8_Report.md`](Phase_E_Fast_UTF8_Report.md), [`Phase_F_UTF8_Iterative_CRAM_Report.md`](Phase_F_UTF8_Iterative_CRAM_Report.md), [`benchmarks/simvq_split_results.json`](benchmarks/simvq_split_results.json), [`benchmarks/phase_b_byte_chunker_results.json`](benchmarks/phase_b_byte_chunker_results.json), [`benchmarks/phase_c_cram_gsm8k_results.json`](benchmarks/phase_c_cram_gsm8k_results.json), [`benchmarks/phase_e_fast_utf8_results.json`](benchmarks/phase_e_fast_utf8_results.json), [`benchmarks/phase_f_utf8_iterative_cram_results.json`](benchmarks/phase_f_utf8_iterative_cram_results.json).
 - **Раннее ядро `v10.4` и архив `v12`–`v36`:** [`simvq_coprime_gpt.py`](simvq_coprime_gpt.py), [`run_champion_local.py`](run_champion_local.py), [`dream_rsi_simvq.py`](dream_rsi_simvq.py), [`archive_v12_v36/`](archive_v12_v36/), [`Полный_отчет_исследования_SimVQ_v1_v21.md`](Полный_отчет_исследования_SimVQ_v1_v21.md), [`Architecture_Freeze_Report_v28.md`](Architecture_Freeze_Report_v28.md).
 
 > **Примечание по крупным бинарным файлам:** `4` ранних чекпоинта `checkpoints/v13`–`v16`, распакованные дубли `c4_b0_a4_coprime_lock.pt` / `m_nl_transfer_ru_en_py.pt`, тяжёлые веса Фазы C (`phase_c_*.pt`) и авто-генерируемые кэши признаков `experiments/cram_gsm8k/checkpoints/*.npz` исключены через `.gitignore`; в репозитории для воспроизведения сохранены `checkpoints/simvq_champions_compact.pt.xz` (`5.13 MB`), веса Фазы A `checkpoints/simvq_split_tournament.pt` (`15.27 MB`), веса Фазы B `checkpoints/simvq_split_byte_hnet.pt` (`11.75 MB`), веса Фазы E `checkpoints/simvq_split_utf8_openweb.pt` (`11.73 MB`, `12,299,191 B`) и мост `experiments/cram_gsm8k/checkpoints/simvq_cram_bridge.pt` (`108.9 KB`).

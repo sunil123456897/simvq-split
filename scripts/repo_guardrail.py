@@ -26,6 +26,8 @@ RUFF_TARGETS = (
     "validate_phase_b_byte_results.py",
     "run_phase_e_fast_utf8_benchmark.py",
     "validate_phase_e_results.py",
+    "run_phase_f_utf8_cram_benchmark.py",
+    "validate_phase_f_results.py",
 )
 
 OPTIONAL_RUFF_TARGETS = ()
@@ -56,6 +58,7 @@ def collect_guarded_markdown_paths(root: Path) -> list[Path]:
         root / "SimVQ_Split_Benchmark_Report.md",
         root / "Phase_B_Byte_Chunker_Report.md",
         root / "Phase_E_Fast_UTF8_Report.md",
+        root / "Phase_F_UTF8_Iterative_CRAM_Report.md",
         root / "Post_Transformer_Architecture_v5_Blueprint.md",
         root / "AGENTS.md",
         root / "CODING_STANDARDS.md",
