@@ -4,7 +4,7 @@ Automated Repository Guardrail (`scripts/repo_guardrail.py`).
 Shared deterministic checks used by `.git/hooks/pre-commit` and `validate_simvq_split_results.py`:
 1. Zero diff on untouched `simvq_split/baselines.py` vs `HEAD`.
 2. Ruff syntax/fatal lint check (`E9,F63,F7,F82`) across core package, tests, scripts, and runners.
-3. 15-law Zero-Cheat `pytest tests/test_anti_cheat.py -q`.
+3. 16-law Zero-Cheat `pytest tests/test_anti_cheat.py -q`.
 4. UTF-8 (no BOM / U+FFFD) and Russian lexical quarantine across repository Markdown docs.
 """
 
@@ -21,6 +21,8 @@ RUFF_TARGETS = (
     "experiments",
     "run_simvq_split_benchmark.py",
     "validate_simvq_split_results.py",
+    "run_phase_b_byte_benchmark.py",
+    "validate_phase_b_byte_results.py",
 )
 
 FORBIDDEN_PHRASES = (
@@ -47,6 +49,7 @@ def collect_guarded_markdown_paths(root: Path) -> list[Path]:
     candidates = [
         root / "README.md",
         root / "SimVQ_Split_Benchmark_Report.md",
+        root / "Phase_B_Byte_Chunker_Report.md",
         root / "Post_Transformer_Architecture_v5_Blueprint.md",
         root / "AGENTS.md",
         root / "CODING_STANDARDS.md",
@@ -92,7 +95,7 @@ def check_ruff_lint(root: Path) -> None:
 
 
 def check_anti_cheat_pytest(root: Path) -> str:
-    """Run `pytest tests/test_anti_cheat.py -q` and require at least 15 passing laws."""
+    """Run `pytest tests/test_anti_cheat.py -q` and require at least 16 passing laws."""
     res = subprocess.run(
         [
             sys.executable,
@@ -105,9 +108,9 @@ def check_anti_cheat_pytest(root: Path) -> str:
         capture_output=True,
         text=True,
     )
-    if res.returncode != 0 or "15 passed" not in res.stdout:
+    if res.returncode != 0 or "16 passed" not in res.stdout:
         detail = (res.stdout + "\n" + res.stderr).strip()
-        raise AssertionError(f"Zero-Cheat pytest suite (15 laws) failed!\n{detail}")
+        raise AssertionError(f"Zero-Cheat pytest suite (16 laws) failed!\n{detail}")
     return res.stdout.strip()
 
 

@@ -9,6 +9,11 @@ Re-export facade for modularized submodules:
 from __future__ import annotations
 
 from .baselines import RMSNorm
+from .chunker import (
+    ByteChunkContext,
+    SurpriseHNetChunker,
+    compute_chunker_state_bytes,
+)
 from .crystal import (
     VoronoiCrystalLayer,
     _sphere_norm_jit,
@@ -50,4 +55,7 @@ __all__ = [
     "inspect_woodbury_spd_spectrum",
     "VoronoiCrystalLayer",
     "NeuralWoodburyLayer",
+    "ByteChunkContext",
+    "SurpriseHNetChunker",
+    "compute_chunker_state_bytes",
 ]

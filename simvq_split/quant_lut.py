@@ -187,6 +187,15 @@ def pack_model_2bit_lut(model: nn.Module) -> nn.Module:
     Deep-copies `model` in eval mode and replaces every ternary-quantized `nn.Linear`
     (keeping `lm_head` tied to `tok_emb`) with a physical `PackedLUT2BitLinear` T-MAC layer.
     """
+    for sub in model.modules():
+        for attr in (
+            "last_commit_loss",
+            "last_gate_loss",
+            "last_ratio_loss",
+            "last_epistemic_uncertainty",
+        ):
+            if hasattr(sub, attr):
+                setattr(sub, attr, None)
     packed = copy.deepcopy(model)
     packed.train(False)
     lm_head_ref = getattr(packed, "lm_head", None)

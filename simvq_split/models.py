@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from .baselines import RMSNorm, SwiGLU, TransformerBlock
 from .memory import (
     NeuralWoodburyLayer,
+    SurpriseHNetChunker,
     VoronoiCrystalLayer,
     quantize_ternary_ste,
 )
@@ -51,8 +52,11 @@ def _configure_model_ternary_qat(
     handles.clear()
     if enabled:
         hook_fn = _make_ternary_qat_hook(model)
+        bc = getattr(model, "byte_chunker", None)
         for _, mod in model.named_modules():
             if isinstance(mod, nn.Linear) and mod is not model.lm_head:
+                if bc is not None and bc.is_locked_router_module(mod):
+                    continue
                 handles.append(mod.register_forward_hook(hook_fn))
 
 
@@ -73,6 +77,17 @@ class SimVQSplitConfig:
     ridge_lambda: float = 0.04
     use_crystal: bool = True
     use_woodbury: bool = True
+    use_byte_chunker: bool = False
+    byte_char_dim: int = 32
+    byte_d_ff: int = 128
+    byte_router_char_dim: int = 16
+    byte_router_hidden: int = 96
+    byte_commit_scale: float = 0.45
+    router_lock_frac: float = 0.135
+    target_chunk_bytes: float = 4.9
+    max_chunk_bytes: int = 10
+    ratio_loss_scale: float = 1.5
+    pad_token_id: int = 0
 
     def resolved_dff(self) -> int:
         if self.d_ff is not None:
@@ -173,6 +188,21 @@ class SimVQSplitLM(nn.Module):
         self.norm_f = RMSNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
+        self.byte_chunker = (
+            SurpriseHNetChunker(
+                vocab_size=cfg.vocab_size,
+                d_model=cfg.d_model,
+                d_byte=cfg.byte_char_dim,
+                d_rchar=cfg.byte_router_char_dim,
+                r_hidden=cfg.byte_router_hidden,
+                byte_d_ff=cfg.byte_d_ff,
+                target_chunk_bytes=cfg.target_chunk_bytes,
+                max_chunk_bytes=cfg.max_chunk_bytes,
+                pad_token_id=cfg.pad_token_id,
+            )
+            if cfg.use_byte_chunker
+            else None
+        )
         self._qat_handles: list = []
         self.ternary_qat_enabled: bool = False
         self.qat_mix: float = 1.0
@@ -195,7 +225,19 @@ class SimVQSplitLM(nn.Module):
             self.crystal_2.qat_active_mix = act
 
     def set_crystal_schedule(self, step: int, total_steps: int) -> None:
-        frac = float(step) / float(max(1, total_steps))
+        raw_frac = float(step) / float(max(1, total_steps))
+        if self.byte_chunker is not None and self.cfg.router_lock_frac > 0.0:
+            lock_f = float(self.cfg.router_lock_frac)
+            if raw_frac < lock_f:
+                if self.byte_chunker.router_locked:
+                    self.byte_chunker.lock_router(False)
+                frac = 0.0
+            else:
+                if not self.byte_chunker.router_locked:
+                    self.byte_chunker.lock_router(True)
+                frac = (raw_frac - lock_f) / max(1e-4, 1.0 - lock_f)
+        else:
+            frac = raw_frac
         s_temp = 9.0 if frac <= 0.35 else min(13.0, 9.0 + 4.0 * (frac - 0.35) / 0.30)
         o_temp = 2.0 if frac <= 0.35 else min(5.0, 2.0 + 3.0 * (frac - 0.35) / 0.30)
         g_tau = 1.0 if frac <= 0.40 else min(1.8, 1.0 + 0.8 * (frac - 0.40) / 0.25)
@@ -223,22 +265,28 @@ class SimVQSplitLM(nn.Module):
 
     def get_commitment_loss(self) -> torch.Tensor:
         loss = torch.tensor(0.0, device=self.tok_emb.weight.device)
+        c_scale = (
+            float(self.cfg.byte_commit_scale)
+            if (self.byte_chunker is not None and self.byte_chunker.router_locked)
+            else 1.0
+        )
         if self.crystal is not None and self.crystal.last_commit_loss is not None:
-            loss = loss + self.crystal.last_commit_loss
+            loss = loss + c_scale * self.crystal.last_commit_loss
         if self.crystal_2 is not None and self.crystal_2.last_commit_loss is not None:
-            loss = loss + self.crystal_2.last_commit_loss
+            loss = loss + c_scale * self.crystal_2.last_commit_loss
         if self.woodbury is not None and self.woodbury.last_gate_loss is not None:
             loss = loss + self.woodbury.last_gate_loss
+        if self.byte_chunker is not None and self.byte_chunker.last_ratio_loss is not None:
+            loss = loss + float(self.cfg.ratio_loss_scale) * self.byte_chunker.last_ratio_loss
         return loss
 
-    def forward(
+    def _forward_core(
         self,
-        token_ids: torch.Tensor,
+        h: torch.Tensor,
+        e_lex: torch.Tensor,
         ablate_crystal: bool = False,
         ablate_woodbury: bool = False,
     ) -> torch.Tensor:
-        e_tok = self.tok_emb(token_ids)
-        h = e_tok
         for blk in self.cortex_pre:
             h = blk(h)
 
@@ -252,17 +300,17 @@ class SimVQSplitLM(nn.Module):
             and not ablate_woodbury
         ):
             gates = 2.0 * torch.sigmoid(self.stream_gate(h_split))
-            c_out = self.crystal(h_split, h_lex=e_tok)
-            w_out = self.woodbury(h_split, h_lex=e_tok)
+            c_out = self.crystal(h_split, h_lex=e_lex)
+            w_out = self.woodbury(h_split, h_lex=e_lex)
             delta_long = gates[..., 0:1] * c_out + gates[..., 1:2] * w_out
         else:
             if self.crystal is not None and not ablate_crystal:
-                c_out = self.crystal(h_split, h_lex=e_tok)
+                c_out = self.crystal(h_split, h_lex=e_lex)
                 if self.stream_gate is not None and self.woodbury is None:
                     c_out = (2.0 * torch.sigmoid(self.stream_gate(h_split))) * c_out
                 delta_long = delta_long + c_out
             if self.woodbury is not None and not ablate_woodbury:
-                delta_long = delta_long + self.woodbury(h_split, h_lex=e_tok)
+                delta_long = delta_long + self.woodbury(h_split, h_lex=e_lex)
 
         h = h + delta_long
         h = h + self.mid_mlp(self.mid_mlp_norm(h))
@@ -272,7 +320,7 @@ class SimVQSplitLM(nn.Module):
             and not ablate_crystal
         ):
             c2_in = self.cryst2_norm(h)
-            c2_out = self.crystal_2(c2_in, h_lex=e_tok)
+            c2_out = self.crystal_2(c2_in, h_lex=e_lex)
             if self.cryst2_gate is not None and (
                 self.woodbury is None or not ablate_woodbury
             ):
@@ -281,5 +329,32 @@ class SimVQSplitLM(nn.Module):
 
         for blk in self.cortex_post:
             h = blk(h)
+        return h
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        ablate_crystal: bool = False,
+        ablate_woodbury: bool = False,
+    ) -> torch.Tensor:
+        e_tok = self.tok_emb(token_ids)
+        if self.byte_chunker is not None:
+            z_in, h_lex_chunk, ctx = self.byte_chunker.encode_to_chunks(
+                e_tok, token_ids, self.tok_emb.weight
+            )
+            z_hat = self._forward_core(
+                z_in,
+                h_lex_chunk,
+                ablate_crystal=ablate_crystal,
+                ablate_woodbury=ablate_woodbury,
+            )
+            h = self.byte_chunker.decode_from_chunks(z_hat, ctx)
+        else:
+            h = self._forward_core(
+                e_tok,
+                e_tok,
+                ablate_crystal=ablate_crystal,
+                ablate_woodbury=ablate_woodbury,
+            )
 
         return self.lm_head(self.norm_f(h))

@@ -32,13 +32,13 @@ import json
 import math
 from pathlib import Path
 import random
-import subprocess
-import sys
 import time
 from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from scripts.repo_guardrail import check_anti_cheat_pytest
 
 from simvq_split.baselines import (
     BaselineConfig,
@@ -51,6 +51,7 @@ from simvq_split.eval_utils import (
 )
 from simvq_split.memory import (
     compute_2bit_lut_footprint,
+    compute_chunker_state_bytes,
     pack_model_2bit_lut,
     quantize_ternary_weights_ls,
 )
@@ -208,7 +209,10 @@ def measure_crystal_drift_at_1024(
     model.set_snap_alpha(1.0)
     x = torch.randint(3, vocab_size, (4, 1024), device=device)
     e_tok = model.tok_emb(x)
-    h = e_tok
+    if model.byte_chunker is not None:
+        h, e_lex, _ = model.byte_chunker.encode_to_chunks(e_tok, x, model.tok_emb.weight)
+    else:
+        h, e_lex = e_tok, e_tok
     for blk in model.cortex_pre:
         h = blk(h)
     hs = model.split_norm(h)
@@ -221,7 +225,7 @@ def measure_crystal_drift_at_1024(
         nonlocal max_norm_drift, max_lattice_err, stages_checked
         scale_r = math.sqrt(cryst.d_s)
         _, c_norm_t = cryst.get_codebook_fp32()
-        s_read, _, _, _ = cryst.forward_states(inp, h_lex=e_tok)
+        s_read, _, _, _ = cryst.forward_states(inp, h_lex=e_lex)
         norms = s_read.float().norm(dim=-1) / scale_r
         max_norm_drift = max(max_norm_drift, float((norms - 1.0).abs().max().item()))
         s_unit = F.normalize(s_read.float(), dim=-1)
@@ -244,17 +248,17 @@ def measure_crystal_drift_at_1024(
         ):
             gates = 2.0 * torch.sigmoid(model.stream_gate(hs))
             delta_long = (
-                gates[..., 0:1] * model.crystal(hs, h_lex=e_tok)
-                + gates[..., 1:2] * model.woodbury(hs, h_lex=e_tok)
+                gates[..., 0:1] * model.crystal(hs, h_lex=e_lex)
+                + gates[..., 1:2] * model.woodbury(hs, h_lex=e_lex)
             )
         else:
             if model.crystal is not None:
-                c1_out = model.crystal(hs, h_lex=e_tok)
+                c1_out = model.crystal(hs, h_lex=e_lex)
                 if model.stream_gate is not None and model.woodbury is None:
                     c1_out = (2.0 * torch.sigmoid(model.stream_gate(hs))) * c1_out
                 delta_long = delta_long + c1_out
             if model.woodbury is not None:
-                delta_long = delta_long + model.woodbury(hs, h_lex=e_tok)
+                delta_long = delta_long + model.woodbury(hs, h_lex=e_lex)
         h2 = h + delta_long
         h2 = h2 + model.mid_mlp(model.mid_mlp_norm(h2))
         _accumulate(model.crystal_2, model.cryst2_norm(h2))
@@ -317,7 +321,16 @@ def compute_state_cache_kb(
         wood_b = wood_mat + wood_ring
     else:
         wood_b = 0
-    return (local_kv + cryst_b + wood_b) / 1024.0
+    chunker_b = (
+        compute_chunker_state_bytes(
+            scfg.d_model,
+            getattr(scfg, "byte_char_dim", 32),
+            getattr(scfg, "byte_router_char_dim", 16),
+        )
+        if getattr(scfg, "use_byte_chunker", False)
+        else 0
+    )
+    return (local_kv + cryst_b + wood_b + chunker_b) / 1024.0
 
 
 @torch.no_grad()
@@ -749,23 +762,8 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    # 1. Enforce 15-Law Zero-Cheat Gate upfront
-    chk = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(root / "tests" / "test_anti_cheat.py"),
-            "-q",
-        ],
-        cwd=str(root),
-        capture_output=True,
-        text=True,
-    )
-    print(chk.stdout.strip(), flush=True)
-    if chk.returncode != 0 or "15 passed" not in chk.stdout:
-        print(chk.stderr, flush=True)
-        raise RuntimeError("Zero-Cheat Gate (15 laws) failed — aborting benchmark!")
+    # 1. Enforce 16-Law Zero-Cheat Gate upfront
+    print(check_anti_cheat_pytest(root), flush=True)
 
     torch.manual_seed(42)
     tr_docs, te_docs, tr_sents, te_sents = load_gsm8k_corpora(root)
