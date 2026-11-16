@@ -1,0 +1,170 @@
+{
+  "fp": {
+    "mode": "fp",
+    "ckpt": "E:\\эксперименты\\Новая нейронка\\checkpoints\\simvq_split_tournament.pt",
+    "n_train": 7473,
+    "n_test": 1319,
+    "pass1_base": 218,
+    "pass1_base_pct": 16.53,
+    "pass1": 224,
+    "pass1_pct": 16.98,
+    "pass1_ci95": [
+      15.05,
+      19.1
+    ],
+    "pass3": 377,
+    "pass3_pct": 28.58,
+    "pass3_ci95": [
+      26.21,
+      31.08
+    ],
+    "pass5": 448,
+    "pass5_pct": 33.97,
+    "pass5_ci95": [
+      31.46,
+      36.56
+    ],
+    "conf_tot": 233,
+    "conf_p1": 95,
+    "conf_acc_pct": 40.77,
+    "conf_cov_pct": 17.66,
+    "mean_u_prob_tr": 0.886527,
+    "mean_u_prob_te": 0.886263,
+    "max_drift": 1.1920928955078125e-07,
+    "by_steps": {
+      "2_steps": {
+        "n": 440,
+        "base_pass1": 122,
+        "base_pct": 27.73,
+        "joint_pass1": 123,
+        "joint_pct": 27.95
+      },
+      "3_steps": {
+        "n": 364,
+        "base_pass1": 57,
+        "base_pct": 15.66,
+        "joint_pass1": 58,
+        "joint_pct": 15.93
+      },
+      "4plus_steps": {
+        "n": 515,
+        "base_pass1": 39,
+        "base_pct": 7.57,
+        "joint_pass1": 43,
+        "joint_pct": 8.35
+      }
+    }
+  },
+  "qat": {
+    "mode": "qat",
+    "ckpt": "E:\\эксперименты\\Новая нейронка\\checkpoints\\simvq_split_tournament.pt",
+    "n_train": 7473,
+    "n_test": 1319,
+    "pass1_base": 218,
+    "pass1_base_pct": 16.53,
+    "pass1": 227,
+    "pass1_pct": 17.21,
+    "pass1_ci95": [
+      15.27,
+      19.34
+    ],
+    "pass3": 379,
+    "pass3_pct": 28.73,
+    "pass3_ci95": [
+      26.36,
+      31.23
+    ],
+    "pass5": 453,
+    "pass5_pct": 34.34,
+    "pass5_ci95": [
+      31.83,
+      36.95
+    ],
+    "conf_tot": 239,
+    "conf_p1": 94,
+    "conf_acc_pct": 39.33,
+    "conf_cov_pct": 18.12,
+    "mean_u_prob_tr": 0.876671,
+    "mean_u_prob_te": 0.87683,
+    "max_drift": 1.1920928955078125e-07,
+    "by_steps": {
+      "2_steps": {
+        "n": 440,
+        "base_pass1": 122,
+        "base_pct": 27.73,
+        "joint_pass1": 124,
+        "joint_pct": 28.18
+      },
+      "3_steps": {
+        "n": 364,
+        "base_pass1": 57,
+        "base_pct": 15.66,
+        "joint_pass1": 61,
+        "joint_pct": 16.76
+      },
+      "4plus_steps": {
+        "n": 515,
+        "base_pass1": 39,
+        "base_pct": 7.57,
+        "joint_pass1": 42,
+        "joint_pct": 8.16
+      }
+    }
+  },
+  "lut": {
+    "mode": "lut",
+    "ckpt": "E:\\эксперименты\\Новая нейронка\\checkpoints\\simvq_split_tournament.pt",
+    "n_train": 7473,
+    "n_test": 1319,
+    "pass1_base": 218,
+    "pass1_base_pct": 16.53,
+    "pass1": 227,
+    "pass1_pct": 17.21,
+    "pass1_ci95": [
+      15.27,
+      19.34
+    ],
+    "pass3": 377,
+    "pass3_pct": 28.58,
+    "pass3_ci95": [
+      26.21,
+      31.08
+    ],
+    "pass5": 451,
+    "pass5_pct": 34.19,
+    "pass5_ci95": [
+      31.68,
+      36.8
+    ],
+    "conf_tot": 232,
+    "conf_p1": 90,
+    "conf_acc_pct": 38.79,
+    "conf_cov_pct": 17.59,
+    "mean_u_prob_tr": 0.876687,
+    "mean_u_prob_te": 0.876846,
+    "max_drift": 1.1920928955078125e-07,
+    "by_steps": {
+      "2_steps": {
+        "n": 440,
+        "base_pass1": 122,
+        "base_pct": 27.73,
+        "joint_pass1": 126,
+        "joint_pct": 28.64
+      },
+      "3_steps": {
+        "n": 364,
+        "base_pass1": 57,
+        "base_pct": 15.66,
+        "joint_pass1": 59,
+        "joint_pct": 16.21
+      },
+      "4plus_steps": {
+        "n": 515,
+        "base_pass1": 39,
+        "base_pct": 7.57,
+        "joint_pass1": 42,
+        "joint_pct": 8.16
+      }
+    }
+  }
+}

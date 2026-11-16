@@ -1,0 +1,333 @@
+{
+  "protocol": {
+    "variant": "A",
+    "sealed_test_calls_used": 1,
+    "sealed_test_max_calls": 1,
+    "blind_dev_tries_used": {
+      "fp": 2,
+      "lut": 1,
+      "max": 2
+    },
+    "full_train_split": {
+      "train": 6700,
+      "cal": 773,
+      "test": 1319
+    }
+  },
+  "alu_invariants": {
+    "add_acc_pct": 100.0,
+    "sub_acc_pct": 100.0,
+    "mul_acc_pct": 100.0,
+    "div_acc_pct": 100.0,
+    "max_norm_drift": 1.1920928955078125e-07
+  },
+  "extractor_stats": {
+    "word_num_map": 27,
+    "unit_const_map": 50,
+    "bigram_suppress": 5,
+    "ctx_vocab": 1024,
+    "slot_aff_keys": 2770,
+    "q_aff_keys": 1503,
+    "pair_aff_keys": 1490
+  },
+  "sys1_full_fit": {
+    "n_compiled_train": 4948.0,
+    "final_loss": 0.209958402748636,
+    "lut_total_kb": 954.55,
+    "train_seconds": 512.6434389999995
+  },
+  "lut_footprint": {
+    "num_lut_layers": 56.0,
+    "packed_weights_count": 1485920.0,
+    "packed_u8_bytes": 371480.0,
+    "packed_u8_kb": 362.77,
+    "scales_fp16_bytes": 92914.0,
+    "scales_fp16_kb": 90.74,
+    "fp16_other_bytes": 513070.0,
+    "fp16_other_kb": 501.04,
+    "total_lut_kb": 954.55,
+    "orig_fp32_matrix_kb": 5804.38,
+    "matrix_compression_vs_fp32": 16.0,
+    "effective_matrix_compression_with_scales": 12.7988
+  },
+  "dev_validation": {
+    "cal_fp": {
+      "cal_oracle_pct": 61.82065217391305,
+      "cal_oof_pass1_pct": 14.130434782608695,
+      "cal_pass5_pct": 32.608695652173914,
+      "cal_unary_ablation_pct": 7.744565217391305,
+      "theta_epi": 0.8890393972396851,
+      "tau_energy": 0.7740289587278326,
+      "cal_cert_prec_pct": 38.93129770992366,
+      "cal_cert_cov_pct": 17.79891304347826
+    },
+    "blind_dev_fp": {
+      "tag": "BlindDev_FP",
+      "n": 737,
+      "pass1": 118,
+      "pass1_pct": 16.010854816824967,
+      "pass1_ci95": [
+        13.540612383374482,
+        18.833582657287103
+      ],
+      "unary_ablation_pass1": 52,
+      "unary_ablation_pass1_pct": 7.055630936227951,
+      "pass3_pct": 29.44369063772049,
+      "pass5_pct": 34.871099050203526,
+      "cert_tot": 115,
+      "cert_ok": 49,
+      "cert_cov_pct": 15.603799185888738,
+      "cert_prec_pct": 42.608695652173914,
+      "max_norm_drift": 5.960464477539063e-08,
+      "gershgorin_margin": 4.100000023841858,
+      "by_steps": {
+        "2_steps": [
+          264,
+          67,
+          130,
+          147
+        ],
+        "3_steps": [
+          223,
+          28,
+          53,
+          69
+        ],
+        "4plus_steps": [
+          250,
+          23,
+          34,
+          41
+        ]
+      }
+    },
+    "cal_lut": {
+      "cal_oracle_pct": 61.68478260869565,
+      "cal_oof_pass1_pct": 14.266304347826086,
+      "cal_pass5_pct": 33.96739130434783,
+      "cal_unary_ablation_pct": 7.744565217391305,
+      "theta_epi": 0.8438456058502197,
+      "tau_energy": 0.7552212727794345,
+      "cal_cert_prec_pct": 39.0,
+      "cal_cert_cov_pct": 13.586956521739129
+    },
+    "blind_dev_lut": {
+      "tag": "BlindDev_LUT",
+      "n": 737,
+      "pass1": 121,
+      "pass1_pct": 16.417910447761194,
+      "pass1_ci95": [
+        13.918885890079554,
+        19.265199030334585
+      ],
+      "unary_ablation_pass1": 58,
+      "unary_ablation_pass1_pct": 7.869742198100407,
+      "pass3_pct": 28.900949796472183,
+      "pass5_pct": 34.73541383989145,
+      "cert_tot": 84,
+      "cert_ok": 32,
+      "cert_cov_pct": 11.397557666214382,
+      "cert_prec_pct": 38.095238095238095,
+      "max_norm_drift": 5.960464477539063e-08,
+      "gershgorin_margin": 4.100000023841858,
+      "by_steps": {
+        "2_steps": [
+          264,
+          76,
+          126,
+          150
+        ],
+        "3_steps": [
+          223,
+          26,
+          55,
+          65
+        ],
+        "4plus_steps": [
+          250,
+          19,
+          32,
+          41
+        ]
+      }
+    }
+  },
+  "full_train_calibration": {
+    "fit_ebm": {
+      "trainable_packs": 4309.0,
+      "final_contrastive_loss": 3.5159478736991643,
+      "gershgorin_margin": 4.100000023841858,
+      "train_seconds": 114.58306959999754
+    },
+    "cal_fp": {
+      "cal_oracle_pct": 64.42432082794308,
+      "cal_oof_pass1_pct": 15.782664941785251,
+      "cal_pass5_pct": 32.85899094437257,
+      "cal_unary_ablation_pct": 8.926261319534282,
+      "theta_epi": 0.8740688562393188,
+      "tau_energy": 0.7362970465175904,
+      "cal_cert_prec_pct": 38.05309734513274,
+      "cal_cert_cov_pct": 14.61836998706339
+    },
+    "cal_lut": {
+      "cal_oracle_pct": 64.42432082794308,
+      "cal_oof_pass1_pct": 16.041397153945667,
+      "cal_pass5_pct": 34.02328589909444,
+      "cal_unary_ablation_pct": 7.8913324708926265,
+      "theta_epi": 0.877981960773468,
+      "tau_energy": 0.7388734904455322,
+      "cal_cert_prec_pct": 38.01652892561984,
+      "cal_cert_cov_pct": 15.653298835705046
+    }
+  },
+  "beam_recalls": {
+    "cal_fp": {
+      "top1_pct": 2.7166882276843465,
+      "topk_pct": 6.597671410090556
+    },
+    "cal_lut": {
+      "top1_pct": 3.3635187580853816,
+      "topk_pct": 8.667529107373868
+    },
+    "test_fp": {
+      "top1_pct": 2.350265352539803,
+      "topk_pct": 6.21683093252464
+    },
+    "test_lut": {
+      "top1_pct": 2.6535253980288096,
+      "topk_pct": 7.050796057619409
+    }
+  },
+  "sealed_test": {
+    "fp": {
+      "tag": "SealedTest_FP",
+      "n": 1319,
+      "oracle_hits": 834,
+      "oracle_pct": 63.229719484457924,
+      "pass1": 179,
+      "pass1_pct": 13.570887035633055,
+      "pass1_ci95": [
+        11.828085038531626,
+        15.525265312558345
+      ],
+      "unary_ablation_pass1": 72,
+      "unary_ablation_pass1_pct": 5.458680818802123,
+      "unary_gain_ratio": 2.4861111111111107,
+      "pass3": 340,
+      "pass3_pct": 25.77710386656558,
+      "pass3_ci95": [
+        23.489284566534533,
+        28.205607082109058
+      ],
+      "pass5": 405,
+      "pass5_pct": 30.70507960576194,
+      "pass5_ci95": [
+        28.274772154208687,
+        33.24744983195655
+      ],
+      "cert_tot": 213,
+      "cert_ok": 80,
+      "cert_cov_pct": 16.148597422289612,
+      "cert_prec_pct": 37.55868544600939,
+      "max_norm_drift": 5.960464477539063e-08,
+      "gershgorin_margin": 4.100000023841858,
+      "by_steps": {
+        "2_steps": [
+          440,
+          105,
+          200,
+          226
+        ],
+        "3_steps": [
+          364,
+          41,
+          84,
+          110
+        ],
+        "4plus_steps": [
+          515,
+          33,
+          56,
+          69
+        ]
+      }
+    },
+    "lut_2bit": {
+      "tag": "SealedTest_LUT_2bit",
+      "n": 1319,
+      "oracle_hits": 821,
+      "oracle_pct": 62.24412433661865,
+      "pass1": 179,
+      "pass1_pct": 13.570887035633055,
+      "pass1_ci95": [
+        11.828085038531626,
+        15.525265312558345
+      ],
+      "unary_ablation_pass1": 82,
+      "unary_ablation_pass1_pct": 6.21683093252464,
+      "unary_gain_ratio": 2.182926829268293,
+      "pass3": 335,
+      "pass3_pct": 25.39802880970432,
+      "pass3_ci95": [
+        23.12270070505879,
+        27.816242456083135
+      ],
+      "pass5": 407,
+      "pass5_pct": 30.856709628506444,
+      "pass5_ci95": [
+        28.422570386704322,
+        33.402030994461576
+      ],
+      "cert_tot": 197,
+      "cert_ok": 78,
+      "cert_cov_pct": 14.935557240333585,
+      "cert_prec_pct": 39.59390862944162,
+      "max_norm_drift": 5.960464477539063e-08,
+      "gershgorin_margin": 4.100000023841858,
+      "by_steps": {
+        "2_steps": [
+          440,
+          107,
+          194,
+          226
+        ],
+        "3_steps": [
+          364,
+          44,
+          86,
+          114
+        ],
+        "4plus_steps": [
+          515,
+          28,
+          55,
+          67
+        ]
+      }
+    },
+    "fp_lut_pass1_gap_pp": 0.0
+  },
+  "acceptance_gates": {
+    "fp": {
+      "pass1_ge_13_0": true,
+      "pass5_ge_27_0": true,
+      "pairwise_ge_1_6x_unary": true,
+      "cert_prec_ge_pass1_plus_15": true,
+      "cert_cov_ge_6_0": true,
+      "drift_lt_1e6": true,
+      "gershgorin_ge_4_0": true
+    },
+    "lut_2bit": {
+      "pass1_ge_13_0": true,
+      "pass5_ge_27_0": true,
+      "pairwise_ge_1_6x_unary": true,
+      "cert_prec_ge_pass1_plus_15": true,
+      "cert_cov_ge_6_0": true,
+      "drift_lt_1e6": true,
+      "gershgorin_ge_4_0": true
+    },
+    "fp_lut_gap_le_2_0pp": true,
+    "all_passed": true
+  },
+  "total_elapsed_sec": 2300.1510758000004
+}
