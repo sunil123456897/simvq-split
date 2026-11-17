@@ -46,6 +46,9 @@ checkpoints/m_nl_transfer_ru_en_py.pt
 experiments/cram_gsm8k/checkpoints/*.npz
 experiments/cram_gsm8k/checkpoints/*.pt
 
-# Heavy Phase G FP/BF16 Colab checkpoints (2-bit LUT `calcite5_tier1_17m_utf8_lut.pt` stays tracked)
+# Heavy Phase G/H FP/BF16 Colab checkpoints (2-bit LUT checkpoints stay tracked)
 checkpoints/calcite5_tier1_17m_utf8_bf16.pt
+checkpoints/attempt1_polished_bf16.pt
+checkpoints/calcite5_tier1_17m_utf8_qat_h_bf16.pt
 checkpoints/tier1_cram_adapted.pt
+checkpoints/tier1_h_cram_adapted.pt
