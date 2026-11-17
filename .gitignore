@@ -45,3 +45,7 @@ checkpoints/m_nl_transfer_ru_en_py.pt
 # Auto-regenerated GSM8K slot feature cache & Phase C local checkpoints
 experiments/cram_gsm8k/checkpoints/*.npz
 experiments/cram_gsm8k/checkpoints/*.pt
+
+# Heavy Phase G FP/BF16 Colab checkpoints (2-bit LUT `calcite5_tier1_17m_utf8_lut.pt` stays tracked)
+checkpoints/calcite5_tier1_17m_utf8_bf16.pt
+checkpoints/tier1_cram_adapted.pt
