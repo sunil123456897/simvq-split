@@ -31,6 +31,7 @@ RUFF_TARGETS = (
     "validate_phase_f_results.py",
     "validate_phase_g_results.py",
     "validate_phase_h_results.py",
+    "validate_phase_i_results.py",
 )
 
 OPTIONAL_RUFF_TARGETS = ()
