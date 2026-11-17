@@ -52,3 +52,7 @@ checkpoints/attempt1_polished_bf16.pt
 checkpoints/calcite5_tier1_17m_utf8_qat_h_bf16.pt
 checkpoints/tier1_cram_adapted.pt
 checkpoints/tier1_h_cram_adapted.pt
+
+# Auto-regenerated Phase J Tier-1 LUT feature caches & local checkpoints
+experiments/uebr_system2/cache/*.npz
+experiments/uebr_system2/checkpoints/*.pt
