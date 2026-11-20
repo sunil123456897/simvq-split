@@ -34,6 +34,7 @@ RUFF_TARGETS = (
     "validate_phase_i_results.py",
     "run_phase_j_uebr_benchmark.py",
     "validate_phase_j_results.py",
+    "validate_phase_k_results.py",
 )
 
 OPTIONAL_RUFF_TARGETS = ()
@@ -68,6 +69,7 @@ def collect_guarded_markdown_paths(root: Path) -> list[Path]:
         root / "Phase_G_Colab_ScaleUp_Report.md",
         root / "Phase_H_Tier1_QAT_Closure_Report.md",
         root / "Phase_J_UEBR_System2_Report.md",
+        root / "Phase_K_System1_Scaling_Report.md",
         root / "Post_Transformer_Architecture_v5_Blueprint.md",
         root / "AGENTS.md",
         root / "CODING_STANDARDS.md",

@@ -56,3 +56,11 @@ checkpoints/tier1_h_cram_adapted.pt
 # Auto-regenerated Phase J Tier-1 LUT feature caches & local checkpoints
 experiments/uebr_system2/cache/*.npz
 experiments/uebr_system2/checkpoints/*.pt
+
+# Transient Phase K scratch cell dumps & intermediate probe files
+# (final phase_k_via_negativa_probe.json, phase_k_scaling_law_results.json, phase_k_chinchilla_s3_results.json & LUT checkpoints stay tracked)
+benchmarks/phase_k_cells/
+benchmarks/phase_k_chinchilla_cells/
+benchmarks/phase_k_via_negativa_probe.partial.json
+benchmarks/phase_k_probe_*.json
+benchmarks/phase_k_smoke_tmp/

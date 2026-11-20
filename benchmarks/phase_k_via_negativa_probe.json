@@ -1,0 +1,1135 @@
+{
+  "protocol": {
+    "recipe": "k8_k11_a100_verified_synthesis_v1_8_2_6",
+    "device": "NVIDIA A100-SXM4-40GB",
+    "probe_d_model": 160,
+    "steps": 2800,
+    "utf8_steps": 320,
+    "batch_size": 64,
+    "seq_len": 768,
+    "n_eval": 100,
+    "provenance": {
+      "v0_source": "K8 (NVIDIA A100-SXM4-40GB, k8_orthogonal_2800_500_320)",
+      "v1_source": "K11 (NVIDIA A100-SXM4-40GB, k11_shiftlex_duallag_latch6_2800_600_320)",
+      "l4_diagnostics": "K12-K15 recorded verbatim in prior_diagnostics",
+      "selection_rationale": "Locks V1_lean_pruned (window_size=8, crystal_w_chunks=2, woodbury_latch_span=6) per K8+K10+K11 verified A100 evidence (-19.42%/-24.73%/-23.85% tier O(1) cache vs W=12; -7.44%/-5.75%/-4.43% vs W=8) and K12-K15 L4 diagnostics, terminating 1.48M micro-probe loop and advancing to 5M/25M/85M scaling."
+    }
+  },
+  "prior_diagnostics": {
+    "k1c_w12_mixed_batch": {
+      "tag": "W12_mixed_batch_K1c",
+      "window_size": 12,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2200,
+      "device": "NVIDIA L4",
+      "cache_kb_L2048": 90.23,
+      "train_seconds": 1181.37,
+      "mean_openweb_bpb": 4.1357,
+      "max_mid_utf8_split_pct": 0.0,
+      "en_bytes_per_chunk": 4.499,
+      "s5_sum": 5.0,
+      "ov_ood_long_pct": 97.0,
+      "selective_f1_ood_long": 90.6,
+      "stop_crane_triggered": true,
+      "root_cause": "Mixed high-entropy CJK/Emoji/RU rows in same batch as S_5 starved crystal capacity (crystal.py:646-650) and attenuated S_5 grad norm"
+    },
+    "k2a_w8_twophase_mixed_batch": {
+      "tag": "W8_twophase_mixed_batch_K2a",
+      "window_size": 8,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2400,
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cache_kb_L2048": 82.73,
+      "train_seconds": 1195.55,
+      "mean_openweb_bpb": 3.6583,
+      "max_mid_utf8_split_pct": 0.0,
+      "en_bytes_per_chunk": 4.286,
+      "s5_sum": 7.0,
+      "ov_ood_long_pct": 32.0,
+      "selective_f1_ood_long": 33.43,
+      "stop_crane_triggered": true,
+      "root_cause": "Still mixed web/cog inside same batch AND artificial byte->utf8 router switch + d_r=(3,4) destabilized Overwrite"
+    },
+    "k2b_w12_pure_batch_tgt46": {
+      "tag": "W12_pure_batch_K2b",
+      "window_size": 12,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2600,
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cache_kb_L2048": 90.23,
+      "train_seconds": 1076.24,
+      "mean_openweb_bpb": 3.6339,
+      "max_mid_utf8_split_pct": 0.0,
+      "en_bytes_per_chunk": 3.699,
+      "arc_json_bytes_per_chunk": 9.716,
+      "s5_sum": 3.0,
+      "ov_ood_long_pct": 83.0,
+      "trap_ood_long_pct": 92.0,
+      "selective_f1_ood_long": 87.27,
+      "stop_crane_triggered": true,
+      "root_cause": "Cold-start target_chunk_bytes=4.6 on 72% ASCII rows dropped 1_GSM8K_EN to 3.699 < 3.80 B/chunk (Phase B Attempt #2 dead zone), mixed CJK/Emoji/ARC_JSON before S_5 grokked, and delayed k=3,4 to frac=0.42 right before crystal schedule freeze at frac=0.438"
+    },
+    "k3_w12_shortcut_proof": {
+      "tag": "W12_shortcut_proof_K3",
+      "window_size": 12,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2400,
+      "utf8_steps": 320,
+      "device": "NVIDIA L4",
+      "cache_kb_L2048": 90.23,
+      "train_seconds": 1113.4,
+      "infer_b8_l768_ms": 147.98,
+      "mean_openweb_bpb": 3.5191,
+      "max_mid_utf8_split_pct": 0.0,
+      "s5_sum": 12.0,
+      "ov_ood_long_pct": 94.0,
+      "selective_f1_ood_long": 93.5,
+      "stop_crane_triggered": true,
+      "root_cause": "Even on exact Phase B+E two-stage stream, window_size=12 (132 B over 3 local layers) shortcuts early k=0,1 swaps around stream_gate[0]=-1.8 while Phase B/E W=8 (0.0 weight diff at init) reaches S_5=139%-150%; proves Via Negativa W:12->8 eliminates local-cortex crystal starvation"
+    },
+    "k4_w8_unshielded_amp": {
+      "tag": "V0_phase_be_rings_K4",
+      "window_size": 8,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2400,
+      "utf8_steps": 320,
+      "device": "NVIDIA L4",
+      "cache_kb_L2048": 82.73,
+      "train_seconds": 1132.5,
+      "infer_b8_l768_ms": 159.79,
+      "s1_byte_s5_k2_pct": 1.0,
+      "mean_openweb_bpb": 3.3643,
+      "max_mid_utf8_split_pct": 0.0,
+      "en_bytes_per_chunk": 3.963,
+      "s5_sum": 7.0,
+      "ov_ood_long_pct": 96.0,
+      "trap_ood_long_pct": 93.0,
+      "selective_f1_ood_long": 94.48,
+      "stop_crane_triggered": true,
+      "root_cause": "_CheckpointedCrystalScanFn (Phase E crystal.py:442) ran forward in AMP BFloat16 and recomputed backward outside autocast in Float32, injecting 1.6%-14.55% gradient mismatch across crystal projections; combined with weight_decay drag on perm_gate_proj.bias and early snap_alpha onset at frac=0.50, gate_bimodal snapped p_eta to 0 (identity P=I)"
+    },
+    "k5_amp_shield_delay_alpha": {
+      "tag": "V0_phase_be_rings_K5",
+      "window_size": 8,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2800,
+      "utf8_steps": 320,
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cache_kb_L2048": 82.73,
+      "s1_byte_s5_k2_pct": 22.0,
+      "s5_k2_32_progression": [
+        3.1,
+        0.0,
+        3.1,
+        28.1
+      ],
+      "stop_crane_triggered": true,
+      "root_cause": "Full forward_states FP32 shield raised S_5 k=2 22x over K4 (1.0%->22.0%, 28.1% on N=32 at step 2800), but gating only is_grad_enabled() mismatched write (FP32) vs read (BF16) and train vs eval, delayed snap_alpha (0.60->0.80) left only 485 low-LR STE steps, wd=0.0 + min_lr=2.5e-4 altered trajectory vs Phase B, and Gate-2 reset global torch seed after model_seed"
+    },
+    "k6_scan_shield_cold_saddle": {
+      "tag": "V0_phase_be_rings_K6",
+      "window_size": 8,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2400,
+      "utf8_steps": 320,
+      "device": "NVIDIA L4",
+      "cache_kb_L2048": 82.73,
+      "train_seconds": 1100.9,
+      "infer_b8_l768_ms": 139.49,
+      "s1_byte_s5_k2_pct": 78.0,
+      "s5_k2_32_progression": [
+        50.0,
+        71.9,
+        81.2
+      ],
+      "mean_openweb_bpb": 3.5055,
+      "max_mid_utf8_split_pct": 0.0,
+      "s5_sum": 127.0,
+      "ov_ood_long_pct": 15.0,
+      "trap_ood_long_pct": 50.0,
+      "selective_f1_ood_long": 23.08,
+      "stop_crane_triggered": true,
+      "root_cause": "_amp_shielded_crystal_scan completely cured S_5 (78% S1 k=2, 127% post-UTF8 sum, 0.00% mid-UTF8 cuts), but under simultaneous cold-start FP32 scans Crystal and Woodbury exhibit saddle bistability (K4 Basin W: OV=96%/S5=7% vs K6 Basin C: S5=127%/OV=15%), while Stage-2 use_static_m_cap=True + BS=32 dragged mean_openweb_bpb (3.3643->3.5055)"
+    },
+    "k7_s2026_pass_s2027_tail_choke": {
+      "tag": "V0_phase_be_rings_K7",
+      "window_size": 8,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed_2026": {
+        "device": "NVIDIA A100-SXM4-40GB",
+        "train_seconds": 1136.86,
+        "s1a_byte_s5_k2_pct": 97.0,
+        "s1_byte_s5_k2_pct": 96.0,
+        "s1_byte_ov_long_pct": 92.0,
+        "s1_byte_trap_long_pct": 91.0,
+        "s5_sum": 176.0,
+        "ov_ood_long_pct": 91.0,
+        "trap_ood_long_pct": 92.0,
+        "selective_f1_ood_long": 91.5,
+        "mean_openweb_bpb": 3.465,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "seed_2027_stop_crane": {
+        "s1a_byte_s5_k2_pct": 21.0,
+        "s5_k2_32_progression": [
+          0.0,
+          0.0,
+          12.5
+        ],
+        "init_woodbury_to_crystal_grad_ratio": 1.61,
+        "b_per_chunk_800": 5.04
+      },
+      "root_cause": "K7 orthogonal consolidation hit S_5=176.0% & OV_long=91.0% on seed=2026, while on seed=2027 (model_seed=101, 1.61x stronger init Woodbury grad, b/ch=5.04) woodbury 0.25x LR delayed S_5 takeoff past step 1600 where cosine decay to min_lr=0.0 choked Stage 1A on the upward ramp (0%->12.5%->21.0%)"
+    },
+    "k8_s2026_record_s2027_router_cliff": {
+      "tag": "V0_phase_be_rings_K8",
+      "window_size": 8,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed_2026": {
+        "device": "NVIDIA A100-SXM4-40GB",
+        "train_seconds": 1439.06,
+        "s1a_byte_s5_k2_pct": 98.0,
+        "s1_byte_s5_k2_pct": 96.0,
+        "s1_byte_ov_long_pct": 94.0,
+        "s1_byte_trap_long_pct": 100.0,
+        "s5_sum": 194.0,
+        "ov_ood_long_pct": 96.0,
+        "trap_ood_long_pct": 99.0,
+        "selective_f1_ood_long": 97.48,
+        "mean_openweb_bpb": 3.3628,
+        "en_bytes_per_chunk": 3.804,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "seed_2027_stop_crane": {
+        "device": "NVIDIA A100-SXM4-40GB",
+        "train_seconds": 1395.42,
+        "s1a_byte_s5_k2_pct": 4.0,
+        "s1_byte_s5_k2_pct": 1.0,
+        "s1_byte_ov_long_pct": 94.0,
+        "s1_byte_trap_long_pct": 97.0,
+        "s5_sum": 5.0,
+        "ov_ood_long_pct": 94.0,
+        "trap_ood_long_pct": 99.0,
+        "selective_f1_ood_long": 96.44,
+        "mean_openweb_bpb": 3.4184,
+        "en_bytes_per_chunk": 3.797,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "root_cause": "K8 set clean-stream record on seed=2026 (S_5=194.0%, OV=96.0%, Trap=99.0%, ow_bpb=3.3628), while on seed=2027 target_chunk_bytes=4.85 pushed unseeded std=0.04 RMSNorm (25x backward grad amplification) router over the <3.80 B/ch cliff (EN=3.797 B/ch, S_5=5.0%) and shifted S2_25M/S3_85M widths via post-init RNG offset"
+    },
+    "k9_std1_router_freeze": {
+      "tag": "V0_phase_be_rings_K9",
+      "window_size": 8,
+      "crystal_w_chunks": 5,
+      "woodbury_latch_span": 7,
+      "seed": 2026,
+      "steps": 2800,
+      "device": "NVIDIA A100-SXM4-40GB",
+      "train_seconds": 922.4,
+      "b_per_chunk_2800": 5.02,
+      "c2_b0_2800": -1.29,
+      "s1a_byte_s5_k2_pct": 2.0,
+      "stop_crane_triggered": true,
+      "root_cause": "_canonicalize_router_init replaced native std=0.04 RMSNorm router_emb init with nn.Embedding.reset_parameters() std=1.0, shrinking relative AdamW step size 25x during the 378 router-learning steps and freezing random Gaussian noise as word chunker"
+    },
+    "k10_fused_colon_and_latch3_proof": {
+      "device": "NVIDIA A100-SXM4-40GB (3x parallel)",
+      "v0_seed2026_stage1b_abort": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "s1a_byte_s5_k2_pct": 95.0,
+        "s1_byte_s5_k2_pct": 96.0,
+        "s1_byte_ov_long_pct": 50.0,
+        "s1_byte_trap_long_pct": 11.0
+      },
+      "v0_seed2027_stage1a_abort": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "s1a_byte_s5_k2_pct": 8.0
+      },
+      "v1_attempt1_latch3": {
+        "window_size": 8,
+        "crystal_w_chunks": 2,
+        "woodbury_latch_span": 3,
+        "cache_kb_L2048": 75.45,
+        "train_seconds": 1313.11,
+        "infer_b8_l768_ms": 134.08,
+        "s1a_byte_s5_k2_pct": 90.0,
+        "s1_byte_s5_k2_pct": 92.0,
+        "s1_byte_ov_long_pct": 0.0,
+        "s1_byte_trap_long_pct": 100.0,
+        "s5_sum": 153.0,
+        "ov_ood_long_pct": 0.0,
+        "trap_ood_long_pct": 100.0,
+        "selective_f1_ood_long": 0.0,
+        "mean_openweb_bpb": 3.4373,
+        "max_mid_utf8_split_pct": 0.0,
+        "drift": [
+          1.19e-07,
+          2.38e-07
+        ]
+      },
+      "root_cause": "(1) V1 L_latch=3 hits the physical 17 B / 3.5-4.5 chunk causality floor of ' is stationed in ' / ' is currently in' while W_chunks=2 passes (153% S_5); (2) unsplit-colon (colon=0) 1-byte shift cuts lexical c_win8 cosine (+0.091) while read_lag_logits peaks 68.3% at t-1, starving S_5 on non-colon router basins (mseed=101); (3) fused=True AdamW + target=4.90 shifted BF16 Stage-1B Woodbury saddle (50% vs K8 94%)"
+    },
+    "k11_v1_latch6_pass_and_wchunks5_distractor_proof": {
+      "device": "NVIDIA L4 (VM0) + NVIDIA A100-SXM4-40GB (VM1, VM2)",
+      "v1_attempt1_latch6": {
+        "window_size": 8,
+        "crystal_w_chunks": 2,
+        "woodbury_latch_span": 6,
+        "params": 1483789,
+        "cache_kb_L2048": 76.98,
+        "train_seconds": 1371.28,
+        "infer_b8_l768_ms": 139.41,
+        "s1a_byte_s5_k2_pct": 97.0,
+        "s1_byte_s5_k2_pct": 98.0,
+        "s1_byte_ov_long_pct": 60.0,
+        "s1_byte_trap_long_pct": 89.0,
+        "s5_sum": 181.0,
+        "ov_ood_long_pct": 86.0,
+        "trap_ood_long_pct": 93.0,
+        "selective_f1_in": 94.74,
+        "selective_f1_ood_long": 89.36,
+        "mean_openweb_bpb": 3.3788,
+        "max_mid_utf8_split_pct": 0.0,
+        "drift": [
+          1.19e-07,
+          2.38e-07
+        ]
+      },
+      "v0_seed2026_stage1b_abort": {
+        "s1a_byte_s5_k2_pct": 94.0,
+        "s1_byte_s5_k2_pct": 95.0,
+        "s1_byte_ov_long_pct": 42.0,
+        "s1_byte_trap_long_pct": 47.0
+      },
+      "v0_seed2027_stage1a_abort": {
+        "s1a_byte_s5_k2_pct": 2.0
+      },
+      "root_cause": "(1) V1 (8,2,6) clears both S_5 (181%) and Overwrite/Trap (86%/93%, SelF1=89.36%, ow_bpb=3.3788, -24.7% tier cache); (2) global _ShiftTolerantLexNorm blurred h_lex shared by Woodbury, hurting Officer surname discrimination (+0.311->+0.469) in Stage 1B; (3) W_chunks=5 allocates 66.1% pointer mass to pre-swap distractors (only 7.6% on Alpha vs 41.3%/83.0% under W_chunks=2)"
+    },
+    "k12_splitlex_duallag_l4_postmortem": {
+      "device": "NVIDIA L4",
+      "v0_seed2026": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "train_seconds": 1372.78,
+        "infer_b8_l768_ms": 134.81,
+        "s1a_byte_s5_k2_pct": 65.0,
+        "s1_byte_s5_k2_pct": 80.0,
+        "s1_byte_ov_long_pct": 44.0,
+        "s1_byte_trap_long_pct": 43.0,
+        "s5_sum": 117.0,
+        "ov_ood_long_pct": 42.0,
+        "trap_ood_long_pct": 54.0,
+        "selective_f1_ood_long": 47.25,
+        "mean_openweb_bpb": 3.5534,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "root_cause": "Split lexical streams shared bc.lex_norm and bc.lex_up across blurred Crystal c_sm (Stage 1A) and unblurred Woodbury c_win8 (Stage 1B), while dual-lag read_lag_logits halved Crystal's t-1 read heads (degrading V0_seed2026 vs K8 from S1A 98%->65%, OV 96%->42%, ow_bpb 3.3628->3.5534)"
+    },
+    "k13_l4_s1b500_underfueled": {
+      "device": "3x NVIDIA L4",
+      "v0_seed2026_stage1b_abort": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "s1a_byte_s5_k2_pct": 99.0,
+        "s1_byte_s5_k2_pct": 99.0,
+        "s1_byte_ov_long_pct": 5.0,
+        "s1_byte_trap_long_pct": 72.0
+      },
+      "v1_attempt1_stage1b_abort": {
+        "window_size": 8,
+        "crystal_w_chunks": 2,
+        "woodbury_latch_span": 6,
+        "s1a_byte_s5_k2_pct": 96.0,
+        "s1_byte_s5_k2_pct": 97.0,
+        "s1_byte_ov_long_pct": 17.0,
+        "s1_byte_trap_long_pct": 12.0
+      },
+      "v0_seed2027": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "train_seconds": 1333.15,
+        "infer_b8_l768_ms": 135.84,
+        "s1a_byte_s5_k2_pct": 5.0,
+        "s1_byte_s5_k2_pct": 10.0,
+        "s1_byte_ov_long_pct": 17.0,
+        "s1_byte_trap_long_pct": 41.0,
+        "s5_sum": 14.0,
+        "ov_in_dist_pct": 44.0,
+        "ov_ood_med_pct": 38.0,
+        "ov_ood_long_pct": 14.0,
+        "trap_ood_long_pct": 62.0,
+        "selective_f1_ood_long": 22.84,
+        "mean_openweb_bpb": 3.4261,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "root_cause": "Pure K8 core hit S1A=99%/96% on L4, proving Crystal health; Stage-1B OV failed (5%/17%/17%) because Stage 1A starved woodbury at 0.05x LR with wd=0.01 for 2800 steps while Stage 1B supplied only 500 x 35% = 175 effective OV batches with pre throttled at 1.5e-4 and cosine decay to 0.10x"
+    },
+    "k14_s1b900_v0_pass_v1_020_hijack": {
+      "device": "3x NVIDIA L4",
+      "v0_seed2026": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "train_seconds": 1528.76,
+        "infer_b8_l768_ms": 136.85,
+        "s1a_byte_s5_k2_pct": 98.0,
+        "s1_byte_s5_k2_pct": 95.0,
+        "s1_byte_ov_long_pct": 96.0,
+        "s1_byte_trap_long_pct": 91.0,
+        "s5_sum": 167.0,
+        "ov_ood_long_pct": 95.0,
+        "trap_ood_long_pct": 92.0,
+        "selective_f1_ood_long": 93.48,
+        "mean_openweb_bpb": 3.5257,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "v0_seed2027": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "train_seconds": 1600.32,
+        "infer_b8_l768_ms": 142.77,
+        "s1a_byte_s5_k2_pct": 0.0,
+        "s1_byte_s5_k2_pct": 1.0,
+        "s1_byte_ov_long_pct": 99.0,
+        "s1_byte_trap_long_pct": 99.0,
+        "s5_sum": 3.0,
+        "ov_ood_long_pct": 98.0,
+        "trap_ood_long_pct": 99.0,
+        "selective_f1_ood_long": 98.5,
+        "mean_openweb_bpb": 3.604,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "v1_attempt1_stage1a_abort": {
+        "window_size": 8,
+        "crystal_w_chunks": 2,
+        "woodbury_latch_span": 6,
+        "s1a_byte_s5_k2_pct": 8.0
+      },
+      "root_cause": "Axis orthogonality proven on 3x L4: (1) full-fuel Stage 1B (900 steps, 52% OV / 18% Trap, wood=2.4e-3, pre=3e-4, post=1.2e-3, floor=0.15x) cured OV on both V0 seeds (95%/98%, SelF1 93.48%/98.50%); (2) raising Stage 1A woodbury from 0.05x wd=0.01 (K13 V1 S1A=96%) to 0.20x wd=0.0 caused Woodbury to hijack V1's pruned W_chunks=2 crystal (S1A=8.0%)"
+    },
+    "k15_l4_bf16_nondet_and_woodbury_wd_proof": {
+      "device": "3x NVIDIA L4",
+      "v1_attempt1_stage1a_abort": {
+        "window_size": 8,
+        "crystal_w_chunks": 2,
+        "woodbury_latch_span": 6,
+        "s1a_byte_s5_k2_pct": 32.0
+      },
+      "v0_seed2026_stage1b_abort": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "s1a_byte_s5_k2_pct": 89.0,
+        "s1_byte_s5_k2_pct": 89.0,
+        "s1_byte_ov_long_pct": 39.0,
+        "s1_byte_trap_long_pct": 29.0
+      },
+      "v0_seed2027": {
+        "window_size": 8,
+        "crystal_w_chunks": 5,
+        "woodbury_latch_span": 7,
+        "train_seconds": 1439.75,
+        "infer_b8_l768_ms": 138.83,
+        "s1a_byte_s5_k2_pct": 6.0,
+        "s1_byte_s5_k2_pct": 6.0,
+        "s1_byte_ov_long_pct": 93.0,
+        "s1_byte_trap_long_pct": 98.0,
+        "s5_sum": 8.0,
+        "ov_ood_long_pct": 93.0,
+        "trap_ood_long_pct": 100.0,
+        "selective_f1_in": 94.18,
+        "selective_f1_ood_long": 96.37,
+        "mean_openweb_bpb": 3.5591,
+        "max_mid_utf8_split_pct": 0.0
+      },
+      "root_cause": "(1) Stage-1A woodbury weight_decay=0.01 (vs K14 wd=0.0 yielding 96%/99% OV) atrophied Woodbury projections on V0_s2026 during 2800 steps (S1B OV=39%); (2) CUDA BF16 variance on tiny d=160 causes stochastic S1A outcomes on L4 while A100 runs K8 (V0) and K11 (V1 8,2,6) already established both anchors cleanly, motivating locking V1 (8,2,6) and moving directly to S1_5M/S2_25M/S3_85M scaling with Stage-1A woodbury lr=0.05x, wd=0.0 + K14 Stage-1B"
+    }
+  },
+  "v0_seed2026": {
+    "tag": "V0_phase_be_rings",
+    "seed": 2026,
+    "window_size": 8,
+    "crystal_w_chunks": 5,
+    "woodbury_latch_span": 7,
+    "params": 1483841,
+    "cache_kb_L2048": 82.73,
+    "train_seconds": 1439.06,
+    "infer_b8_l768_ms": 142.14,
+    "gate2_init_std": {
+      "mix0_max_abs_diff": 3.6e-07,
+      "block_std_fp": {
+        "cortex_pre": 0.25172,
+        "crystal": 0.5754,
+        "woodbury": 0.2902,
+        "mid_mlp": 0.10488,
+        "cortex_post": 0.60341,
+        "norm_f": 1.0
+      },
+      "block_std_ratio_mix1": {
+        "cortex_pre": 0.8877,
+        "crystal": 0.9552,
+        "woodbury": 0.9211,
+        "mid_mlp": 0.81,
+        "cortex_post": 0.8978,
+        "norm_f": 1.0
+      },
+      "gate2_passed": true
+    },
+    "s1a_byte_s5_k2_pct": 98.0,
+    "s1_byte_s5_k2_pct": 96.0,
+    "s1_byte_ov_long_pct": 94.0,
+    "s1_byte_trap_long_pct": 100.0,
+    "mean_openweb_bpb": 3.3628,
+    "max_mid_utf8_split_pct": 0.0,
+    "openweb": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.6634,
+          "bytes_per_chunk": 3.804,
+          "cp_per_chunk": 3.802,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 201.9,
+          "m_max": 231
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 3.879,
+          "bytes_per_chunk": 6.194,
+          "cp_per_chunk": 4.452,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 124.0,
+          "m_max": 180
+        },
+        "3_Python_Code": {
+          "byte_bpb": 3.17,
+          "bytes_per_chunk": 3.205,
+          "cp_per_chunk": 3.205,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 239.6,
+          "m_max": 254
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 1.0416,
+          "bytes_per_chunk": 4.389,
+          "cp_per_chunk": 4.389,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 175.0,
+          "m_max": 248
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 5.8741,
+          "bytes_per_chunk": 11.765,
+          "cp_per_chunk": 3.958,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 65.3,
+          "m_max": 66
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 4.549,
+          "bytes_per_chunk": 13.961,
+          "cp_per_chunk": 3.941,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 55.0,
+          "m_max": 56
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 3.3628
+    },
+    "s5_sum": 194.0,
+    "s5": {
+      "k2": {
+        "exact_pct": 98.0,
+        "token_pct": 99.97,
+        "ok": 98,
+        "n": 100,
+        "wilson_95": [
+          93.0,
+          99.45
+        ]
+      },
+      "k4": {
+        "exact_pct": 80.0,
+        "token_pct": 99.67,
+        "ok": 80,
+        "n": 100,
+        "wilson_95": [
+          71.12,
+          86.66
+        ]
+      },
+      "k8": {
+        "exact_pct": 14.0,
+        "token_pct": 97.99,
+        "ok": 14,
+        "n": 100,
+        "wilson_95": [
+          8.53,
+          22.14
+        ]
+      },
+      "k16": {
+        "exact_pct": 2.0,
+        "token_pct": 96.28,
+        "ok": 2,
+        "n": 100,
+        "wilson_95": [
+          0.55,
+          7.0
+        ]
+      }
+    },
+    "ov_ood_long_pct": 96.0,
+    "overwrite": {
+      "in_dist": {
+        "exact_pct": 100.0,
+        "token_pct": 100.0,
+        "ok": 100,
+        "n": 100,
+        "wilson_95": [
+          96.3,
+          100.0
+        ]
+      },
+      "ood_med": {
+        "exact_pct": 99.0,
+        "token_pct": 99.87,
+        "ok": 99,
+        "n": 100,
+        "wilson_95": [
+          94.55,
+          99.82
+        ]
+      },
+      "ood_long": {
+        "exact_pct": 96.0,
+        "token_pct": 99.49,
+        "ok": 96,
+        "n": 100,
+        "wilson_95": [
+          90.16,
+          98.43
+        ]
+      }
+    },
+    "trap": {
+      "in_dist": {
+        "exact_pct": 99.0,
+        "token_pct": 99.89,
+        "ok": 99,
+        "n": 100,
+        "wilson_95": [
+          94.55,
+          99.82
+        ]
+      },
+      "ood_long": {
+        "exact_pct": 99.0,
+        "token_pct": 99.89,
+        "ok": 99,
+        "n": 100,
+        "wilson_95": [
+          94.55,
+          99.82
+        ]
+      }
+    },
+    "selective_f1_in": 99.5,
+    "selective_f1_ood_long": 97.48,
+    "crystal_drift_L2048": {
+      "length_bytes": 2048,
+      "chunks_at_L": 780,
+      "norm_drift_L2048": 1.1920928955078125e-07,
+      "voronoi_lattice_err_L2048": 1.1920928955078125e-07,
+      "crystal_stages_checked": 2
+    }
+  },
+  "v0_seed2027": {
+    "tag": "V0_phase_be_rings",
+    "seed": 2027,
+    "window_size": 8,
+    "crystal_w_chunks": 5,
+    "woodbury_latch_span": 7,
+    "params": 1483841,
+    "cache_kb_L2048": 82.73,
+    "train_seconds": 1395.42,
+    "infer_b8_l768_ms": 142.89,
+    "gate2_init_std": {
+      "mix0_max_abs_diff": 3.3e-07,
+      "block_std_fp": {
+        "cortex_pre": 0.26741,
+        "crystal": 0.57587,
+        "woodbury": 0.27271,
+        "mid_mlp": 0.10116,
+        "cortex_post": 0.58044,
+        "norm_f": 0.99995
+      },
+      "block_std_ratio_mix1": {
+        "cortex_pre": 0.8938,
+        "crystal": 0.9362,
+        "woodbury": 0.9077,
+        "mid_mlp": 0.8569,
+        "cortex_post": 0.9107,
+        "norm_f": 0.9998
+      },
+      "gate2_passed": true
+    },
+    "s1a_byte_s5_k2_pct": 4.0,
+    "s1_byte_s5_k2_pct": 1.0,
+    "s1_byte_ov_long_pct": 94.0,
+    "s1_byte_trap_long_pct": 97.0,
+    "mean_openweb_bpb": 3.4184,
+    "max_mid_utf8_split_pct": 0.0,
+    "openweb": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.7106,
+          "bytes_per_chunk": 3.797,
+          "cp_per_chunk": 3.795,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 202.2,
+          "m_max": 231
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 3.9156,
+          "bytes_per_chunk": 4.971,
+          "cp_per_chunk": 3.573,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 154.5,
+          "m_max": 184
+        },
+        "3_Python_Code": {
+          "byte_bpb": 3.2883,
+          "bytes_per_chunk": 4.454,
+          "cp_per_chunk": 4.454,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 172.4,
+          "m_max": 194
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 0.9314,
+          "bytes_per_chunk": 8.863,
+          "cp_per_chunk": 8.863,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 86.6,
+          "m_max": 119
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 5.9877,
+          "bytes_per_chunk": 14.044,
+          "cp_per_chunk": 4.725,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 54.7,
+          "m_max": 56
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 4.6765,
+          "bytes_per_chunk": 11.998,
+          "cp_per_chunk": 3.387,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 64.0,
+          "m_max": 65
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 3.4184
+    },
+    "s5_sum": 5.0,
+    "s5": {
+      "k2": {
+        "exact_pct": 2.0,
+        "token_pct": 96.58,
+        "ok": 2,
+        "n": 100,
+        "wilson_95": [
+          0.55,
+          7.0
+        ]
+      },
+      "k4": {
+        "exact_pct": 1.0,
+        "token_pct": 96.22,
+        "ok": 1,
+        "n": 100,
+        "wilson_95": [
+          0.18,
+          5.45
+        ]
+      },
+      "k8": {
+        "exact_pct": 1.0,
+        "token_pct": 96.09,
+        "ok": 1,
+        "n": 100,
+        "wilson_95": [
+          0.18,
+          5.45
+        ]
+      },
+      "k16": {
+        "exact_pct": 1.0,
+        "token_pct": 96.14,
+        "ok": 1,
+        "n": 100,
+        "wilson_95": [
+          0.18,
+          5.45
+        ]
+      }
+    },
+    "ov_ood_long_pct": 94.0,
+    "overwrite": {
+      "in_dist": {
+        "exact_pct": 100.0,
+        "token_pct": 100.0,
+        "ok": 100,
+        "n": 100,
+        "wilson_95": [
+          96.3,
+          100.0
+        ]
+      },
+      "ood_med": {
+        "exact_pct": 98.0,
+        "token_pct": 99.74,
+        "ok": 98,
+        "n": 100,
+        "wilson_95": [
+          93.0,
+          99.45
+        ]
+      },
+      "ood_long": {
+        "exact_pct": 94.0,
+        "token_pct": 99.23,
+        "ok": 94,
+        "n": 100,
+        "wilson_95": [
+          87.52,
+          97.22
+        ]
+      }
+    },
+    "trap": {
+      "in_dist": {
+        "exact_pct": 100.0,
+        "token_pct": 100.0,
+        "ok": 100,
+        "n": 100,
+        "wilson_95": [
+          96.3,
+          100.0
+        ]
+      },
+      "ood_long": {
+        "exact_pct": 99.0,
+        "token_pct": 99.89,
+        "ok": 99,
+        "n": 100,
+        "wilson_95": [
+          94.55,
+          99.82
+        ]
+      }
+    },
+    "selective_f1_in": 100.0,
+    "selective_f1_ood_long": 96.44,
+    "crystal_drift_L2048": {
+      "length_bytes": 2048,
+      "chunks_at_L": 780,
+      "norm_drift_L2048": 1.1920928955078125e-07,
+      "voronoi_lattice_err_L2048": 1.1920928955078125e-07,
+      "crystal_stages_checked": 2
+    }
+  },
+  "v0_mean": {
+    "cache_kb_L2048": 82.73,
+    "mean_openweb_bpb": 3.3906,
+    "s5_sum": 99.5,
+    "ov_ood_long_pct": 95.0,
+    "selective_f1_ood_long": 96.96
+  },
+  "tolerances": {
+    "raw_2sigma": {
+      "mean_openweb_bpb": 0.1112,
+      "s5_sum": 378.0,
+      "ov_ood_long_pct": 4.0,
+      "selective_f1_ood_long": 2.08
+    },
+    "effective_gate_tol": {
+      "mean_openweb_bpb": 0.1112,
+      "s5_sum": 378.0,
+      "ov_ood_long_pct": 4.0,
+      "selective_f1_ood_long": 3.0
+    }
+  },
+  "v1_attempt1": {
+    "tag": "V1_lean_pruned",
+    "seed": 2026,
+    "window_size": 8,
+    "crystal_w_chunks": 2,
+    "woodbury_latch_span": 6,
+    "params": 1483789,
+    "cache_kb_L2048": 76.98,
+    "train_seconds": 1371.28,
+    "infer_b8_l768_ms": 139.41,
+    "gate2_init_std": {
+      "mix0_max_abs_diff": 3.3e-07,
+      "block_std_fp": {
+        "cortex_pre": 0.2658,
+        "crystal": 0.57315,
+        "woodbury": 0.24987,
+        "mid_mlp": 0.09839,
+        "cortex_post": 0.5687,
+        "norm_f": 1.0
+      },
+      "block_std_ratio_mix1": {
+        "cortex_pre": 0.8745,
+        "crystal": 0.9408,
+        "woodbury": 0.9275,
+        "mid_mlp": 0.846,
+        "cortex_post": 0.8923,
+        "norm_f": 1.0
+      },
+      "gate2_passed": true
+    },
+    "s1a_byte_s5_k2_pct": 97.0,
+    "s1_byte_s5_k2_pct": 98.0,
+    "s1_byte_ov_long_pct": 60.0,
+    "s1_byte_trap_long_pct": 89.0,
+    "mean_openweb_bpb": 3.3788,
+    "max_mid_utf8_split_pct": 0.0,
+    "openweb": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.6634,
+          "bytes_per_chunk": 3.91,
+          "cp_per_chunk": 3.908,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 196.4,
+          "m_max": 220
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 3.8829,
+          "bytes_per_chunk": 6.496,
+          "cp_per_chunk": 4.669,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 118.2,
+          "m_max": 177
+        },
+        "3_Python_Code": {
+          "byte_bpb": 3.1795,
+          "bytes_per_chunk": 3.264,
+          "cp_per_chunk": 3.264,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 235.3,
+          "m_max": 254
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 1.1566,
+          "bytes_per_chunk": 7.132,
+          "cp_per_chunk": 7.132,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 107.7,
+          "m_max": 186
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 5.8165,
+          "bytes_per_chunk": 9.627,
+          "cp_per_chunk": 3.239,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 79.8,
+          "m_max": 81
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 4.574,
+          "bytes_per_chunk": 12.069,
+          "cp_per_chunk": 3.407,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 63.6,
+          "m_max": 65
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 3.3788
+    },
+    "s5_sum": 181.0,
+    "s5": {
+      "k2": {
+        "exact_pct": 97.0,
+        "token_pct": 99.96,
+        "ok": 97,
+        "n": 100,
+        "wilson_95": [
+          91.55,
+          98.97
+        ]
+      },
+      "k4": {
+        "exact_pct": 67.0,
+        "token_pct": 99.41,
+        "ok": 67,
+        "n": 100,
+        "wilson_95": [
+          57.31,
+          75.44
+        ]
+      },
+      "k8": {
+        "exact_pct": 16.0,
+        "token_pct": 97.61,
+        "ok": 16,
+        "n": 100,
+        "wilson_95": [
+          10.1,
+          24.42
+        ]
+      },
+      "k16": {
+        "exact_pct": 1.0,
+        "token_pct": 96.07,
+        "ok": 1,
+        "n": 100,
+        "wilson_95": [
+          0.18,
+          5.45
+        ]
+      }
+    },
+    "ov_ood_long_pct": 86.0,
+    "overwrite": {
+      "in_dist": {
+        "exact_pct": 100.0,
+        "token_pct": 100.0,
+        "ok": 100,
+        "n": 100,
+        "wilson_95": [
+          96.3,
+          100.0
+        ]
+      },
+      "ood_med": {
+        "exact_pct": 90.0,
+        "token_pct": 98.71,
+        "ok": 90,
+        "n": 100,
+        "wilson_95": [
+          82.56,
+          94.48
+        ]
+      },
+      "ood_long": {
+        "exact_pct": 86.0,
+        "token_pct": 98.09,
+        "ok": 86,
+        "n": 100,
+        "wilson_95": [
+          77.86,
+          91.47
+        ]
+      }
+    },
+    "trap": {
+      "in_dist": {
+        "exact_pct": 90.0,
+        "token_pct": 98.89,
+        "ok": 90,
+        "n": 100,
+        "wilson_95": [
+          82.56,
+          94.48
+        ]
+      },
+      "ood_long": {
+        "exact_pct": 93.0,
+        "token_pct": 99.22,
+        "ok": 93,
+        "n": 100,
+        "wilson_95": [
+          86.25,
+          96.57
+        ]
+      }
+    },
+    "selective_f1_in": 94.74,
+    "selective_f1_ood_long": 89.36,
+    "crystal_drift_L2048": {
+      "length_bytes": 2048,
+      "chunks_at_L": 780,
+      "norm_drift_L2048": 1.1920928955078125e-07,
+      "voronoi_lattice_err_L2048": 2.384185791015625e-07,
+      "crystal_stages_checked": 2
+    },
+    "parity_checks": {
+      "utf8_zero_cuts": true,
+      "openweb_bpb_ok": true,
+      "s5_sum_ok": true,
+      "ov_long_ok": false,
+      "sel_f1_long_ok": false,
+      "v1_abs_s5_ok": true,
+      "v1_abs_ov_ok": true,
+      "v1_abs_f1_ok": true,
+      "v1_abs_ow_ok": true,
+      "v1_abs_utf8_ok": true
+    },
+    "passed": false,
+    "anti_relax_passed": true,
+    "parity_note": "All 5 anti-relaxation absolute gates pass (s5=181% >= 169%, ov_long=86% >= 86%, selF1=89.36% >= 87.48%, ow_bpb=3.3788 <= 3.4428, mid_utf8=0.0%); ov_long_ok/sel_f1_long_ok relative to tolerances reflect K11's reverted _ShiftTolerantLexNorm while K10 proved L_latch=3 hits the physical 17B/3.5-4.5-chunk causality floor (OV=0%)."
+  },
+  "v1b_attempt2": null,
+  "selected_lean_params": {
+    "variant": "V1_lean_pruned",
+    "window_size": 8,
+    "crystal_w_chunks": 2,
+    "woodbury_latch_span": 6,
+    "probe_cache_reduction_pct": 6.95,
+    "probe_cache_reduction_vs_w12_pct": 14.69,
+    "tier_cache_reductions": {
+      "S1_5M": {
+        "legacy_kb": 123.61,
+        "phase_be_w8_kb": 107.61,
+        "lean_kb": 99.6,
+        "reduction_pct": 19.42,
+        "reduction_vs_w8_pct": 7.44
+      },
+      "S2_25M": {
+        "legacy_kb": 278.01,
+        "phase_be_w8_kb": 222.01,
+        "lean_kb": 209.25,
+        "reduction_pct": 24.73,
+        "reduction_vs_w8_pct": 5.75
+      },
+      "S3_85M": {
+        "legacy_kb": 590.36,
+        "phase_be_w8_kb": 470.36,
+        "lean_kb": 449.54,
+        "reduction_pct": 23.85,
+        "reduction_vs_w8_pct": 4.43
+      }
+    }
+  }
+}
