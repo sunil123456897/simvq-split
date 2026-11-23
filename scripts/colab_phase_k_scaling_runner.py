@@ -232,6 +232,16 @@ def run_stage_build_corpus(
         reused_drv = _try_reuse(drive_cache)
         if reused_drv is not None:
             return reused_drv
+    drive_tar = drive_cache.parent / "phase_k_corpus_cache.tar.gz"
+    if drive_tar.is_file():
+        import tarfile as _tf
+
+        print(f"Extracting cached corpus archive from {drive_tar}...", flush=True)
+        with _tf.open(drive_tar, "r:*") as tf:
+            tf.extractall(data_dir)
+        reused_tar = _try_reuse(data_dir)
+        if reused_tar is not None:
+            return reused_tar
 
     if corpus_gdrive_id:
         import subprocess as _sub

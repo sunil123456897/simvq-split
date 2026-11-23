@@ -1,11 +1,12 @@
 """
 Automated Repository Guardrail (`scripts/repo_guardrail.py`).
 
-Shared deterministic checks used by `.git/hooks/pre-commit` and `validate_simvq_split_results.py`:
+Shared deterministic checks used by `.git/hooks/pre-commit` and phase validators:
 1. Zero diff on untouched `simvq_split/baselines.py` vs `HEAD`.
-2. Ruff syntax/fatal lint check (`E9,F63,F7,F82`) across core package, tests, scripts, and runners.
-3. 16-law Zero-Cheat `pytest tests/test_anti_cheat.py -q`.
-4. UTF-8 (no BOM / U+FFFD) and Russian lexical quarantine across repository Markdown docs.
+2. Ruff syntax/fatal lint check (`E9,F63,F7,F82`) across core package, kernels, tests, scripts, and runners.
+3. 17-law Zero-Cheat `pytest tests/test_anti_cheat.py -q` + v3 CUDA/QAT `tests/test_fast_calcite_scans.py -q`.
+4. `AGENTS.md` size cap (`<= 24,000 B`, prevents silent context truncation).
+5. UTF-8 (no BOM / U+FFFD) and Russian lexical quarantine across repository Markdown docs & workspace skills.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import sys
 
 RUFF_TARGETS = (
     "simvq_split",
+    "calcite_v2",
     "kernels",
     "tests",
     "scripts",
@@ -58,6 +60,9 @@ FORBIDDEN_PHRASES = (
 )
 
 
+AGENTS_MD_MAX_BYTES = 24_000
+
+
 def collect_guarded_markdown_paths(root: Path) -> list[Path]:
     """Return existing repository Markdown documents governed by UTF-8 and lexical quarantine."""
     candidates = [
@@ -70,6 +75,7 @@ def collect_guarded_markdown_paths(root: Path) -> list[Path]:
         root / "Phase_H_Tier1_QAT_Closure_Report.md",
         root / "Phase_J_UEBR_System2_Report.md",
         root / "Phase_K_System1_Scaling_Report.md",
+        root / "Phase_L_Calcite_v2_Report.md",
         root / "Post_Transformer_Architecture_v5_Blueprint.md",
         root / "AGENTS.md",
         root / "CODING_STANDARDS.md",
@@ -77,7 +83,21 @@ def collect_guarded_markdown_paths(root: Path) -> list[Path]:
     synth_dir = root / "research" / "post_transformer_synthesis"
     if synth_dir.is_dir():
         candidates.extend(sorted(synth_dir.glob("*.md")))
+    skill_dir = root / ".agents" / "skills" / "calcite-phase-runner"
+    if skill_dir.is_dir():
+        candidates.extend(sorted(skill_dir.rglob("*.md")))
     return [p for p in candidates if p.exists()]
+
+
+def check_agents_md_size(root: Path, max_bytes: int = AGENTS_MD_MAX_BYTES) -> int:
+    """Assert `AGENTS.md` stays within the 24 KB rule context cap."""
+    p = root / "AGENTS.md"
+    size = p.stat().st_size
+    if size > max_bytes:
+        raise AssertionError(
+            f"`AGENTS.md` exceeds {max_bytes:,} B rule cap ({size:,} B); condense or move archive pointers to references/."
+        )
+    return size
 
 
 def check_baselines_untouched(root: Path) -> None:
@@ -150,6 +170,24 @@ def check_markdown_quarantine(root: Path, paths: list[Path] | None = None) -> in
     return len(targets)
 
 
+def check_fast_kernels_pytest(root: Path) -> str:
+    """Run `pytest tests/test_fast_calcite_scans.py -q` (v3 CUDA/QAT + `AdamW(fused=True)` regression)."""
+    test_p = root / "tests" / "test_fast_calcite_scans.py"
+    if not test_p.exists():
+        return "skipped (not present)"
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_p), "-q"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+    )
+    m = re.search(r"(\d+)\s+passed", res.stdout)
+    if res.returncode != 0 or m is None or int(m.group(1)) < 5 or "failed" in res.stdout:
+        detail = (res.stdout + "\n" + res.stderr).strip()
+        raise AssertionError(f"v3 CUDA/QAT pytest suite (>= 5 tests) failed!\n{detail}")
+    return res.stdout.strip()
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     check_baselines_untouched(root)
@@ -158,6 +196,10 @@ def main() -> int:
     print("OK ruff: E9,F63,F7,F82 clean", flush=True)
     pytest_out = check_anti_cheat_pytest(root)
     print(f"OK pytest: {pytest_out.splitlines()[-1]}", flush=True)
+    fk_out = check_fast_kernels_pytest(root)
+    print(f"OK fast_kernels: {fk_out.splitlines()[-1]}", flush=True)
+    agents_b = check_agents_md_size(root)
+    print(f"OK AGENTS.md: {agents_b:,} B <= {AGENTS_MD_MAX_BYTES:,} B", flush=True)
     n_docs = check_markdown_quarantine(root)
     print(f"OK quarantine: {n_docs} Markdown files verified clean", flush=True)
     return 0

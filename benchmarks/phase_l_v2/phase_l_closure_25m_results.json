@@ -1,0 +1,482 @@
+{
+  "phase": "Phase_L_Closure_25M",
+  "device": "NVIDIA GeForce RTX 5060",
+  "params": 25389575,
+  "config": {
+    "vocab_size": 259,
+    "d_model": 448,
+    "n_heads": 7,
+    "d_ff": null,
+    "n_layers_pre": 4,
+    "n_layers_post": 4,
+    "window_size": 8,
+    "num_spheres": 24,
+    "d_sphere": 32,
+    "codebook_size": 32,
+    "crystal_w_chunks": 2,
+    "mem_heads": 7,
+    "mem_dim": 32,
+    "ridge_lambda": 0.04,
+    "woodbury_latch_span": 6,
+    "byte_char_dim": 48,
+    "byte_d_ff": 448,
+    "byte_router_char_dim": 16,
+    "byte_router_hidden": 96,
+    "byte_commit_scale": 0.45,
+    "router_lock_frac": 0.135,
+    "target_chunk_bytes": 4.6,
+    "max_chunk_bytes": 10,
+    "byte_chunk_mode": "utf8",
+    "max_utf8_bytes": 16,
+    "use_static_m_cap": true,
+    "ratio_loss_scale": 1.5,
+    "pad_token_id": 0,
+    "topology": "hourglass",
+    "use_scaled_decoder": true,
+    "use_kalman_precond": false,
+    "use_latent_feedback": false,
+    "latent_feedback_skip_p": 0.5,
+    "use_clean_gates": false,
+    "use_fast_kernels": true
+  },
+  "schedule": {
+    "s1a_steps": 2400,
+    "s1b_steps": 800,
+    "s2_steps": 1600,
+    "qat_steps": 500,
+    "batch_size": 64,
+    "seq_len": 512,
+    "eval_only_seconds": 667.43
+  },
+  "stage1_gates": {
+    "s1a_s5_k2_pct": 98.44,
+    "s1_s5_k2_pct": 96.88,
+    "s1_ov_long_pct": 37.5,
+    "s1_trap_long_pct": 40.62
+  },
+  "router_max_abs_diff": 0.0,
+  "cache_kb_L2048": 219.71,
+  "cache_kb_L32768": 219.71,
+  "lut_footprint": {
+    "num_lut_layers": 99,
+    "packed_weights_count": 25235008,
+    "packed_u8_bytes": 6308976,
+    "packed_u8_kb": 6161.11,
+    "scales_fp16_bytes": 1577434,
+    "scales_fp16_kb": 1540.46,
+    "fp16_other_bytes": 308888,
+    "fp16_other_kb": 301.65,
+    "total_lut_kb": 8003.22,
+    "orig_fp32_matrix_kb": 98574.25,
+    "matrix_compression_vs_fp32": 15.9994,
+    "effective_matrix_compression_with_scales": 12.7992
+  },
+  "gap_val_bpb": 0.053,
+  "gap_ow_bpb": 0.033,
+  "eval_fp": {
+    "val_bpb": 2.1338,
+    "extrap_4x": {
+      "bpb_L512": 2.0201,
+      "bpb_L2048": 1.9553,
+      "bpb_L2048_head": 1.9604,
+      "bpb_L2048_tail": 1.9644,
+      "extrap_delta_bpb": -0.0648,
+      "tail_minus_head_bpb": 0.004
+    },
+    "openweb_6": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.7901,
+          "bytes_per_chunk": 4.151,
+          "cp_per_chunk": 4.149,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 123.3,
+          "m_max": 140
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 2.348,
+          "bytes_per_chunk": 6.484,
+          "cp_per_chunk": 4.636,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 79.0,
+          "m_max": 117
+        },
+        "3_Python_Code": {
+          "byte_bpb": 2.1022,
+          "bytes_per_chunk": 3.61,
+          "cp_per_chunk": 3.61,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 141.8,
+          "m_max": 157
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 0.5314,
+          "bytes_per_chunk": 4.106,
+          "cp_per_chunk": 4.106,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 124.7,
+          "m_max": 158
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 3.2996,
+          "bytes_per_chunk": 14.965,
+          "cp_per_chunk": 5.035,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 34.2,
+          "m_max": 35
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 5.0756,
+          "bytes_per_chunk": 14.1,
+          "cp_per_chunk": 3.981,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 36.3,
+          "m_max": 37
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 2.5245
+    },
+    "cognitive": {
+      "s5": {
+        "k2": {
+          "exact_pct": 94.67,
+          "token_pct": 99.92,
+          "ok": 142,
+          "n": 150,
+          "wilson_95": [
+            89.83,
+            97.27
+          ]
+        },
+        "k4": {
+          "exact_pct": 54.67,
+          "token_pct": 99.21,
+          "ok": 82,
+          "n": 150,
+          "wilson_95": [
+            46.68,
+            62.42
+          ]
+        },
+        "k8": {
+          "exact_pct": 9.33,
+          "token_pct": 97.34,
+          "ok": 14,
+          "n": 150,
+          "wilson_95": [
+            5.64,
+            15.06
+          ]
+        },
+        "k16": {
+          "exact_pct": 1.33,
+          "token_pct": 96.33,
+          "ok": 2,
+          "n": 150,
+          "wilson_95": [
+            0.37,
+            4.73
+          ]
+        }
+      },
+      "s5_sum": 160.0,
+      "overwrite": {
+        "in_dist": {
+          "exact_pct": 73.33,
+          "token_pct": 96.49,
+          "ok": 110,
+          "n": 150,
+          "wilson_95": [
+            65.74,
+            79.76
+          ]
+        },
+        "ood_med": {
+          "exact_pct": 60.67,
+          "token_pct": 94.75,
+          "ok": 91,
+          "n": 150,
+          "wilson_95": [
+            52.68,
+            68.12
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 41.33,
+          "token_pct": 92.03,
+          "ok": 62,
+          "n": 150,
+          "wilson_95": [
+            33.77,
+            49.33
+          ]
+        }
+      },
+      "trap": {
+        "in_dist": {
+          "exact_pct": 39.33,
+          "token_pct": 93.26,
+          "ok": 59,
+          "n": 150,
+          "wilson_95": [
+            31.88,
+            47.32
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 42.67,
+          "token_pct": 93.63,
+          "ok": 64,
+          "n": 150,
+          "wilson_95": [
+            35.03,
+            50.67
+          ]
+        }
+      },
+      "selective_f1_in": 51.2,
+      "selective_f1_ood_long": 41.99,
+      "crystal_norm_drift_L2048": 4.8e-07
+    }
+  },
+  "eval_lut": {
+    "val_bpb": 2.1868,
+    "extrap_4x": {
+      "bpb_L512": 2.0619,
+      "bpb_L2048": 2.0099,
+      "bpb_L2048_head": 2.0182,
+      "bpb_L2048_tail": 2.0175,
+      "extrap_delta_bpb": -0.052,
+      "tail_minus_head_bpb": -0.0007
+    },
+    "openweb_6": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.8534,
+          "bytes_per_chunk": 4.177,
+          "cp_per_chunk": 4.175,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 122.6,
+          "m_max": 140
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 2.4079,
+          "bytes_per_chunk": 6.505,
+          "cp_per_chunk": 4.651,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 78.7,
+          "m_max": 117
+        },
+        "3_Python_Code": {
+          "byte_bpb": 2.1857,
+          "bytes_per_chunk": 3.611,
+          "cp_per_chunk": 3.611,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 141.8,
+          "m_max": 157
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 0.6189,
+          "bytes_per_chunk": 4.103,
+          "cp_per_chunk": 4.103,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 124.8,
+          "m_max": 158
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 3.3249,
+          "bytes_per_chunk": 14.965,
+          "cp_per_chunk": 5.035,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 34.2,
+          "m_max": 35
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 4.954,
+          "bytes_per_chunk": 14.1,
+          "cp_per_chunk": 3.981,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 36.3,
+          "m_max": 37
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 2.5575
+    },
+    "cognitive": {
+      "s5": {
+        "k2": {
+          "exact_pct": 87.33,
+          "token_pct": 99.82,
+          "ok": 131,
+          "n": 150,
+          "wilson_95": [
+            81.06,
+            91.74
+          ]
+        },
+        "k4": {
+          "exact_pct": 41.33,
+          "token_pct": 98.89,
+          "ok": 62,
+          "n": 150,
+          "wilson_95": [
+            33.77,
+            49.33
+          ]
+        },
+        "k8": {
+          "exact_pct": 3.33,
+          "token_pct": 97.0,
+          "ok": 5,
+          "n": 150,
+          "wilson_95": [
+            1.43,
+            7.57
+          ]
+        },
+        "k16": {
+          "exact_pct": 1.33,
+          "token_pct": 96.32,
+          "ok": 2,
+          "n": 150,
+          "wilson_95": [
+            0.37,
+            4.73
+          ]
+        }
+      },
+      "s5_sum": 133.32,
+      "overwrite": {
+        "in_dist": {
+          "exact_pct": 80.67,
+          "token_pct": 97.43,
+          "ok": 121,
+          "n": 150,
+          "wilson_95": [
+            73.61,
+            86.19
+          ]
+        },
+        "ood_med": {
+          "exact_pct": 58.67,
+          "token_pct": 93.97,
+          "ok": 88,
+          "n": 150,
+          "wilson_95": [
+            50.67,
+            66.23
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 42.67,
+          "token_pct": 92.2,
+          "ok": 64,
+          "n": 150,
+          "wilson_95": [
+            35.03,
+            50.67
+          ]
+        }
+      },
+      "trap": {
+        "in_dist": {
+          "exact_pct": 35.33,
+          "token_pct": 92.81,
+          "ok": 53,
+          "n": 150,
+          "wilson_95": [
+            28.14,
+            43.26
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 34.0,
+          "token_pct": 92.67,
+          "ok": 51,
+          "n": 150,
+          "wilson_95": [
+            26.9,
+            41.9
+          ]
+        }
+      },
+      "selective_f1_in": 49.14,
+      "selective_f1_ood_long": 37.84,
+      "crystal_norm_drift_L2048": 4.8e-07
+    }
+  },
+  "long_context_fp": {
+    "L_2048": {
+      "bpb": 2.2295,
+      "head_bpb": 2.2911,
+      "tail_bpb": 2.1421,
+      "tail_minus_head": -0.1491
+    },
+    "L_8192": {
+      "bpb": 2.0413,
+      "head_bpb": 1.9423,
+      "tail_bpb": 1.8747,
+      "tail_minus_head": -0.0675
+    },
+    "L_32768": {
+      "bpb": 1.7627,
+      "head_bpb": 1.5656,
+      "tail_bpb": 1.519,
+      "tail_minus_head": -0.0467
+    }
+  },
+  "long_context_lut": {
+    "L_2048": {
+      "bpb": 2.2956,
+      "head_bpb": 2.3184,
+      "tail_bpb": 2.2224,
+      "tail_minus_head": -0.0959
+    },
+    "L_8192": {
+      "bpb": 2.0787,
+      "head_bpb": 1.9937,
+      "tail_bpb": 1.9107,
+      "tail_minus_head": -0.083
+    },
+    "L_32768": {
+      "bpb": 1.819,
+      "head_bpb": 1.6346,
+      "tail_bpb": 1.5548,
+      "tail_minus_head": -0.0798
+    }
+  },
+  "stream_cpu": {
+    "device": "cpu",
+    "stream_vs_batch_max_err": 8e-06,
+    "state_bytes_prompt": 394420,
+    "state_bytes_after_gen": 394420,
+    "strict_o1_ram_invariant": true,
+    "state_kb": 385.18,
+    "generated_bytes": 128,
+    "backbone_ticks": 33,
+    "total_bytes_processed": 212,
+    "effective_chunk_ratio": 6.42,
+    "bytes_per_sec": 62.7,
+    "ms_per_byte": 15.943,
+    "sample_preview": "Calcite v2 post-transformer streaming check: \u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440! \u6771\u4eac \ud83d\ude80 2026 - 450 -308 -07 334 65 5018. | \u043f\u0440\u0435\u0432\u0438\u0434\u043d\u043e\u0439 \u0444\u0443\u0442\u0440\u0430\u043d\u0435\u043d\u0438\u044f \u0441\u0443\u0434\u043e\u0439 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0435\u043d\u043d\u043e\u0433\u043e \u043a\u0430\u043a \u043d\u0430 \u043f\u0440\u0438\u043d"
+  },
+  "stream_gpu": {
+    "device": "cuda",
+    "stream_vs_batch_max_err": 5e-06,
+    "state_bytes_prompt": 394420,
+    "state_bytes_after_gen": 394420,
+    "strict_o1_ram_invariant": true,
+    "state_kb": 385.18,
+    "generated_bytes": 256,
+    "backbone_ticks": 67,
+    "total_bytes_processed": 340,
+    "effective_chunk_ratio": 5.07,
+    "bytes_per_sec": 49.0,
+    "ms_per_byte": 20.403,
+    "sample_preview": "Calcite v2 post-transformer streaming check: \u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440! \u6771\u4eac \ud83d\ude80 2026 1818\nM18 Hummain. The calculation of the Basin disciple is produced to be the live findings of her alcoholes so in women which and probability of his earth because of marriets in fact and mean"
+  },
+  "checkpoint_path": "checkpoints\\calcite_v2_s2_25m_utf8_lut.pt",
+  "checkpoint_bytes": 8616628
+}

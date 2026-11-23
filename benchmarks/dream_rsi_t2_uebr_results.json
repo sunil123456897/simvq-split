@@ -1,0 +1,397 @@
+{
+  "task_name": "uebr_mdl_t2",
+  "baseline_score": 14.4422,
+  "baseline_dev": {
+    "valid": true,
+    "n": 737,
+    "pass1": 131,
+    "pass1_pct": 17.77,
+    "pass1_ci95": [
+      15.18,
+      20.7
+    ],
+    "pass5_pct": 35.69,
+    "oracle_pct": 76.93,
+    "step1_choice_pct": 2.99,
+    "buckets": {
+      "le2": {
+        "n": 88,
+        "pass1_pct": 19.32
+      },
+      "eq3": {
+        "n": 248,
+        "pass1_pct": 26.21
+      },
+      "eq4": {
+        "n": 178,
+        "pass1_pct": 18.54
+      },
+      "ge5": {
+        "n": 223,
+        "pass1_pct": 7.17
+      },
+      "le3": {
+        "n": 336,
+        "pass1_pct": 24.4
+      },
+      "ge4": {
+        "n": 401,
+        "pass1_pct": 12.22
+      }
+    }
+  },
+  "baseline_stress": {
+    "valid": true,
+    "n": 737,
+    "pass1": 95,
+    "pass1_pct": 12.89,
+    "pass1_ci95": [
+      10.66,
+      15.5
+    ],
+    "pass5_pct": 29.99,
+    "oracle_pct": 75.03,
+    "step1_choice_pct": 3.93,
+    "buckets": {
+      "le2": {
+        "n": 5,
+        "pass1_pct": 0.0
+      },
+      "eq3": {
+        "n": 65,
+        "pass1_pct": 12.31
+      },
+      "eq4": {
+        "n": 208,
+        "pass1_pct": 24.04
+      },
+      "ge5": {
+        "n": 459,
+        "pass1_pct": 8.06
+      },
+      "le3": {
+        "n": 70,
+        "pass1_pct": 11.43
+      },
+      "ge4": {
+        "n": 667,
+        "pass1_pct": 13.04
+      }
+    }
+  },
+  "champion_id": "xover_b3_risk_gated_ood_brake_v2_x_b2_null_aware_coverage_deep_neuro_symbolic",
+  "champion_score": 15.0732,
+  "champion_metrics": {
+    "pass_mask": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "bucket_scores": [
+      0.1591,
+      0.254,
+      0.1685,
+      0.0717,
+      0.0,
+      0.1692,
+      0.2308,
+      0.0959
+    ],
+    "dev_pass1_pct": 16.69,
+    "dev_le3_pct": 22.92,
+    "dev_ge4_pct": 11.47,
+    "stress_pass1_pct": 13.98,
+    "stress_le3_pct": 15.71,
+    "stress_ge4_pct": 13.79,
+    "hmean_4": 14.9822,
+    "dev_step1_choice_pct": 6.11,
+    "stress_step1_choice_pct": 6.78,
+    "summary": "score=15.07 | HMean4=14.98% | Dev=16.69% (<=3:22.9%, >=4:11.5%) | Stress=13.98% (<=3:15.7%, >=4:13.8%)"
+  },
+  "total_nodes_explored": 9,
+  "elapsed_s": 234.33,
+  "blind_vault_report": {
+    "ASDiv_2078": {
+      "baseline_a3": {
+        "valid": true,
+        "n": 2078,
+        "pass1": 437,
+        "pass1_pct": 21.03,
+        "pass1_ci95": [
+          19.33,
+          22.83
+        ],
+        "pass5_pct": 48.51,
+        "oracle_pct": 81.42,
+        "step1_choice_pct": 17.3,
+        "buckets": {
+          "le2": {
+            "n": 1280,
+            "pass1_pct": 20.31
+          },
+          "eq3": {
+            "n": 550,
+            "pass1_pct": 25.27
+          },
+          "eq4": {
+            "n": 157,
+            "pass1_pct": 21.02
+          },
+          "ge5": {
+            "n": 91,
+            "pass1_pct": 5.49
+          },
+          "le3": {
+            "n": 1830,
+            "pass1_pct": 21.8
+          },
+          "ge4": {
+            "n": 248,
+            "pass1_pct": 15.32
+          }
+        }
+      },
+      "champion": {
+        "valid": true,
+        "n": 2078,
+        "pass1": 541,
+        "pass1_pct": 26.03,
+        "pass1_ci95": [
+          24.19,
+          27.96
+        ],
+        "pass5_pct": 51.59,
+        "oracle_pct": 81.42,
+        "step1_choice_pct": 29.98,
+        "buckets": {
+          "le2": {
+            "n": 1280,
+            "pass1_pct": 28.2
+          },
+          "eq3": {
+            "n": 550,
+            "pass1_pct": 26.18
+          },
+          "eq4": {
+            "n": 157,
+            "pass1_pct": 21.02
+          },
+          "ge5": {
+            "n": 91,
+            "pass1_pct": 3.3
+          },
+          "le3": {
+            "n": 1830,
+            "pass1_pct": 27.6
+          },
+          "ge4": {
+            "n": 248,
+            "pass1_pct": 14.52
+          }
+        }
+      },
+      "delta_pass1_pp": 5.0,
+      "delta_le3_pp": 5.8
+    },
+    "MultiArith_600": {
+      "baseline_a3": {
+        "valid": true,
+        "n": 600,
+        "pass1": 287,
+        "pass1_pct": 47.83,
+        "pass1_ci95": [
+          43.86,
+          51.83
+        ],
+        "pass5_pct": 82.67,
+        "oracle_pct": 97.67,
+        "step1_choice_pct": 0.5,
+        "buckets": {
+          "le2": {
+            "n": 0,
+            "pass1_pct": 0.0
+          },
+          "eq3": {
+            "n": 574,
+            "pass1_pct": 49.3
+          },
+          "eq4": {
+            "n": 14,
+            "pass1_pct": 28.57
+          },
+          "ge5": {
+            "n": 12,
+            "pass1_pct": 0.0
+          },
+          "le3": {
+            "n": 574,
+            "pass1_pct": 49.3
+          },
+          "ge4": {
+            "n": 26,
+            "pass1_pct": 15.38
+          }
+        }
+      },
+      "champion": {
+        "valid": true,
+        "n": 600,
+        "pass1": 275,
+        "pass1_pct": 45.83,
+        "pass1_ci95": [
+          41.89,
+          49.83
+        ],
+        "pass5_pct": 79.83,
+        "oracle_pct": 97.67,
+        "step1_choice_pct": 1.0,
+        "buckets": {
+          "le2": {
+            "n": 0,
+            "pass1_pct": 0.0
+          },
+          "eq3": {
+            "n": 574,
+            "pass1_pct": 47.39
+          },
+          "eq4": {
+            "n": 14,
+            "pass1_pct": 21.43
+          },
+          "ge5": {
+            "n": 12,
+            "pass1_pct": 0.0
+          },
+          "le3": {
+            "n": 574,
+            "pass1_pct": 47.39
+          },
+          "ge4": {
+            "n": 26,
+            "pass1_pct": 11.54
+          }
+        }
+      },
+      "delta_pass1_pp": -2.0,
+      "delta_le3_pp": -1.91
+    },
+    "SVAMP_1000": {
+      "baseline_a3": {
+        "valid": true,
+        "n": 1000,
+        "pass1": 197,
+        "pass1_pct": 19.7,
+        "pass1_ci95": [
+          17.35,
+          22.28
+        ],
+        "pass5_pct": 50.1,
+        "oracle_pct": 95.5,
+        "step1_choice_pct": 12.6,
+        "buckets": {
+          "le2": {
+            "n": 351,
+            "pass1_pct": 28.49
+          },
+          "eq3": {
+            "n": 491,
+            "pass1_pct": 18.53
+          },
+          "eq4": {
+            "n": 155,
+            "pass1_pct": 3.87
+          },
+          "ge5": {
+            "n": 3,
+            "pass1_pct": 0.0
+          },
+          "le3": {
+            "n": 842,
+            "pass1_pct": 22.68
+          },
+          "ge4": {
+            "n": 158,
+            "pass1_pct": 3.8
+          }
+        }
+      },
+      "champion": {
+        "valid": true,
+        "n": 1000,
+        "pass1": 251,
+        "pass1_pct": 25.1,
+        "pass1_ci95": [
+          22.51,
+          27.88
+        ],
+        "pass5_pct": 55.9,
+        "oracle_pct": 95.5,
+        "step1_choice_pct": 19.9,
+        "buckets": {
+          "le2": {
+            "n": 351,
+            "pass1_pct": 40.74
+          },
+          "eq3": {
+            "n": 491,
+            "pass1_pct": 20.77
+          },
+          "eq4": {
+            "n": 155,
+            "pass1_pct": 3.87
+          },
+          "ge5": {
+            "n": 3,
+            "pass1_pct": 0.0
+          },
+          "le3": {
+            "n": 842,
+            "pass1_pct": 29.1
+          },
+          "ge4": {
+            "n": 158,
+            "pass1_pct": 3.8
+          }
+        }
+      },
+      "delta_pass1_pp": 5.4,
+      "delta_le3_pp": 6.42
+    },
+    "summary_delta_pp": {
+      "ASDiv_2078": 5.0,
+      "MultiArith_600": -2.0,
+      "SVAMP_1000": 5.4
+    },
+    "champion_params": {
+      "prior_scale": 1.01,
+      "beam_scale": 0.88,
+      "mdl_ops_pen": 0.074,
+      "depth_norm_p": 0.45,
+      "null_relax_lam": 2.5,
+      "unused_g_scale": 0.958,
+      "const_pen_extra": 0.2
+    },
+    "blind_vault_call_count": 1
+  },
+  "journal": [
+    "[Baseline] `root` verified: score=14.4422 (score=14.44 | HMean4=13.94% | Dev=17.77% (<=3:24.4%, >=4:12.2%) | Stress=12.89% (<=3:11.4%, >=4:13.0%))",
+    "[Pre-Commitment Gate | H=(c,pi,d,a)] Contract verified: valid=True (tri-state criteria=support/weaken/inconclusive, confounders=2)",
+    "[Round 1 | Branch 0] `b0_occam_mdl_debias` -> score=13.9709",
+    "[Round 1 | Branch 1] `b1_depth_norm_energy` -> score=14.8133",
+    "[Round 1 | Branch 2] `b2_null_aware_coverage` -> score=14.8792",
+    "[Round 1 | Branch 3] `b3_risk_gated_ood_brake` -> score=14.8874",
+    "[Round 2 | Deepen Branch 1] `b1_depth_norm_full` -> score=14.3039",
+    "[Round 2 | Deepen Branch 2] `b2_null_aware_coverage_deep` -> score=14.4194",
+    "[Round 2 | Deepen Branch 3] `b3_risk_gated_ood_brake_v2` -> score=12.4935",
+    "[Round 3 | DAG CROSSOVER(b3_risk_gated_ood_brake_v2, b2_null_aware_coverage_deep)] Synthesized `xover_b3_risk_gated_ood_brake_v2_x_b2_null_aware_coverage_deep` -> score=14.6427 (projected=14.8874) | Error-Fingerprint Union=0.00% (+0.00% gain, unique_u=0, unique_v=0)",
+    "[Round 4 | Neuro-Symbolic Split + RRSI Pruner + Flat-Plateau] `xover_b3_risk_gated_ood_brake_v2_x_b2_null_aware_coverage_deep`: 14.6427 -> 15.0732 | Active knobs=5/6 (kept=['prior_scale', 'beam_scale', 'mdl_ops_pen', 'null_relax_lam', 'unused_g_scale']) | Plateau mean=15.0054 (cliff_drop=0.0678, sharp_spike=False)",
+    "[Blind Vault | Single-Shot Sealed Audit] Champion `xover_b3_risk_gated_ood_brake_v2_x_b2_null_aware_coverage_deep_neuro_symbolic` -> {'ASDiv_2078': {'baseline_a3': {'valid': True, 'n': 2078, 'pass1': 437, 'pass1_pct': 21.03, 'pass1_ci95': [19.33, 22.83], 'pass5_pct': 48.51, 'oracle_pct': 81.42, 'step1_choice_pct': 17.3, 'buckets': {'le2': {'n': 1280, 'pass1_pct': 20.31}, 'eq3': {'n': 550, 'pass1_pct': 25.27}, 'eq4': {'n': 157, 'pass1_pct': 21.02}, 'ge5': {'n': 91, 'pass1_pct': 5.49}, 'le3': {'n': 1830, 'pass1_pct': 21.8}, 'ge4': {'n': 248, 'pass1_pct': 15.32}}}, 'champion': {'valid': True, 'n': 2078, 'pass1': 541, 'pass1_pct': 26.03, 'pass1_ci95': [24.19, 27.96], 'pass5_pct': 51.59, 'oracle_pct': 81.42, 'step1_choice_pct': 29.98, 'buckets': {'le2': {'n': 1280, 'pass1_pct': 28.2}, 'eq3': {'n': 550, 'pass1_pct': 26.18}, 'eq4': {'n': 157, 'pass1_pct': 21.02}, 'ge5': {'n': 91, 'pass1_pct': 3.3}, 'le3': {'n': 1830, 'pass1_pct': 27.6}, 'ge4': {'n': 248, 'pass1_pct': 14.52}}}, 'delta_pass1_pp': 5.0, 'delta_le3_pp': 5.8}, 'MultiArith_600': {'baseline_a3': {'valid': True, 'n': 600, 'pass1': 287, 'pass1_pct': 47.83, 'pass1_ci95': [43.86, 51.83], 'pass5_pct': 82.67, 'oracle_pct': 97.67, 'step1_choice_pct': 0.5, 'buckets': {'le2': {'n': 0, 'pass1_pct': 0.0}, 'eq3': {'n': 574, 'pass1_pct': 49.3}, 'eq4': {'n': 14, 'pass1_pct': 28.57}, 'ge5': {'n': 12, 'pass1_pct': 0.0}, 'le3': {'n': 574, 'pass1_pct': 49.3}, 'ge4': {'n': 26, 'pass1_pct': 15.38}}}, 'champion': {'valid': True, 'n': 600, 'pass1': 275, 'pass1_pct': 45.83, 'pass1_ci95': [41.89, 49.83], 'pass5_pct': 79.83, 'oracle_pct': 97.67, 'step1_choice_pct': 1.0, 'buckets': {'le2': {'n': 0, 'pass1_pct': 0.0}, 'eq3': {'n': 574, 'pass1_pct': 47.39}, 'eq4': {'n': 14, 'pass1_pct': 21.43}, 'ge5': {'n': 12, 'pass1_pct': 0.0}, 'le3': {'n': 574, 'pass1_pct': 47.39}, 'ge4': {'n': 26, 'pass1_pct': 11.54}}}, 'delta_pass1_pp': -2.0, 'delta_le3_pp': -1.91}, 'SVAMP_1000': {'baseline_a3': {'valid': True, 'n': 1000, 'pass1': 197, 'pass1_pct': 19.7, 'pass1_ci95': [17.35, 22.28], 'pass5_pct': 50.1, 'oracle_pct': 95.5, 'step1_choice_pct': 12.6, 'buckets': {'le2': {'n': 351, 'pass1_pct': 28.49}, 'eq3': {'n': 491, 'pass1_pct': 18.53}, 'eq4': {'n': 155, 'pass1_pct': 3.87}, 'ge5': {'n': 3, 'pass1_pct': 0.0}, 'le3': {'n': 842, 'pass1_pct': 22.68}, 'ge4': {'n': 158, 'pass1_pct': 3.8}}}, 'champion': {'valid': True, 'n': 1000, 'pass1': 251, 'pass1_pct': 25.1, 'pass1_ci95': [22.51, 27.88], 'pass5_pct': 55.9, 'oracle_pct': 95.5, 'step1_choice_pct': 19.9, 'buckets': {'le2': {'n': 351, 'pass1_pct': 40.74}, 'eq3': {'n': 491, 'pass1_pct': 20.77}, 'eq4': {'n': 155, 'pass1_pct': 3.87}, 'ge5': {'n': 3, 'pass1_pct': 0.0}, 'le3': {'n': 842, 'pass1_pct': 29.1}, 'ge4': {'n': 158, 'pass1_pct': 3.8}}}, 'delta_pass1_pp': 5.4, 'delta_le3_pp': 6.42}, 'summary_delta_pp': {'ASDiv_2078': 5.0, 'MultiArith_600': -2.0, 'SVAMP_1000': 5.4}, 'champion_params': {'prior_scale': 1.01, 'beam_scale': 0.88, 'mdl_ops_pen': 0.074, 'depth_norm_p': 0.45, 'null_relax_lam': 2.5, 'unused_g_scale': 0.958, 'const_pen_extra': 0.2}, 'blind_vault_call_count': 1}",
+    "[DiscoveryRSI v3 Gates] Credit Active=5/9 (Proposition-1 conserved=True) | Masked-SFT(context=10, zero_loss_dead_ends=6, supervised_lineage=4, M=2.00) | 2x2 Gate=('theta_plus', 'psi_plus') (score=15.0732, synergy=+0.1858)"
+  ],
+  "pool_dir": "C:\\Users\\vanya\\.gemini\\antigravity\\dream_rsi_pool"
+}

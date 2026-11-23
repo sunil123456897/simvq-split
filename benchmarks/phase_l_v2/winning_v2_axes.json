@@ -1,0 +1,13 @@
+{
+  "bpb_base": 2.4519,
+  "two_sigma_bpb": 0.0057,
+  "ov_base": 0.0,
+  "s5_base": 0.0,
+  "winning_axes": {
+    "use_scaled_decoder": true,
+    "use_kalman_precond": false,
+    "topology": "hourglass",
+    "use_clean_gates": false,
+    "use_latent_feedback": false
+  }
+}

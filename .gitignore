@@ -64,3 +64,7 @@ benchmarks/phase_k_chinchilla_cells/
 benchmarks/phase_k_via_negativa_probe.partial.json
 benchmarks/phase_k_probe_*.json
 benchmarks/phase_k_smoke_tmp/
+data_cache/
+benchmarks/phase_l_v2/*_fp_tmp.pt
+benchmarks/phase_l_v2/closure_25m_*_fp.pt
+benchmarks/phase_l_v2/smoke_*.pt

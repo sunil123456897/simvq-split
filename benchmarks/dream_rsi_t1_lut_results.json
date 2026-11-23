@@ -1,0 +1,244 @@
+{
+  "task_name": "calcite_lut_t1",
+  "fp_ref_dev": {
+    "mean_openweb_bpb": 2.7006,
+    "s5_sum": 162.49,
+    "selective_f1_ood_long": 49.32,
+    "ov_long": 60.42,
+    "trap_long": 41.67,
+    "regimes": {
+      "1_GSM8K_EN": 2.5536,
+      "2_Russian_UTF8": 2.1305,
+      "3_Python_Code": 2.0521,
+      "4_ARC_JSON": 0.3946,
+      "5_CJK_UTF8": 3.5806,
+      "6_Emoji_4Byte": 5.4922
+    }
+  },
+  "baseline_score": 94.308,
+  "champion_id": "xover_b1_awq_rms_smooth_gentle_x_b0_hessian_cd_deep_neuro_symbolic",
+  "champion_score": 102.866,
+  "champion_metrics": {
+    "pass_mask": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "bucket_scores": [
+      2.7876,
+      3.1912,
+      2.9232,
+      5.5019,
+      2.1225,
+      1.3476,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.2292,
+      0.2708
+    ],
+    "spec": {
+      "mode": "hessian_cd",
+      "damp_rel": 0.04365,
+      "cd_passes": 4,
+      "grid_points": 7,
+      "grid_span": 0.4,
+      "smooth_gamma": 0.249,
+      "awq_alpha": 0.4,
+      "barbell_kb_thresh": 100.0,
+      "barbell_scope": "cog_only",
+      "tag": "xover_hcd_d0.044_g0.25_b100_a0.40"
+    },
+    "mean_openweb_bpb": 3.021,
+    "regimes_bpb": {
+      "1_GSM8K_EN": 3.2124,
+      "2_Russian_UTF8": 2.8088,
+      "3_Python_Code": 3.0768,
+      "4_ARC_JSON": 0.4981,
+      "5_CJK_UTF8": 3.8775,
+      "6_Emoji_4Byte": 4.6524
+    },
+    "s5_sum": 0.0,
+    "s5": {
+      "k2": 0.0,
+      "k4": 0.0,
+      "k8": 0.0,
+      "k16": 0.0
+    },
+    "ov_long": 22.92,
+    "trap_long": 27.08,
+    "selective_f1_ood_long": 24.83,
+    "lut_mb": 25.582,
+    "n_quantized": 75,
+    "n_fp16_barbell": 25,
+    "router_max_abs_diff": 0.0,
+    "eval_s": 10.9,
+    "summary": "score=102.87 | ow6=3.0210 | S5=0.0% | SelF1=24.8% | size=25.58MB (10.9s)"
+  },
+  "total_nodes_explored": 9,
+  "elapsed_s": 569.31,
+  "blind_vault_report": {
+    "champion_spec": {
+      "mode": "hessian_cd",
+      "damp_rel": 0.04365,
+      "cd_passes": 4,
+      "grid_points": 7,
+      "grid_span": 0.4,
+      "smooth_gamma": 0.249,
+      "awq_alpha": 0.4,
+      "barbell_kb_thresh": 100.0,
+      "barbell_scope": "cog_only",
+      "tag": "xover_hcd_d0.044_g0.25_b100_a0.40"
+    },
+    "fp_ceiling_vault": {
+      "mean_openweb_bpb": 2.8369,
+      "regimes_bpb": {
+        "1_GSM8K_EN": 2.6322,
+        "2_Russian_UTF8": 2.5329,
+        "3_Python_Code": 2.1328,
+        "4_ARC_JSON": 0.6345,
+        "5_CJK_UTF8": 3.5787,
+        "6_Emoji_4Byte": 5.5104
+      },
+      "s5_sum": 162.0,
+      "s5": {
+        "k2": 91.33,
+        "k4": 58.0,
+        "k8": 10.67,
+        "k16": 2.0
+      },
+      "ov_long": 57.33,
+      "trap_long": 38.67,
+      "selective_f1_ood_long": 46.19
+    },
+    "baseline_lut_vault": {
+      "mean_openweb_bpb": 3.1932,
+      "regimes_bpb": {
+        "1_GSM8K_EN": 3.2353,
+        "2_Russian_UTF8": 3.3183,
+        "3_Python_Code": 3.0154,
+        "4_ARC_JSON": 1.2017,
+        "5_CJK_UTF8": 4.0888,
+        "6_Emoji_4Byte": 4.2995
+      },
+      "s5_sum": 0.0,
+      "s5": {
+        "k2": 0.0,
+        "k4": 0.0,
+        "k8": 0.0,
+        "k16": 0.0
+      },
+      "ov_long": 35.33,
+      "trap_long": 20.67,
+      "selective_f1_ood_long": 26.08,
+      "lut_mb": 24.9047
+    },
+    "champion_lut_vault": {
+      "mean_openweb_bpb": 3.1068,
+      "regimes_bpb": {
+        "1_GSM8K_EN": 3.2677,
+        "2_Russian_UTF8": 3.1046,
+        "3_Python_Code": 2.9672,
+        "4_ARC_JSON": 0.8158,
+        "5_CJK_UTF8": 3.8814,
+        "6_Emoji_4Byte": 4.6039
+      },
+      "s5_sum": 0.0,
+      "s5": {
+        "k2": 0.0,
+        "k4": 0.0,
+        "k8": 0.0,
+        "k16": 0.0
+      },
+      "ov_long": 18.0,
+      "trap_long": 26.67,
+      "selective_f1_ood_long": 21.49,
+      "max_mid_utf8_split_pct": 0.0,
+      "lut_mb": 25.582,
+      "physical_footprint": {
+        "num_lut_layers": 75,
+        "packed_weights_count": 81401856,
+        "packed_u8_bytes": 20351040,
+        "packed_u8_kb": 19874.06,
+        "scales_fp16_bytes": 5087622,
+        "scales_fp16_kb": 4968.38,
+        "fp16_other_bytes": 1386018,
+        "fp16_other_kb": 1353.53,
+        "total_lut_kb": 26195.98,
+        "orig_fp32_matrix_kb": 317976.0,
+        "matrix_compression_vs_fp32": 15.9995,
+        "effective_matrix_compression_with_scales": 12.7997
+      },
+      "n_quantized": 75,
+      "n_fp16_barbell": 25,
+      "fp16_keep_layers": [
+        "crystal.op_mode_proj",
+        "crystal.op_ptr_proj",
+        "crystal.perm_gate_proj",
+        "crystal.pool_score",
+        "crystal.slot_proj",
+        "crystal.subj_sal_proj",
+        "crystal.w_ctx_proj",
+        "crystal.w_eta_proj",
+        "crystal.w_val_proj",
+        "crystal_2.op_mode_proj",
+        "crystal_2.op_ptr_proj",
+        "crystal_2.perm_gate_proj",
+        "crystal_2.pool_score",
+        "crystal_2.slot_proj",
+        "crystal_2.subj_sal_proj",
+        "crystal_2.w_ctx_proj",
+        "crystal_2.w_eta_proj",
+        "crystal_2.w_val_proj",
+        "woodbury.beta_proj",
+        "woodbury.gamma_proj",
+        "woodbury.prose_k_proj",
+        "woodbury.prose_q_proj",
+        "woodbury.query_intent_proj",
+        "woodbury.subj_salience",
+        "woodbury.write_pool_score"
+      ]
+    },
+    "physical_tmac_parity_max_diff": 0.051857,
+    "physical_tmac_parity_mean_diff": 0.004903,
+    "delta_vs_baseline": {
+      "openweb_bpb": -0.0864,
+      "s5_sum_pp": 0.0,
+      "selective_f1_long_pp": -4.59,
+      "lut_mb_delta": 0.6773
+    },
+    "gap_vs_fp_ceiling": {
+      "baseline_bpb_gap": 0.3563,
+      "champion_bpb_gap": 0.2699,
+      "baseline_s5_gap_pp": -162.0,
+      "champion_s5_gap_pp": -162.0
+    },
+    "blind_vault_call_count": 1
+  },
+  "journal": [
+    "[Baseline] `root` verified: score=94.3080 (score=94.31 | ow6=3.1098 | S5=0.0% | SelF1=26.4% | size=24.90MB (9.33s))",
+    "[Pre-Commitment Gate | H=(c,pi,d,a)] Contract verified: valid=True (tri-state criteria=support/weaken/inconclusive, confounders=2)",
+    "[Round 1 | Branch 0] `b0_hessian_cd` -> score=96.0000",
+    "[Round 1 | Branch 1] `b1_awq_rms_smooth` -> score=101.1760",
+    "[Round 1 | Branch 2] `b2_barbell_gates` -> score=95.6680",
+    "[Round 1 | Branch 3] `b3_grid_scale_ls` -> score=95.2000",
+    "[Round 2 | Deepen Branch 0] `b0_hessian_cd_deep` -> score=95.8860",
+    "[Round 2 | Deepen Branch 1] `b1_awq_rms_smooth_gentle` -> score=97.1900",
+    "[Round 2 | Deepen Branch 2] `b2_barbell_gates_200kb` -> score=90.0696",
+    "[Round 3 | DAG CROSSOVER(b1_awq_rms_smooth_gentle, b0_hessian_cd_deep)] Synthesized `xover_b1_awq_rms_smooth_gentle_x_b0_hessian_cd_deep` -> score=98.2080 (projected=101.1760) | Error-Fingerprint Union=8.33% (+0.00% gain, unique_u=0, unique_v=0)",
+    "[Round 4 | Neuro-Symbolic Split + RRSI Pruner + Flat-Plateau] `xover_b1_awq_rms_smooth_gentle_x_b0_hessian_cd_deep`: 98.2080 -> 102.8660 | Active knobs=3/4 (kept=['damp_log10', 'smooth_gamma', 'awq_alpha']) | Plateau mean=102.9798 (cliff_drop=-0.1138, sharp_spike=False)",
+    "[Blind Vault | Single-Shot Sealed Audit] Champion `xover_b1_awq_rms_smooth_gentle_x_b0_hessian_cd_deep_neuro_symbolic` -> {'champion_spec': {'mode': 'hessian_cd', 'damp_rel': 0.04365, 'cd_passes': 4, 'grid_points': 7, 'grid_span': 0.4, 'smooth_gamma': 0.249, 'awq_alpha': 0.4, 'barbell_kb_thresh': 100.0, 'barbell_scope': 'cog_only', 'tag': 'xover_hcd_d0.044_g0.25_b100_a0.40'}, 'fp_ceiling_vault': {'mean_openweb_bpb': 2.8369, 'regimes_bpb': {'1_GSM8K_EN': 2.6322, '2_Russian_UTF8': 2.5329, '3_Python_Code': 2.1328, '4_ARC_JSON': 0.6345, '5_CJK_UTF8': 3.5787, '6_Emoji_4Byte': 5.5104}, 's5_sum': 162.0, 's5': {'k2': 91.33, 'k4': 58.0, 'k8': 10.67, 'k16': 2.0}, 'ov_long': 57.33, 'trap_long': 38.67, 'selective_f1_ood_long': 46.19}, 'baseline_lut_vault': {'mean_openweb_bpb': 3.1932, 'regimes_bpb': {'1_GSM8K_EN': 3.2353, '2_Russian_UTF8': 3.3183, '3_Python_Code': 3.0154, '4_ARC_JSON': 1.2017, '5_CJK_UTF8': 4.0888, '6_Emoji_4Byte': 4.2995}, 's5_sum': 0.0, 's5': {'k2': 0.0, 'k4': 0.0, 'k8': 0.0, 'k16': 0.0}, 'ov_long': 35.33, 'trap_long': 20.67, 'selective_f1_ood_long': 26.08, 'lut_mb': 24.9047}, 'champion_lut_vault': {'mean_openweb_bpb': 3.1068, 'regimes_bpb': {'1_GSM8K_EN': 3.2677, '2_Russian_UTF8': 3.1046, '3_Python_Code': 2.9672, '4_ARC_JSON': 0.8158, '5_CJK_UTF8': 3.8814, '6_Emoji_4Byte': 4.6039}, 's5_sum': 0.0, 's5': {'k2': 0.0, 'k4': 0.0, 'k8': 0.0, 'k16': 0.0}, 'ov_long': 18.0, 'trap_long': 26.67, 'selective_f1_ood_long': 21.49, 'max_mid_utf8_split_pct': 0.0, 'lut_mb': 25.582, 'physical_footprint': {'num_lut_layers': 75, 'packed_weights_count': 81401856, 'packed_u8_bytes': 20351040, 'packed_u8_kb': 19874.06, 'scales_fp16_bytes': 5087622, 'scales_fp16_kb': 4968.38, 'fp16_other_bytes': 1386018, 'fp16_other_kb': 1353.53, 'total_lut_kb': 26195.98, 'orig_fp32_matrix_kb': 317976.0, 'matrix_compression_vs_fp32': 15.9995, 'effective_matrix_compression_with_scales': 12.7997}, 'n_quantized': 75, 'n_fp16_barbell': 25, 'fp16_keep_layers': ['crystal.op_mode_proj', 'crystal.op_ptr_proj', 'crystal.perm_gate_proj', 'crystal.pool_score', 'crystal.slot_proj', 'crystal.subj_sal_proj', 'crystal.w_ctx_proj', 'crystal.w_eta_proj', 'crystal.w_val_proj', 'crystal_2.op_mode_proj', 'crystal_2.op_ptr_proj', 'crystal_2.perm_gate_proj', 'crystal_2.pool_score', 'crystal_2.slot_proj', 'crystal_2.subj_sal_proj', 'crystal_2.w_ctx_proj', 'crystal_2.w_eta_proj', 'crystal_2.w_val_proj', 'woodbury.beta_proj', 'woodbury.gamma_proj', 'woodbury.prose_k_proj', 'woodbury.prose_q_proj', 'woodbury.query_intent_proj', 'woodbury.subj_salience', 'woodbury.write_pool_score']}, 'physical_tmac_parity_max_diff': 0.051857, 'physical_tmac_parity_mean_diff': 0.004903, 'delta_vs_baseline': {'openweb_bpb': -0.0864, 's5_sum_pp': 0.0, 'selective_f1_long_pp': -4.59, 'lut_mb_delta': 0.6773}, 'gap_vs_fp_ceiling': {'baseline_bpb_gap': 0.3563, 'champion_bpb_gap': 0.2699, 'baseline_s5_gap_pp': -162.0, 'champion_s5_gap_pp': -162.0}, 'blind_vault_call_count': 1}",
+    "[DiscoveryRSI v3 Gates] Credit Active=8/9 (Proposition-1 conserved=True) | Masked-SFT(context=10, zero_loss_dead_ends=4, supervised_lineage=6, M=3.00) | 2x2 Gate=('theta_plus', 'psi_plus') (score=102.8660, synergy=+1.6900)"
+  ],
+  "pool_dir": "C:\\Users\\vanya\\.gemini\\antigravity\\dream_rsi_pool"
+}
