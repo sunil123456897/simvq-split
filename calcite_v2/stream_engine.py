@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from .chunker import ChunkerStreamState
 from .crystal import CrystalStreamState
+from .epistemic_slots import EpistemicSlotsStreamState
 from .model import CalciteV2LM
 from .woodbury import WoodburyStreamState
 
@@ -29,11 +30,14 @@ class CalciteStreamState:
     chunker: ChunkerStreamState
     swa_k_rings: List[torch.Tensor]        # per SWA block: (B, W, n_heads, head_dim)
     swa_v_rings: List[torch.Tensor]        # per SWA block: (B, W, n_heads, head_dim)
+    swa_canon_rings: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
     woodbury_fast: Optional[WoodburyStreamState]
     woodbury_slow: WoodburyStreamState
+    epistemic_slots: Optional[EpistemicSlotsStreamState]
     crystal_1: CrystalStreamState
     crystal_2: CrystalStreamState
     fb_prev_z_hat: Optional[torch.Tensor]  # (B, d_model) if use_latent_feedback
+    tr_carry_B: Optional[torch.Tensor]     # (B, d_model) if use_temporal_residual
     chunk_pos: int
     total_bytes: int
     backbone_ticks: int
@@ -44,13 +48,20 @@ class CalciteStreamState:
         total = self.chunker.memory_bytes()
         for kr, vr in zip(self.swa_k_rings, self.swa_v_rings):
             total += (kr.numel() * kr.element_size() + vr.numel() * vr.element_size()) // b
+        if self.swa_canon_rings is not None:
+            for ca, cm in self.swa_canon_rings:
+                total += (ca.numel() * ca.element_size() + cm.numel() * cm.element_size()) // b
         if self.woodbury_fast is not None:
             total += self.woodbury_fast.memory_bytes()
         total += self.woodbury_slow.memory_bytes()
+        if self.epistemic_slots is not None:
+            total += self.epistemic_slots.memory_bytes()
         total += self.crystal_1.memory_bytes()
         total += self.crystal_2.memory_bytes()
         if self.fb_prev_z_hat is not None:
             total += (self.fb_prev_z_hat.numel() * self.fb_prev_z_hat.element_size()) // b
+        if self.tr_carry_B is not None:
+            total += (self.tr_carry_B.numel() * self.tr_carry_B.element_size()) // b
         return int(total)
 
 
@@ -75,6 +86,17 @@ class CalciteStreamEngine:
         Dh = self.cfg.d_model // H
         k_rings = [torch.zeros(batch_size, W, H, Dh, device=dev, dtype=dt) for _ in swa_blocks]
         v_rings = [torch.zeros(batch_size, W, H, Dh, device=dev, dtype=dt) for _ in swa_blocks]
+        canon_rings = (
+            [
+                (
+                    torch.zeros(batch_size, 3, self.cfg.d_model, device=dev, dtype=dt),
+                    torch.zeros(batch_size, 3, self.cfg.d_model, device=dev, dtype=dt),
+                )
+                for _ in swa_blocks
+            ]
+            if self.cfg.use_canon_chunks
+            else None
+        )
 
         wf_state = (
             self.model.woodbury_fast.init_stream_state(batch_size, dev, dt)
@@ -82,6 +104,11 @@ class CalciteStreamEngine:
             else None
         )
         ws_state = self.model.woodbury.init_stream_state(batch_size, dev, dt)
+        es_state = (
+            self.model.epistemic_slots.init_stream_state(batch_size, dev, dt)
+            if self.model.epistemic_slots is not None
+            else None
+        )
         c1_state = self.model.crystal.init_stream_state(batch_size, dev, dt)
         c2_state = self.model.crystal_2.init_stream_state(batch_size, dev, dt)
         fb_prev = (
@@ -89,15 +116,23 @@ class CalciteStreamEngine:
             if self.cfg.use_latent_feedback
             else None
         )
+        tr_carry = (
+            torch.zeros(batch_size, self.cfg.d_model, device=dev, dtype=dt)
+            if self.cfg.use_temporal_residual
+            else None
+        )
         return CalciteStreamState(
             chunker=self.model.byte_chunker.init_stream_state(batch_size, dev, dt),
             swa_k_rings=k_rings,
             swa_v_rings=v_rings,
+            swa_canon_rings=canon_rings,
             woodbury_fast=wf_state,
             woodbury_slow=ws_state,
+            epistemic_slots=es_state,
             crystal_1=c1_state,
             crystal_2=c2_state,
             fb_prev_z_hat=fb_prev,
+            tr_carry_B=tr_carry,
             chunk_pos=0,
             total_bytes=0,
             backbone_ticks=0,
@@ -125,8 +160,9 @@ class CalciteStreamEngine:
         ring_idx = 0
         if self.cfg.topology == "interleaved" and m.swa_stages is not None:
             for blk in m.swa_stages[0]:
+                c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
-                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos
+                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
             if m.woodbury_fast is not None and m.woodbury_fast_norm is not None and m.woodbury_fast_gate is not None and state.woodbury_fast is not None:
@@ -135,8 +171,9 @@ class CalciteStreamEngine:
                 h = h + wf_g * m.woodbury_fast.step(wf_in, h_lex_t, state.woodbury_fast)
 
             for blk in m.swa_stages[1]:
+                c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
-                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos
+                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
             if m.cryst1_norm is not None and m.cryst1_gate is not None:
@@ -145,14 +182,20 @@ class CalciteStreamEngine:
                 h = h + c1_g * m.crystal.step(c1_in, h_lex_t, state.crystal_1)
 
             for blk in m.swa_stages[2]:
+                c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
-                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos
+                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
             if m.woodbury_slow_gate is not None:
                 ws_in = m.split_norm(h)
                 ws_g = 2.0 * torch.sigmoid(m.woodbury_slow_gate(ws_in))
                 h = h + ws_g * m.woodbury.step(ws_in, h_lex_t, state.woodbury_slow)
+                if m.epistemic_slots is not None and m.epistemic_slots_gate is not None and state.epistemic_slots is not None:
+                    es_g = 2.0 * torch.sigmoid(m.epistemic_slots_gate(ws_in))
+                    h = h + es_g * m.epistemic_slots.step(
+                        ws_in, m.woodbury.last_epistemic_uncertainty, state.epistemic_slots
+                    )
             h = h + m.mid_mlp(m.mid_mlp_norm(h))
 
             c2_in = m.cryst2_norm(h)
@@ -160,35 +203,153 @@ class CalciteStreamEngine:
             h = h + c2_g * m.crystal_2.step(c2_in, h_lex_t, state.crystal_2)
 
             for blk in m.swa_stages[3]:
+                c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
-                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos
+                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
         else:
-            for blk in m.cortex_pre:
-                h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
-                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos
-                )
-                ring_idx += 1
-            h_split = m.split_norm(h)
-            c_out = m.crystal.step(h_split, h_lex_t, state.crystal_1)
-            w_out = m.woodbury.step(h_split, h_lex_t, state.woodbury_slow)
-            if m.stream_gate is not None:
-                gates = 2.0 * torch.sigmoid(m.stream_gate(h_split))
-                h = h + gates[..., 0:1] * c_out + gates[..., 1:2] * w_out
-            else:
-                h = h + c_out + w_out
-            h = h + m.mid_mlp(m.mid_mlp_norm(h))
-            c2_in = m.cryst2_norm(h)
-            c2_out = (2.0 * torch.sigmoid(m.cryst2_gate(c2_in))) * m.crystal_2.step(
-                c2_in, h_lex_t, state.crystal_2
+            use_ar = m.attnres_mixers is not None
+            use_tr = (
+                self.cfg.use_temporal_residual
+                and state.tr_carry_B is not None
+                and m.tr_rA is not None
+                and m.tr_rB is not None
+                and m.tr_sB is not None
+                and m.tr_phi is not None
             )
-            h = h + c2_out
-            for blk in m.cortex_post:
-                h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
-                    h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos
-                )
+            b_stream = (
+                (m.tr_phi(state.tr_carry_B) if pos > 0 else torch.zeros_like(h))
+                if use_tr and state.tr_carry_B is not None and m.tr_phi is not None
+                else None
+            )
+            tr_idx = 0
+
+            def _tr_step_stream(a_cur: torch.Tensor, b_cur: Optional[torch.Tensor], y_fn) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                nonlocal tr_idx
+                if use_tr and b_cur is not None and m.tr_rA is not None and m.tr_rB is not None and m.tr_sB is not None:
+                    u = m.tr_rA[tr_idx].to(a_cur.dtype) * a_cur + m.tr_rB[tr_idx].to(a_cur.dtype) * b_cur
+                    y = y_fn(u)
+                    a_next = a_cur + y
+                    b_next = b_cur + m.tr_sB[tr_idx].to(a_cur.dtype) * y
+                    tr_idx += 1
+                    return a_next, b_next
+                return a_cur + y_fn(a_cur), b_cur
+
+            def _step_swa_blk(blk, r_i: int, a_cur: torch.Tensor, b_cur: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                c_r = state.swa_canon_rings[r_i] if state.swa_canon_rings is not None else None
+                if use_tr:
+                    def _attn_fn(u: torch.Tensor) -> torch.Tensor:
+                        x1 = blk.norm1(u)
+                        if blk.canon_attn is not None and c_r is not None:
+                            x1, nxt_ca = blk._canon_step(x1, blk.canon_attn, c_r[0])
+                            c_r[0].copy_(nxt_ca)
+                        ao, kr, vr = blk.attn.step(x1, state.swa_k_rings[r_i], state.swa_v_rings[r_i], pos)
+                        state.swa_k_rings[r_i] = kr
+                        state.swa_v_rings[r_i] = vr
+                        return ao
+
+                    def _mlp_fn(u: torch.Tensor) -> torch.Tensor:
+                        x2 = blk.norm2(u)
+                        if blk.canon_mlp is not None and c_r is not None:
+                            x2, nxt_cm = blk._canon_step(x2, blk.canon_mlp, c_r[1])
+                            c_r[1].copy_(nxt_cm)
+                        return blk.mlp(x2)
+
+                    a_cur, b_cur = _tr_step_stream(a_cur, b_cur, _attn_fn)
+                    a_cur, b_cur = _tr_step_stream(a_cur, b_cur, _mlp_fn)
+                    return a_cur, b_cur
+                a_out, kr, vr = blk.step(a_cur, state.swa_k_rings[r_i], state.swa_v_rings[r_i], pos, canon_rings=c_r)
+                state.swa_k_rings[r_i] = kr
+                state.swa_v_rings[r_i] = vr
+                return a_out, b_cur
+
+            hist: List[torch.Tensor] = [h] if use_ar else []
+            for blk in m.cortex_pre:
+                h, b_stream = _step_swa_blk(blk, ring_idx, h, b_stream)
                 ring_idx += 1
+                if use_ar:
+                    hist.append(h)
+
+            def _long_mem_step(u_in: torch.Tensor) -> torch.Tensor:
+                h_split = m.split_norm(u_in)
+                c_out = m.crystal.step(h_split, h_lex_t, state.crystal_1)
+                w_out = m.woodbury.step(h_split, h_lex_t, state.woodbury_slow)
+                if m.stream_gate is not None:
+                    gates = 2.0 * torch.sigmoid(m.stream_gate(h_split))
+                    delta_l = gates[..., 0:1] * c_out + gates[..., 1:2] * w_out
+                else:
+                    delta_l = c_out + w_out
+                if m.epistemic_slots is not None and m.epistemic_slots_gate is not None and state.epistemic_slots is not None:
+                    es_g = 2.0 * torch.sigmoid(m.epistemic_slots_gate(h_split))
+                    delta_l = delta_l + es_g * m.epistemic_slots.step(
+                        h_split, m.woodbury.last_epistemic_uncertainty, state.epistemic_slots
+                    )
+                return delta_l
+
+            if use_ar and m.attnres_mixers is not None:
+                h_long_in = m.attnres_mixers[0](h, hist)
+                if use_tr and b_stream is not None and m.tr_rA is not None and m.tr_rB is not None and m.tr_sB is not None:
+                    u = m.tr_rA[tr_idx].to(h.dtype) * h_long_in + m.tr_rB[tr_idx].to(h.dtype) * b_stream
+                    y = _long_mem_step(u)
+                    h = h + y
+                    b_stream = b_stream + m.tr_sB[tr_idx].to(h.dtype) * y
+                    tr_idx += 1
+                else:
+                    h = h + _long_mem_step(h_long_in)
+                hist.append(h)
+            else:
+                h, b_stream = _tr_step_stream(h, b_stream, _long_mem_step)
+
+            def _mid_mlp_step(u_in: torch.Tensor) -> torch.Tensor:
+                return m.mid_mlp(m.mid_mlp_norm(u_in))
+
+            if use_ar and m.attnres_mixers is not None:
+                h_mid_in = m.attnres_mixers[1](h, hist)
+                if use_tr and b_stream is not None and m.tr_rA is not None and m.tr_rB is not None and m.tr_sB is not None:
+                    u = m.tr_rA[tr_idx].to(h.dtype) * h_mid_in + m.tr_rB[tr_idx].to(h.dtype) * b_stream
+                    y = _mid_mlp_step(u)
+                    h = h + y
+                    b_stream = b_stream + m.tr_sB[tr_idx].to(h.dtype) * y
+                    tr_idx += 1
+                else:
+                    h = h + _mid_mlp_step(h_mid_in)
+                hist.append(h)
+            else:
+                h, b_stream = _tr_step_stream(h, b_stream, _mid_mlp_step)
+
+            def _c2_step(u_in: torch.Tensor) -> torch.Tensor:
+                c2_in = m.cryst2_norm(u_in)
+                return (2.0 * torch.sigmoid(m.cryst2_gate(c2_in))) * m.crystal_2.step(
+                    c2_in, h_lex_t, state.crystal_2
+                )
+
+            if use_ar and m.attnres_mixers is not None:
+                h_c2_in = m.attnres_mixers[2](h, hist)
+                if use_tr and b_stream is not None and m.tr_rA is not None and m.tr_rB is not None and m.tr_sB is not None:
+                    u = m.tr_rA[tr_idx].to(h.dtype) * h_c2_in + m.tr_rB[tr_idx].to(h.dtype) * b_stream
+                    y = _c2_step(u)
+                    h = h + y
+                    b_stream = b_stream + m.tr_sB[tr_idx].to(h.dtype) * y
+                    tr_idx += 1
+                else:
+                    h = h + _c2_step(h_c2_in)
+                hist.append(h)
+            else:
+                h, b_stream = _tr_step_stream(h, b_stream, _c2_step)
+
+            for pi, blk in enumerate(m.cortex_post):
+                if use_ar and m.attnres_mixers is not None:
+                    h = m.attnres_mixers[3 + pi](h, hist)
+                h, b_stream = _step_swa_blk(blk, ring_idx, h, b_stream)
+                ring_idx += 1
+                if use_ar:
+                    hist.append(h)
+
+            if use_ar and m.attnres_mixers is not None:
+                h = m.attnres_mixers[-1](h, hist)
+            if use_tr and b_stream is not None:
+                state.tr_carry_B = b_stream.clone()
 
         if state.fb_prev_z_hat is not None:
             state.fb_prev_z_hat = h.clone()

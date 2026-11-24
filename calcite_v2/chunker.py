@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from kernels.fast_calcite_swa_chunker import (
     utf8_span_and_compact_cuda,
 )
-from simvq_split.baselines import RMSNorm, SwiGLU
+from simvq_split.baselines import RMSNorm, SwiGLU, apply_rope
 from simvq_split.chunker import (
     _enforce_utf8_chunk_span_jit,
     _utf8_tensor_flags,
@@ -47,6 +47,7 @@ class ChunkContext:
     slot_idx: torch.Tensor
     offset_in_chunk: torch.Tensor
     valid_chunk: torch.Tensor
+    token_ids: torch.Tensor
 
 
 @dataclass
@@ -59,6 +60,11 @@ class ChunkerStreamState:
     cur_z_bar: torch.Tensor        # (B, d_model)
     ring_dec_conv1: torch.Tensor   # (B, 3, d_model) if scaled decoder else (B, 0, 1)
     ring_dec_conv2: torch.Tensor   # (B, 6, d_model) if scaled decoder else (B, 0, 1)
+    ring_enc_conv2: torch.Tensor   # (B, 6, d_model) if sym_byte_swa else (B, 0, 1)
+    ring_dec_conv3: torch.Tensor   # (B, 12, d_model) if sym_byte_swa else (B, 0, 1)
+    ring_byte_k: torch.Tensor      # (B, W_byte, 2, d_b_hd) if sym_byte_swa else (B, 0, 1, 1)
+    ring_byte_v: torch.Tensor      # (B, W_byte, 2, d_b_hd) if sym_byte_swa else (B, 0, 1, 1)
+    ring_tok3: torch.Tensor        # (B, 3) int64 if byte_engram else (B, 0)
     run_len: torch.Tensor          # (B,) int64
     cp_run: torch.Tensor           # (B,) int64
     cont_streak: torch.Tensor      # (B,) int64
@@ -78,6 +84,11 @@ class ChunkerStreamState:
             self.cur_z_bar,
             self.ring_dec_conv1,
             self.ring_dec_conv2,
+            self.ring_enc_conv2,
+            self.ring_dec_conv3,
+            self.ring_byte_k,
+            self.ring_byte_v,
+            self.ring_tok3,
             self.run_len,
             self.cp_run,
             self.cont_streak,
@@ -103,6 +114,12 @@ class CalciteV2Chunker(nn.Module):
         max_utf8_bytes: int = 16,
         use_static_m_cap: bool = True,
         use_scaled_decoder: bool = True,
+        use_sym_byte_swa: bool = False,
+        byte_swa_window: int = 24,
+        byte_swa_dim: int = 64,
+        use_byte_engram: bool = False,
+        engram_slots: int = 4096,
+        engram_dim: int = 32,
         use_fast_kernels: bool = True,
     ):
         super().__init__()
@@ -119,6 +136,14 @@ class CalciteV2Chunker(nn.Module):
         self.max_utf8_bytes = int(max(4, max_utf8_bytes))
         self.use_static_m_cap = bool(use_static_m_cap)
         self.use_scaled_decoder = bool(use_scaled_decoder)
+        self.use_sym_byte_swa = bool(use_sym_byte_swa)
+        self.byte_swa_window = int(byte_swa_window)
+        self.byte_swa_dim = int(byte_swa_dim)
+        self.byte_swa_heads = 2
+        self.byte_swa_head_dim = self.byte_swa_dim // self.byte_swa_heads
+        self.use_byte_engram = bool(use_byte_engram)
+        self.engram_slots = int(engram_slots)
+        self.engram_dim = int(engram_dim)
         self.use_fast_kernels = bool(use_fast_kernels)
 
         self.refill_int = 100
@@ -184,6 +209,74 @@ class CalciteV2Chunker(nn.Module):
             self.dec_dw2_conv = None
             self.dec_dw2_gate = None
             self.dec_dw2_out = None
+
+        if self.use_sym_byte_swa:
+            # Symmetric encoder dilated mixer (k=4, d=2 -> 14-byte encoder RF)
+            self.enc_dw2_norm = RMSNorm(d_model)
+            self.enc_dw2_conv = nn.Conv1d(
+                d_model, d_model, kernel_size=4, dilation=2, groups=d_model, bias=True
+            )
+            nn.init.normal_(self.enc_dw2_conv.weight, std=0.02)
+            nn.init.zeros_(self.enc_dw2_conv.bias)
+            self.enc_dw2_gate = nn.Linear(d_model, d_model, bias=False)
+            self.enc_dw2_out = nn.Linear(d_model, d_model, bias=False)
+
+            # 3rd-scale decoder dilated mixer (k=4, d=4 -> 22-byte RF)
+            self.dec_dw3_norm = RMSNorm(d_model)
+            self.dec_dw3_conv = nn.Conv1d(
+                d_model, d_model, kernel_size=4, dilation=4, groups=d_model, bias=True
+            )
+            nn.init.normal_(self.dec_dw3_conv.weight, std=0.02)
+            nn.init.zeros_(self.dec_dw3_conv.bias)
+            self.dec_dw3_gate = nn.Linear(d_model, d_model, bias=False)
+            self.dec_dw3_out = nn.Linear(d_model, d_model, bias=False)
+
+            # Micro Byte-SWA (`W_byte = 24`, `d = 64`, `2` heads -> 6 KB O(1) KV ring)
+            self.byte_swa_norm = RMSNorm(d_model)
+            self.byte_swa_qkv = nn.Linear(d_model, 3 * self.byte_swa_dim, bias=False)
+            self.byte_swa_out = nn.Linear(self.byte_swa_dim, d_model, bias=False)
+            with torch.no_grad():
+                self.byte_swa_out.weight.mul_(0.35)
+            b_inv_freq = 1.0 / (
+                10000.0
+                ** (
+                    torch.arange(0, self.byte_swa_head_dim, 2, dtype=torch.float32)
+                    / self.byte_swa_head_dim
+                )
+            )
+            self.register_buffer("byte_swa_inv_freq", b_inv_freq, persistent=False)
+        else:
+            self.enc_dw2_norm = None
+            self.enc_dw2_conv = None
+            self.enc_dw2_gate = None
+            self.enc_dw2_out = None
+            self.dec_dw3_norm = None
+            self.dec_dw3_conv = None
+            self.dec_dw3_gate = None
+            self.dec_dw3_out = None
+            self.byte_swa_norm = None
+            self.byte_swa_qkv = None
+            self.byte_swa_out = None
+            self.byte_swa_inv_freq = None
+
+        if self.use_byte_engram:
+            # Pure-tensor hashed 2-byte + 3-byte lexical n-gram memory (zero dynamic state!)
+            self.engram_emb2 = nn.Embedding(self.engram_slots, self.engram_dim)
+            self.engram_emb3 = nn.Embedding(self.engram_slots, self.engram_dim)
+            nn.init.normal_(self.engram_emb2.weight, std=0.02)
+            nn.init.normal_(self.engram_emb3.weight, std=0.02)
+            self.engram_norm = RMSNorm(self.engram_dim)
+            self.engram_proj = nn.Linear(self.engram_dim, d_model, bias=False)
+            with torch.no_grad():
+                self.engram_proj.weight.mul_(0.25)
+            self.engram_gate = nn.Linear(d_model, 1, bias=True)
+            nn.init.constant_(self.engram_gate.bias, -1.0)
+        else:
+            self.engram_emb2 = None
+            self.engram_emb3 = None
+            self.engram_norm = None
+            self.engram_proj = None
+            self.engram_gate = None
 
         self.dec_fuse_norm = RMSNorm(d_model + 8 * self.d_byte)
         self.dec_fuse = nn.Linear(d_model + 8 * self.d_byte, d_model, bias=False)
@@ -290,6 +383,11 @@ class CalciteV2Chunker(nn.Module):
             base += 3 * 4
         if self.use_scaled_decoder:
             base += 9 * self.d_model * 2  # causal 2-scale dw conv rings (3 + 6)
+        if self.use_sym_byte_swa:
+            base += (6 + 12) * self.d_model * 2  # enc_dw2 (6) + dec_dw3 (12)
+            base += 2 * self.byte_swa_window * self.byte_swa_dim * 2  # micro byte-SWA K+V ring
+        if self.use_byte_engram:
+            base += 3 * 8  # ring_tok3 int64
         return int(base)
 
     def _causal_win8(self, e_tok: torch.Tensor) -> torch.Tensor:
@@ -402,6 +500,16 @@ class CalciteV2Chunker(nn.Module):
         c_norm = self.enc_norm_in(c_win8)
         h_enc0 = e_tok + self.enc_up(c_norm)
         h_byte = h_enc0 + self.enc_mlp(self.enc_norm(h_enc0))
+        if (
+            self.use_sym_byte_swa
+            and self.enc_dw2_norm is not None
+            and self.enc_dw2_conv is not None
+            and self.enc_dw2_gate is not None
+            and self.enc_dw2_out is not None
+        ):
+            xe = self.enc_dw2_norm(h_byte)
+            ce = self.enc_dw2_conv(F.pad(xe.transpose(1, 2), (6, 0))).transpose(1, 2)
+            h_byte = h_byte + self.enc_dw2_out(F.silu(ce) * self.enc_dw2_gate(xe))
 
         if self.router_locked:
             with torch.no_grad():
@@ -570,6 +678,7 @@ class CalciteV2Chunker(nn.Module):
             slot_idx=slot_idx,
             offset_in_chunk=offset_in_chunk,
             valid_chunk=valid_chunk,
+            token_ids=token_ids,
         )
         return z_in, h_lex_chunk, ctx
 
@@ -618,6 +727,67 @@ class CalciteV2Chunker(nn.Module):
             xn2 = self.dec_dw2_norm(dec_in)
             c2 = self.dec_dw2_conv(F.pad(xn2.transpose(1, 2), (6, 0))).transpose(1, 2)
             dec_in = dec_in + self.dec_dw2_out(F.silu(c2) * self.dec_dw2_gate(xn2))
+        if (
+            self.use_sym_byte_swa
+            and self.dec_dw3_norm is not None
+            and self.dec_dw3_conv is not None
+            and self.dec_dw3_gate is not None
+            and self.dec_dw3_out is not None
+            and self.byte_swa_norm is not None
+            and self.byte_swa_qkv is not None
+            and self.byte_swa_out is not None
+            and self.byte_swa_inv_freq is not None
+        ):
+            xn3 = self.dec_dw3_norm(dec_in)
+            c3 = self.dec_dw3_conv(F.pad(xn3.transpose(1, 2), (12, 0))).transpose(1, 2)
+            dec_in = dec_in + self.dec_dw3_out(F.silu(c3) * self.dec_dw3_gate(xn3))
+
+            # Micro Byte-SWA: strict O(T * W_byte) RoPE sliding attention (`W_byte = 24, d = 64`)
+            xb_n = self.byte_swa_norm(dec_in)
+            qkv_b = self.byte_swa_qkv(xb_n).view(B, T, 3, self.byte_swa_heads, self.byte_swa_head_dim)
+            qb = qkv_b[:, :, 0].transpose(1, 2)
+            kb = qkv_b[:, :, 1].transpose(1, 2)
+            vb = qkv_b[:, :, 2].transpose(1, 2)
+            tb = torch.arange(T, device=dec_in.device, dtype=torch.float32)
+            fb = torch.outer(tb, self.byte_swa_inv_freq.to(device=dec_in.device))
+            cos_b = torch.cos(fb).to(dec_in.dtype).view(1, 1, T, -1)
+            sin_b = torch.sin(fb).to(dec_in.dtype).view(1, 1, T, -1)
+            qb = apply_rope(qb, cos_b, sin_b)
+            kb = apply_rope(kb, cos_b, sin_b)
+            Wb = self.byte_swa_window
+            if T <= Wb:
+                yb = F.scaled_dot_product_attention(qb, kb, vb, is_causal=True)
+            else:
+                kb_pad = F.pad(kb, (0, 0, Wb - 1, 0))
+                vb_pad = F.pad(vb, (0, 0, Wb - 1, 0))
+                kb_win = kb_pad.unfold(2, Wb, 1)
+                vb_win = vb_pad.unfold(2, Wb, 1)
+                sc_b = 1.0 / math.sqrt(float(self.byte_swa_head_dim))
+                scores_b = torch.einsum("bhtd,bhtdw->bhtw", qb.float(), kb_win.float()) * sc_b
+                t_i = torch.arange(T, device=dec_in.device).unsqueeze(1)
+                w_i = torch.arange(Wb, device=dec_in.device).unsqueeze(0)
+                scores_b = scores_b.masked_fill(~((t_i + w_i) >= (Wb - 1)).view(1, 1, T, Wb), -1e4)
+                probs_b = F.softmax(scores_b, dim=-1).to(dec_in.dtype)
+                yb = torch.einsum("bhtw,bhtdw->bhtd", probs_b, vb_win)
+            dec_in = dec_in + self.byte_swa_out(
+                yb.transpose(1, 2).contiguous().view(B, T, self.byte_swa_dim)
+            )
+        if (
+            self.use_byte_engram
+            and self.engram_emb2 is not None
+            and self.engram_emb3 is not None
+            and self.engram_norm is not None
+            and self.engram_proj is not None
+            and self.engram_gate is not None
+        ):
+            t0 = ctx.token_ids
+            t1 = F.pad(t0[:, :-1], (1, 0), value=0) if T > 1 else torch.zeros_like(t0)
+            t2 = F.pad(t0[:, :-2], (2, 0), value=0) if T > 2 else torch.zeros_like(t0)
+            h2 = torch.remainder(t1 * 263 + t0 * 1009, self.engram_slots)
+            h3 = torch.remainder(t2 * 691 + t1 * 263 + t0 * 1009 + 17, self.engram_slots)
+            e_eng = (self.engram_emb2(h2) + self.engram_emb3(h3)).to(dec_in.dtype)
+            eg = torch.sigmoid(self.engram_gate(dec_in))
+            dec_in = dec_in + eg * self.engram_proj(self.engram_norm(e_eng))
         return dec_in + self.dec_mlp(self.dec_norm(dec_in))
 
     # ------------------------------------------------------------------
@@ -637,6 +807,45 @@ class CalciteV2Chunker(nn.Module):
             if self.use_scaled_decoder
             else torch.zeros(batch_size, 0, 1, device=device, dtype=dtype)
         )
+        ring_enc2 = (
+            torch.zeros(batch_size, 6, self.d_model, device=device, dtype=dtype)
+            if self.use_sym_byte_swa
+            else torch.zeros(batch_size, 0, 1, device=device, dtype=dtype)
+        )
+        ring_dec3 = (
+            torch.zeros(batch_size, 12, self.d_model, device=device, dtype=dtype)
+            if self.use_sym_byte_swa
+            else torch.zeros(batch_size, 0, 1, device=device, dtype=dtype)
+        )
+        ring_bk = (
+            torch.zeros(
+                batch_size,
+                self.byte_swa_window,
+                self.byte_swa_heads,
+                self.byte_swa_head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            if self.use_sym_byte_swa
+            else torch.zeros(batch_size, 0, 1, 1, device=device, dtype=dtype)
+        )
+        ring_bv = (
+            torch.zeros(
+                batch_size,
+                self.byte_swa_window,
+                self.byte_swa_heads,
+                self.byte_swa_head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            if self.use_sym_byte_swa
+            else torch.zeros(batch_size, 0, 1, 1, device=device, dtype=dtype)
+        )
+        ring_tok3 = (
+            torch.zeros(batch_size, 3, device=device, dtype=torch.long)
+            if self.use_byte_engram
+            else torch.zeros(batch_size, 0, device=device, dtype=torch.long)
+        )
         return ChunkerStreamState(
             ring_char=torch.zeros(batch_size, 7, self.d_byte, device=device, dtype=dtype),
             ring_rchar=torch.zeros(batch_size, 3, self.d_rchar, device=device, dtype=dtype),
@@ -646,6 +855,11 @@ class CalciteV2Chunker(nn.Module):
             cur_z_bar=torch.zeros(batch_size, self.d_model, device=device, dtype=dtype),
             ring_dec_conv1=ring_dec1,
             ring_dec_conv2=ring_dec2,
+            ring_enc_conv2=ring_enc2,
+            ring_dec_conv3=ring_dec3,
+            ring_byte_k=ring_bk,
+            ring_byte_v=ring_bv,
+            ring_tok3=ring_tok3,
             run_len=torch.zeros(batch_size, device=device, dtype=torch.long),
             cp_run=torch.zeros(batch_size, device=device, dtype=torch.long),
             cont_streak=torch.zeros(batch_size, device=device, dtype=torch.long),
@@ -684,10 +898,30 @@ class CalciteV2Chunker(nn.Module):
         state.ring_char[:, -1] = ct
         state.ring_rchar[:, :-1] = state.ring_rchar[:, 1:].clone()
         state.ring_rchar[:, -1] = rc_t
+        if self.use_byte_engram and state.ring_tok3.size(1) == 3:
+            state.ring_tok3[:, :-1] = state.ring_tok3[:, 1:].clone()
+            state.ring_tok3[:, -1] = token_t
 
         c_norm_t = self.enc_norm_in(c_win8_t)
         h_enc0 = e_tok_t + self.enc_up(c_norm_t)
         h_byte_t = h_enc0 + self.enc_mlp(self.enc_norm(h_enc0))
+        if (
+            self.use_sym_byte_swa
+            and self.enc_dw2_norm is not None
+            and self.enc_dw2_conv is not None
+            and self.enc_dw2_gate is not None
+            and self.enc_dw2_out is not None
+        ):
+            xe = self.enc_dw2_norm(h_byte_t)
+            win7_e = torch.cat([state.ring_enc_conv2, xe.unsqueeze(1)], dim=1)
+            state.ring_enc_conv2 = win7_e[:, 1:, :].clone()
+            taps_e = win7_e[:, 0::2, :]
+            we = self.enc_dw2_conv.weight.squeeze(1).to(dt)
+            be = self.enc_dw2_conv.bias.to(dt) if self.enc_dw2_conv.bias is not None else None
+            ce = (taps_e.transpose(1, 2) * we.unsqueeze(0)).sum(dim=-1)
+            if be is not None:
+                ce = ce + be.unsqueeze(0)
+            h_byte_t = h_byte_t + self.enc_dw2_out(F.silu(ce) * self.enc_dw2_gate(xe))
         h_lex_t = self.lex_up(self.lex_norm(c_win8_t))
 
         h_rt = F.silu(self._r_lin(self.router_in_proj, self.router_in_norm(r_win4_t)))
@@ -822,4 +1056,74 @@ class CalciteV2Chunker(nn.Module):
             if b2 is not None:
                 c2 = c2 + b2.unsqueeze(0)
             dec_in = dec_in + self.dec_dw2_out(F.silu(c2) * self.dec_dw2_gate(xn2))
+        if (
+            self.use_sym_byte_swa
+            and self.dec_dw3_norm is not None
+            and self.dec_dw3_conv is not None
+            and self.dec_dw3_gate is not None
+            and self.dec_dw3_out is not None
+            and self.byte_swa_norm is not None
+            and self.byte_swa_qkv is not None
+            and self.byte_swa_out is not None
+            and self.byte_swa_inv_freq is not None
+        ):
+            xn3 = self.dec_dw3_norm(dec_in)
+            win13 = torch.cat([state.ring_dec_conv3, xn3.unsqueeze(1)], dim=1)
+            state.ring_dec_conv3 = win13[:, 1:, :].clone()
+            taps3 = win13[:, 0::4, :]  # dilation=4 taps at [0, 4, 8, 12]
+            w3 = self.dec_dw3_conv.weight.squeeze(1).to(dt)
+            b3 = self.dec_dw3_conv.bias.to(dt) if self.dec_dw3_conv.bias is not None else None
+            c3 = (taps3.transpose(1, 2) * w3.unsqueeze(0)).sum(dim=-1)
+            if b3 is not None:
+                c3 = c3 + b3.unsqueeze(0)
+            dec_in = dec_in + self.dec_dw3_out(F.silu(c3) * self.dec_dw3_gate(xn3))
+
+            # Micro Byte-SWA streaming step (pos = state.step_idx - 1 since encode_byte_step already incremented)
+            B_cur = dec_in.size(0)
+            pos_b = max(0, state.step_idx - 1)
+            Wb = self.byte_swa_window
+            xb_n = self.byte_swa_norm(dec_in)
+            qkv_b = self.byte_swa_qkv(xb_n).view(B_cur, 3, self.byte_swa_heads, self.byte_swa_head_dim)
+            qb = qkv_b[:, 0]
+            kb = qkv_b[:, 1]
+            vb = qkv_b[:, 2]
+            fb = float(pos_b) * self.byte_swa_inv_freq.to(device=dec_in.device, dtype=torch.float32)
+            cos_b = torch.cos(fb).to(dt).view(1, 1, -1)
+            sin_b = torch.sin(fb).to(dt).view(1, 1, -1)
+            qb = apply_rope(qb, cos_b, sin_b)
+            kb = apply_rope(kb, cos_b, sin_b)
+            if pos_b < Wb:
+                state.ring_byte_k[:, pos_b] = kb
+                state.ring_byte_v[:, pos_b] = vb
+                k_use = state.ring_byte_k[:, : pos_b + 1]
+                v_use = state.ring_byte_v[:, : pos_b + 1]
+            else:
+                state.ring_byte_k[:, :-1] = state.ring_byte_k[:, 1:].clone()
+                state.ring_byte_k[:, -1] = kb
+                state.ring_byte_v[:, :-1] = state.ring_byte_v[:, 1:].clone()
+                state.ring_byte_v[:, -1] = vb
+                k_use = state.ring_byte_k
+                v_use = state.ring_byte_v
+            sc_b = 1.0 / math.sqrt(float(self.byte_swa_head_dim))
+            scores_b = torch.einsum("bhd,bwhd->bhw", qb.float(), k_use.float()) * sc_b
+            probs_b = F.softmax(scores_b, dim=-1).to(dt)
+            yb = torch.einsum("bhw,bwhd->bhd", probs_b, v_use).reshape(B_cur, self.byte_swa_dim)
+            dec_in = dec_in + self.byte_swa_out(yb)
+        if (
+            self.use_byte_engram
+            and self.engram_emb2 is not None
+            and self.engram_emb3 is not None
+            and self.engram_norm is not None
+            and self.engram_proj is not None
+            and self.engram_gate is not None
+            and state.ring_tok3.size(1) == 3
+        ):
+            t2 = state.ring_tok3[:, 0]
+            t1 = state.ring_tok3[:, 1]
+            t0 = state.ring_tok3[:, 2]
+            h2 = torch.remainder(t1 * 263 + t0 * 1009, self.engram_slots)
+            h3 = torch.remainder(t2 * 691 + t1 * 263 + t0 * 1009 + 17, self.engram_slots)
+            e_eng = (self.engram_emb2(h2) + self.engram_emb3(h3)).to(dt)
+            eg = torch.sigmoid(self.engram_gate(dec_in))
+            dec_in = dec_in + eg * self.engram_proj(self.engram_norm(e_eng))
         return dec_in + self.dec_mlp(self.dec_norm(dec_in))

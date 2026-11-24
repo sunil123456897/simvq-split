@@ -268,3 +268,220 @@ def test_l5_standalone_router_pretrain_utf8_safety_and_tiers() -> None:
         opt_c.step()
         out2 = m_cuda(xc)
         assert not torch.allclose(out1.detach(), out2.detach()), "Stale QAT cache after fused AdamW step!"
+
+
+@pytest.mark.parametrize(
+    "axis_name,extra_kw",
+    [
+        ("M1_sparse_woodbury", {"woodbury_sub_banks": 4, "woodbury_top_k_banks": 1}),
+        ("M2_epistemic_slots", {"use_epistemic_slots": True, "epistemic_slots_n": 16, "epistemic_slots_dim": 32}),
+        ("M3_sym_byte_swa", {"use_sym_byte_swa": True, "byte_swa_window": 16, "byte_swa_dim": 32}),
+        ("M4_swa_drop", {"swa_drop_prob": 0.25}),
+        ("M5_attnres", {"use_attnres": True}),
+        ("M6_deltanet2", {"use_deltanet2_gates": True}),
+        ("M6_sparse_deltanet2", {"woodbury_sub_banks": 4, "woodbury_top_k_banks": 1, "use_deltanet2_gates": True}),
+        ("M7_canon_chunks", {"use_canon_chunks": True}),
+        ("M8_byte_engram", {"use_byte_engram": True, "engram_slots": 256, "engram_dim": 16}),
+        (
+            "M_v3_combo",
+            {
+                "use_sym_byte_swa": True,
+                "byte_swa_window": 16,
+                "byte_swa_dim": 32,
+                "use_attnres": True,
+                "use_deltanet2_gates": True,
+                "use_canon_chunks": True,
+                "use_byte_engram": True,
+                "engram_slots": 256,
+                "engram_dim": 16,
+            },
+        ),
+    ],
+)
+def test_m_axes_init_std_live_grads_causality_and_stream_parity(
+    axis_name: str, extra_kw: dict
+) -> None:
+    """Phase M Gate 1–2: init-std, live gradients, strict causality, exact stream==forward parity, O(1) RAM."""
+    torch.manual_seed(2026)
+    cfg = _make_tiny_cfg(
+        topology="hourglass",
+        use_scaled_decoder=True,
+        use_kalman_precond=False,
+        use_latent_feedback=False,
+    )
+    for k, v in extra_kw.items():
+        setattr(cfg, k, v)
+
+    model = CalciteV2LM(cfg)
+    model.byte_chunker.lock_router(True)
+    model.set_crystal_schedule(1, 1)
+    model.set_snap_alpha(1.0)
+
+    text = "Ref code X7K9Q2M4. Alice moved to Paris! Привет 🚀 東京 12345 " * 3
+    ids = torch.tensor([[b + 3 for b in text.encode("utf-8")]], dtype=torch.long)
+    x_tr = torch.cat([ids[:, :64], ids[:, 16:80]], dim=0)
+    y_tr = torch.randint(3, 259, x_tr.shape)
+
+    # 1. Init-std bound + strict causality (no look-ahead)
+    model.eval()
+    with torch.no_grad():
+        lg1 = model(ids[:, :64])
+        assert torch.isfinite(lg1).all(), f"Non-finite logits in {axis_name}"
+        assert 0.05 < float(lg1.std().item()) < 2.0, f"Bad init std in {axis_name}: {lg1.std().item()}"
+
+        ids_mod = ids[:, :64].clone()
+        ids_mod[:, 32:] = torch.randint(3, 128, (1, 32))
+        lg2 = model(ids_mod)
+        causal_diff = float((lg1[:, :32] - lg2[:, :32]).abs().max().item())
+        assert causal_diff < 1e-5, f"Look-ahead leak in {axis_name}: {causal_diff}"
+
+        # 2. Exact stream == forward parity + strict O(1) RAM
+        engine = CalciteStreamEngine(model)
+        lg_stream, st = engine.prefill(ids[:, :96], return_all_logits=True)
+        lg_batch = model(ids[:, :96])
+        parity_err = float((lg_batch - lg_stream).abs().max().item())
+        assert parity_err < 1e-4, f"Stream parity mismatch in {axis_name}: {parity_err}"
+
+        mem_start = st.memory_bytes()
+        _, st = engine.prefill(torch.randint(3, 128, (1, 128)), state=st, return_all_logits=False)
+        assert st.memory_bytes() == mem_start, f"RAM grew in {axis_name}: {mem_start} -> {st.memory_bytes()}"
+
+    # 3. Live gradients on trainable params
+    model.train()
+    logits = model(x_tr)
+    loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), y_tr.reshape(-1)) + model.get_commitment_loss()
+    loss.backward()
+    dead = []
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            if p.grad is None or float(p.grad.abs().max().item()) == 0.0:
+                if "byte_offset_emb" in name or "engram_emb" in name:
+                    continue
+                dead.append(name)
+    assert not dead, f"Dead gradients in {axis_name}: {dead}"
+
+
+def test_m_temporal_residual_exact_retrofit_causality_and_stream_parity() -> None:
+    """TR: exact step-0 identity retrofit, live grads, zero look-ahead, exact stream==forward fixed point, O(1) RAM."""
+    from scripts.muon_opt import MuonAdamWHybrid
+
+    torch.manual_seed(2026)
+    base_cfg = _make_tiny_cfg(
+        topology="hourglass",
+        use_scaled_decoder=True,
+        use_kalman_precond=False,
+        use_latent_feedback=False,
+    )
+    base_cfg.use_sym_byte_swa = True
+    base_cfg.byte_swa_window = 16
+    base_cfg.byte_swa_dim = 32
+    base_model = CalciteV2LM(base_cfg).eval()
+    base_model.byte_chunker.lock_router(True)
+    base_model.set_crystal_schedule(1, 1)
+    base_model.set_snap_alpha(1.0)
+
+    tr_cfg = _make_tiny_cfg(
+        topology="hourglass",
+        use_scaled_decoder=True,
+        use_kalman_precond=False,
+        use_latent_feedback=False,
+    )
+    tr_cfg.use_sym_byte_swa = True
+    tr_cfg.byte_swa_window = 16
+    tr_cfg.byte_swa_dim = 32
+    tr_cfg.use_temporal_residual = True
+    tr_cfg.tr_train_passes = 4
+    tr_cfg.tr_eval_passes = 8
+    tr_cfg.tr_backprop_passes = 2
+    tr_model = CalciteV2LM(tr_cfg).eval()
+    tr_model.byte_chunker.lock_router(True)
+    tr_model.set_crystal_schedule(1, 1)
+    tr_model.set_snap_alpha(1.0)
+    missing, unexpected = tr_model.load_state_dict(base_model.state_dict(), strict=False)
+    assert not unexpected
+    assert all(k.startswith("tr_") for k in missing), f"Unexpected missing keys: {missing}"
+
+    text = "Alice moved to Paris! Ref X7K9Q2M4. Привет 🚀 東京 12345 " * 2
+    ids = torch.tensor([[b + 3 for b in text.encode("utf-8")]], dtype=torch.long)
+
+    # 1. Exact step-0 identity (rB == 0 -> bit-for-bit identical to pretrained base!)
+    with torch.no_grad():
+        lg_base = base_model(ids[:, :64])
+        lg_tr0 = tr_model(ids[:, :64], tr_passes=4)
+        assert float((lg_base - lg_tr0).abs().max().item()) < 1e-5
+
+    # 2. Take 2 steps with MuonAdamWHybrid so rB moves off 0 and verify all TR params receive live grads
+    tr_model.train()
+    opt = MuonAdamWHybrid(tr_model, base_lr=1e-2, muon_lr_mult=4.0, device="cpu")
+    x_tr = ids[:, :64].repeat(2, 1)
+    y_tr = torch.randint(3, 259, x_tr.shape)
+    for step_i in range(2):
+        opt.zero_grad(set_to_none=True)
+        lg = tr_model(x_tr, tr_passes=4, tr_backprop_passes=2)
+        loss = F.cross_entropy(lg.reshape(-1, tr_cfg.vocab_size), y_tr.reshape(-1))
+        loss.backward()
+        if step_i == 0:
+            assert tr_model.tr_rB.grad is not None and float(tr_model.tr_rB.grad.abs().max().item()) > 0.0
+        else:
+            for nm in ("tr_rA", "tr_rB", "tr_sB"):
+                p = getattr(tr_model, nm)
+                assert p.grad is not None and float(p.grad.abs().max().item()) > 0.0, f"Dead grad on {nm}"
+            assert tr_model.tr_phi.weight.grad is not None and float(tr_model.tr_phi.weight.grad.abs().max().item()) > 0.0
+        opt.step()
+
+    # 3. Strict causality + exact stream == forward fixed-point parity + strict O(1) RAM
+    tr_model.eval()
+    with torch.no_grad():
+        lg1 = tr_model(ids[:, :64], tr_passes=6)
+        ids_mod = ids[:, :64].clone()
+        ids_mod[:, 32:] = torch.randint(3, 128, (1, 32))
+        lg2 = tr_model(ids_mod, tr_passes=6)
+        assert float((lg1[:, :32] - lg2[:, :32]).abs().max().item()) < 1e-5, "Look-ahead leak in TR!"
+
+        engine = CalciteStreamEngine(tr_model)
+        lg_stream, st = engine.prefill(ids[:, :80], return_all_logits=True)
+        lg_batch = tr_model(ids[:, :80], tr_passes=max(2, st.backbone_ticks))
+        err = float((lg_batch - lg_stream).abs().max().item())
+        assert err < 1e-4, f"TR stream vs batch fixed-point mismatch: {err}"
+
+        mem0 = st.memory_bytes()
+        _, st = engine.prefill(torch.randint(3, 128, (1, 128)), state=st, return_all_logits=False)
+        assert st.memory_bytes() == mem0, f"TR stream RAM grew: {mem0} -> {st.memory_bytes()}"
+
+
+def test_interleaved_canon_stream_parity_and_unsupported_axes_guard() -> None:
+    """Interleaved topology passes canon_rings cleanly in streaming, rejects unsupported AttnRes/TR, and tests Muon state_dict."""
+    from scripts.muon_opt import MuonAdamWHybrid
+
+    torch.manual_seed(2026)
+    cfg = _make_tiny_cfg(topology="interleaved", use_scaled_decoder=True)
+    cfg.use_canon_chunks = True
+    m = CalciteV2LM(cfg).eval()
+    m.byte_chunker.lock_router(True)
+    m.set_crystal_schedule(1, 1)
+    m.set_snap_alpha(1.0)
+    x = torch.randint(3, 128, (1, 64))
+    with torch.no_grad():
+        lb = m(x)
+        ls, _ = CalciteStreamEngine(m).prefill(x, return_all_logits=True)
+    err = float((lb - ls).abs().max().item())
+    assert err < 1e-4, f"interleaved canon stream mismatch: {err}"
+
+    for bad_kw in ({"use_attnres": True}, {"use_temporal_residual": True}):
+        bad_cfg = _make_tiny_cfg(topology="interleaved")
+        for k, v in bad_kw.items():
+            setattr(bad_cfg, k, v)
+        with pytest.raises(ValueError, match="hourglass"):
+            CalciteV2LM(bad_cfg)
+
+    lin = torch.nn.Linear(32, 32)
+    opt = MuonAdamWHybrid(lin, base_lr=1e-3, muon_lr_mult=4.0, device="cpu")
+    lin(torch.randn(2, 32)).sum().backward()
+    opt.step()
+    sd = opt.state_dict()
+    opt2 = MuonAdamWHybrid(lin, base_lr=1e-3, muon_lr_mult=4.0, device="cpu")
+    opt2.load_state_dict(sd)
+    assert len(opt2.muon_bufs) == len(opt.muon_bufs) == 1
+    assert torch.allclose(opt2.muon_bufs[id(lin.weight)], opt.muon_bufs[id(lin.weight)])
+
+

@@ -14,6 +14,7 @@ and `Zero-Cheat` pure-neural AST invariants:
 
 from .chunker import CalciteV2Chunker, ChunkContext, ChunkerStreamState
 from .crystal import CalciteV2CrystalLayer, CrystalStreamState
+from .epistemic_slots import EpistemicSlotMemory, EpistemicSlotsStreamState
 from .model import (
     CalciteV2Config,
     CalciteV2LM,
@@ -30,6 +31,8 @@ __all__ = [
     "ChunkerStreamState",
     "CalciteV2CrystalLayer",
     "CrystalStreamState",
+    "EpistemicSlotMemory",
+    "EpistemicSlotsStreamState",
     "CalciteV2WoodburyLayer",
     "WoodburyStreamState",
     "CalciteV2Config",

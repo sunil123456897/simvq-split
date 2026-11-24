@@ -1,0 +1,509 @@
+{
+  "phase": "Phase_M_Closure_V3_25M",
+  "device": "NVIDIA GeForce RTX 5060",
+  "params": 26589864,
+  "config": {
+    "vocab_size": 259,
+    "d_model": 448,
+    "n_heads": 7,
+    "d_ff": null,
+    "n_layers_pre": 4,
+    "n_layers_post": 4,
+    "window_size": 8,
+    "num_spheres": 24,
+    "d_sphere": 32,
+    "codebook_size": 32,
+    "crystal_w_chunks": 2,
+    "mem_heads": 7,
+    "mem_dim": 32,
+    "ridge_lambda": 0.04,
+    "woodbury_latch_span": 6,
+    "byte_char_dim": 48,
+    "byte_d_ff": 448,
+    "byte_router_char_dim": 16,
+    "byte_router_hidden": 96,
+    "byte_commit_scale": 0.45,
+    "router_lock_frac": 0.135,
+    "target_chunk_bytes": 4.6,
+    "max_chunk_bytes": 10,
+    "byte_chunk_mode": "utf8",
+    "max_utf8_bytes": 16,
+    "use_static_m_cap": true,
+    "ratio_loss_scale": 1.5,
+    "pad_token_id": 0,
+    "topology": "hourglass",
+    "use_scaled_decoder": true,
+    "use_kalman_precond": false,
+    "use_latent_feedback": false,
+    "latent_feedback_skip_p": 0.5,
+    "use_clean_gates": false,
+    "use_fast_kernels": true,
+    "woodbury_sub_banks": 1,
+    "woodbury_top_k_banks": 1,
+    "use_epistemic_slots": false,
+    "epistemic_slots_n": 32,
+    "epistemic_slots_dim": 64,
+    "use_sym_byte_swa": true,
+    "byte_swa_window": 24,
+    "byte_swa_dim": 64,
+    "swa_drop_prob": 0.0,
+    "use_attnres": false,
+    "use_deltanet2_gates": false,
+    "use_canon_chunks": false,
+    "use_byte_engram": true,
+    "engram_slots": 4096,
+    "engram_dim": 32,
+    "use_temporal_residual": false,
+    "tr_train_passes": 4,
+    "tr_eval_passes": 8,
+    "tr_backprop_passes": 2
+  },
+  "schedule": {
+    "s1a_steps": 1600,
+    "s1b_steps": 500,
+    "s2_steps": 1600,
+    "qat_steps": 800,
+    "batch_size": 64,
+    "seq_len": 512,
+    "qat_seconds": 1791.89,
+    "total_seconds": 2471.3
+  },
+  "stage1_gates": {
+    "s1a_s5_k2_pct": 95.31,
+    "s1_s5_k2_pct": 85.94,
+    "s1_ov_long_pct": 93.75,
+    "s1_trap_long_pct": 95.31
+  },
+  "router_max_abs_diff": 0.0,
+  "cache_kb_o1": 241.49,
+  "ckpt_bytes": 9982947,
+  "lut_footprint": {
+    "num_lut_layers": 107,
+    "packed_weights_count": 26167296,
+    "packed_u8_bytes": 6542048,
+    "packed_u8_kb": 6388.72,
+    "scales_fp16_bytes": 1635704,
+    "scales_fp16_kb": 1597.37,
+    "fp16_other_bytes": 844888,
+    "fp16_other_kb": 825.09,
+    "total_lut_kb": 8811.17,
+    "orig_fp32_matrix_kb": 102216.0,
+    "matrix_compression_vs_fp32": 15.9995,
+    "effective_matrix_compression_with_scales": 12.7993
+  },
+  "gap_val_bpb": 0.0721,
+  "gap_ow_bpb": 0.0729,
+  "eval_fp": {
+    "val_bpb": 2.0395,
+    "extrap_4x": {
+      "bpb_L512": 1.9351,
+      "bpb_L2048": 1.8695,
+      "bpb_L2048_head": 1.8753,
+      "bpb_L2048_tail": 1.878,
+      "extrap_delta_bpb": -0.0656,
+      "tail_minus_head_bpb": 0.0027
+    },
+    "openweb_6": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.7775,
+          "bytes_per_chunk": 4.118,
+          "cp_per_chunk": 4.116,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 124.3,
+          "m_max": 145
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 2.2935,
+          "bytes_per_chunk": 7.531,
+          "cp_per_chunk": 5.385,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 68.0,
+          "m_max": 93
+        },
+        "3_Python_Code": {
+          "byte_bpb": 1.935,
+          "bytes_per_chunk": 4.534,
+          "cp_per_chunk": 4.534,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 112.9,
+          "m_max": 137
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 0.489,
+          "bytes_per_chunk": 3.727,
+          "cp_per_chunk": 3.727,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 137.4,
+          "m_max": 159
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 3.1407,
+          "bytes_per_chunk": 12.423,
+          "cp_per_chunk": 4.179,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 41.2,
+          "m_max": 42
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 5.0129,
+          "bytes_per_chunk": 14.1,
+          "cp_per_chunk": 3.981,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 36.3,
+          "m_max": 37
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 2.4414
+    },
+    "cognitive": {
+      "s5": {
+        "k2": {
+          "exact_pct": 84.67,
+          "token_pct": 99.76,
+          "ok": 127,
+          "n": 150,
+          "wilson_95": [
+            78.04,
+            89.56
+          ]
+        },
+        "k4": {
+          "exact_pct": 40.67,
+          "token_pct": 98.76,
+          "ok": 61,
+          "n": 150,
+          "wilson_95": [
+            33.13,
+            48.67
+          ]
+        },
+        "k8": {
+          "exact_pct": 10.0,
+          "token_pct": 96.97,
+          "ok": 15,
+          "n": 150,
+          "wilson_95": [
+            6.15,
+            15.84
+          ]
+        },
+        "k16": {
+          "exact_pct": 2.0,
+          "token_pct": 96.14,
+          "ok": 3,
+          "n": 150,
+          "wilson_95": [
+            0.68,
+            5.71
+          ]
+        }
+      },
+      "s5_sum": 137.34,
+      "overwrite": {
+        "in_dist": {
+          "exact_pct": 90.67,
+          "token_pct": 98.8,
+          "ok": 136,
+          "n": 150,
+          "wilson_95": [
+            84.94,
+            94.36
+          ]
+        },
+        "ood_med": {
+          "exact_pct": 87.33,
+          "token_pct": 98.36,
+          "ok": 131,
+          "n": 150,
+          "wilson_95": [
+            81.06,
+            91.74
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 89.33,
+          "token_pct": 98.56,
+          "ok": 134,
+          "n": 150,
+          "wilson_95": [
+            83.38,
+            93.33
+          ]
+        }
+      },
+      "trap": {
+        "in_dist": {
+          "exact_pct": 93.33,
+          "token_pct": 99.26,
+          "ok": 140,
+          "n": 150,
+          "wilson_95": [
+            88.16,
+            96.34
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 93.33,
+          "token_pct": 99.26,
+          "ok": 140,
+          "n": 150,
+          "wilson_95": [
+            88.16,
+            96.34
+          ]
+        }
+      },
+      "selective_f1_in": 91.98,
+      "selective_f1_ood_long": 91.29,
+      "crystal_norm_drift_L2048": 4.8e-07
+    }
+  },
+  "eval_lut": {
+    "val_bpb": 2.1116,
+    "extrap_4x": {
+      "bpb_L512": 2.0114,
+      "bpb_L2048": 1.9458,
+      "bpb_L2048_head": 1.9532,
+      "bpb_L2048_tail": 1.9552,
+      "extrap_delta_bpb": -0.0655,
+      "tail_minus_head_bpb": 0.002
+    },
+    "openweb_6": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.857,
+          "bytes_per_chunk": 4.106,
+          "cp_per_chunk": 4.104,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 124.7,
+          "m_max": 144
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 2.3686,
+          "bytes_per_chunk": 7.511,
+          "cp_per_chunk": 5.37,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 68.2,
+          "m_max": 93
+        },
+        "3_Python_Code": {
+          "byte_bpb": 2.0133,
+          "bytes_per_chunk": 4.537,
+          "cp_per_chunk": 4.537,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 112.9,
+          "m_max": 137
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 0.5053,
+          "bytes_per_chunk": 3.727,
+          "cp_per_chunk": 3.727,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 137.4,
+          "m_max": 159
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 3.256,
+          "bytes_per_chunk": 12.423,
+          "cp_per_chunk": 4.179,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 41.2,
+          "m_max": 42
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 5.0859,
+          "bytes_per_chunk": 14.1,
+          "cp_per_chunk": 3.981,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 36.3,
+          "m_max": 37
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 2.5143
+    },
+    "cognitive": {
+      "s5": {
+        "k2": {
+          "exact_pct": 83.33,
+          "token_pct": 99.73,
+          "ok": 125,
+          "n": 150,
+          "wilson_95": [
+            76.55,
+            88.45
+          ]
+        },
+        "k4": {
+          "exact_pct": 40.0,
+          "token_pct": 98.72,
+          "ok": 60,
+          "n": 150,
+          "wilson_95": [
+            32.5,
+            48.0
+          ]
+        },
+        "k8": {
+          "exact_pct": 7.33,
+          "token_pct": 96.97,
+          "ok": 11,
+          "n": 150,
+          "wilson_95": [
+            4.14,
+            12.65
+          ]
+        },
+        "k16": {
+          "exact_pct": 0.0,
+          "token_pct": 96.08,
+          "ok": 0,
+          "n": 150,
+          "wilson_95": [
+            0.0,
+            2.5
+          ]
+        }
+      },
+      "s5_sum": 130.66,
+      "overwrite": {
+        "in_dist": {
+          "exact_pct": 92.67,
+          "token_pct": 99.06,
+          "ok": 139,
+          "n": 150,
+          "wilson_95": [
+            87.35,
+            95.86
+          ]
+        },
+        "ood_med": {
+          "exact_pct": 91.33,
+          "token_pct": 98.88,
+          "ok": 137,
+          "n": 150,
+          "wilson_95": [
+            85.74,
+            94.87
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 92.67,
+          "token_pct": 98.98,
+          "ok": 139,
+          "n": 150,
+          "wilson_95": [
+            87.35,
+            95.86
+          ]
+        }
+      },
+      "trap": {
+        "in_dist": {
+          "exact_pct": 93.33,
+          "token_pct": 99.26,
+          "ok": 140,
+          "n": 150,
+          "wilson_95": [
+            88.16,
+            96.34
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 93.33,
+          "token_pct": 99.26,
+          "ok": 140,
+          "n": 150,
+          "wilson_95": [
+            88.16,
+            96.34
+          ]
+        }
+      },
+      "selective_f1_in": 93.0,
+      "selective_f1_ood_long": 93.0,
+      "crystal_norm_drift_L2048": 4.8e-07
+    }
+  },
+  "long_context_fp": {
+    "L_2048": {
+      "bpb": 2.0928,
+      "head_bpb": 2.1008,
+      "tail_bpb": 2.0057,
+      "tail_minus_head": -0.0952
+    },
+    "L_8192": {
+      "bpb": 1.965,
+      "head_bpb": 1.8642,
+      "tail_bpb": 1.8036,
+      "tail_minus_head": -0.0606
+    },
+    "L_32768": {
+      "bpb": 1.6769,
+      "head_bpb": 1.4946,
+      "tail_bpb": 1.4345,
+      "tail_minus_head": -0.0601
+    }
+  },
+  "long_context_lut": {
+    "L_2048": {
+      "bpb": 2.1643,
+      "head_bpb": 2.1895,
+      "tail_bpb": 2.0811,
+      "tail_minus_head": -0.1084
+    },
+    "L_8192": {
+      "bpb": 2.0255,
+      "head_bpb": 1.9475,
+      "tail_bpb": 1.8504,
+      "tail_minus_head": -0.0971
+    },
+    "L_32768": {
+      "bpb": 1.7557,
+      "head_bpb": 1.5689,
+      "tail_bpb": 1.5288,
+      "tail_minus_head": -0.0401
+    }
+  },
+  "needle_fp": {
+    "haystack_bytes": 1500,
+    "n_samples": 24,
+    "needle_bpb_with": 8.0726,
+    "needle_bpb_without": 8.077,
+    "recall_gain_bpb": 0.0044,
+    "exact_match_pct": 0.0
+  },
+  "stream_cpu": {
+    "device": "cpu",
+    "stream_vs_batch_max_err": 1.2e-05,
+    "state_bytes_prompt": 438988,
+    "state_bytes_after_gen": 438988,
+    "strict_o1_ram_invariant": true,
+    "state_kb": 428.7,
+    "generated_bytes": 256,
+    "backbone_ticks": 42,
+    "total_bytes_processed": 340,
+    "effective_chunk_ratio": 8.1,
+    "bytes_per_sec": 75.1,
+    "ms_per_byte": 13.311,
+    "sample_preview": "Calcite v2 post-transformer streaming check: Привет, мир! 東京 🚀 2026 года (р. 1938), укаремеспользует также всех в отстания в начальной и основенного соответствих от первого сильная объяста политики острование �"
+  },
+  "stream_gpu": {
+    "device": "cuda",
+    "stream_vs_batch_max_err": 6e-06,
+    "state_bytes_prompt": 438988,
+    "state_bytes_after_gen": 438988,
+    "strict_o1_ram_invariant": true,
+    "state_kb": 428.7,
+    "generated_bytes": 256,
+    "backbone_ticks": 34,
+    "total_bytes_processed": 340,
+    "effective_chunk_ratio": 10.0,
+    "bytes_per_sec": 54.2,
+    "ms_per_byte": 18.462,
+    "sample_preview": "Calcite v2 post-transformer streaming check: Привет, мир! 東京 🚀 2026 году короля в Войской символьно застя в одной выстически имени и полность состоятельные устойскому количие в гражданский языканию по отме�"
+  },
+  "checkpoint_path": "E:\\эксперименты\\Новая нейронка\\checkpoints\\calcite_v3_s2_25m_utf8_lut.pt"
+}

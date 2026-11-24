@@ -3,10 +3,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.ruff_cache/
 .venv/
 venv/
 .env
 .env.*
+
+# Local reading archive (personal PDFs, chat exports & notebooks)
+_local_reading/
 
 # Internal agent / IDE metadata & scratchpads
 .agents/*
@@ -68,3 +72,5 @@ data_cache/
 benchmarks/phase_l_v2/*_fp_tmp.pt
 benchmarks/phase_l_v2/closure_25m_*_fp.pt
 benchmarks/phase_l_v2/smoke_*.pt
+benchmarks/phase_m_v3/*_fp.pt
+benchmarks/phase_m_v3/smoke_*.pt
