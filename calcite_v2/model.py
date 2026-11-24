@@ -323,6 +323,9 @@ class CalciteV2Config:
     use_byte_engram: bool = False          # M8: Pure-tensor hashed 2/3-byte n-gram memory in decoder
     engram_slots: int = 4096               # M8: Hash table slots
     engram_dim: int = 32                   # M8: Engram embedding dim
+    use_byte_induct_cache: bool = False    # N1: Phase-free O(1) 2-scale byte induction hash-cache
+    byte_induct_slots: int = 1024          # N1: Slots per scale (2 scales = 2*S slots)
+    byte_induct_dim: int = 16              # N1: Value dim per scale (d_sig=8)
     use_temporal_residual: bool = False    # TR: Princeton Temporal Residual 2nd carried stream (+1 vec)
     tr_train_passes: int = 4               # TR: Jacobi passes during training
     tr_eval_passes: int = 8                # TR: Jacobi passes during batch eval (exact in streaming)
@@ -364,6 +367,9 @@ class CalciteV2LM(nn.Module):
             use_byte_engram=cfg.use_byte_engram,
             engram_slots=cfg.engram_slots,
             engram_dim=cfg.engram_dim,
+            use_byte_induct_cache=cfg.use_byte_induct_cache,
+            byte_induct_slots=cfg.byte_induct_slots,
+            byte_induct_dim=cfg.byte_induct_dim,
             use_fast_kernels=cfg.use_fast_kernels,
         )
 
@@ -685,6 +691,13 @@ class CalciteV2LM(nn.Module):
         for w in self._all_woodburys():
             if w.last_gate_loss is not None:
                 loss = loss + w.last_gate_loss
+        if self.epistemic_slots is not None and self.epistemic_slots.last_aux_loss is not None:
+            loss = loss + self.epistemic_slots.last_aux_loss
+        if (
+            self.byte_chunker.byte_induct_cache is not None
+            and self.byte_chunker.byte_induct_cache.last_aux_loss is not None
+        ):
+            loss = loss + self.byte_chunker.byte_induct_cache.last_aux_loss
         if self.byte_chunker.last_ratio_loss is not None:
             loss = loss + float(self.cfg.ratio_loss_scale) * self.byte_chunker.last_ratio_loss
         return loss
@@ -723,7 +736,9 @@ class CalciteV2LM(nn.Module):
                 h = h + ws_g * self.woodbury(ws_in, h_lex=e_lex)
                 if self.epistemic_slots is not None and self.epistemic_slots_gate is not None:
                     es_g = 2.0 * torch.sigmoid(self.epistemic_slots_gate(ws_in))
-                    h = h + es_g * self.epistemic_slots(ws_in, self.woodbury.last_epistemic_uncertainty)
+                    h = h + es_g * self.epistemic_slots(
+                        ws_in, self.woodbury.last_epistemic_uncertainty, h_lex=e_lex
+                    )
             h = h + self.mid_mlp(self.mid_mlp_norm(h))
 
             # Stage 3: Crystal 2 -> Top SWA
@@ -780,7 +795,7 @@ class CalciteV2LM(nn.Module):
                 if self.epistemic_slots is not None and self.epistemic_slots_gate is not None:
                     es_g = 2.0 * torch.sigmoid(self.epistemic_slots_gate(h_split))
                     delta_long = delta_long + es_g * self.epistemic_slots(
-                        h_split, self.woodbury.last_epistemic_uncertainty
+                        h_split, self.woodbury.last_epistemic_uncertainty, h_lex=e_lex
                     )
             else:
                 if not ablate_crystal:
@@ -790,7 +805,7 @@ class CalciteV2LM(nn.Module):
                     if self.epistemic_slots is not None and self.epistemic_slots_gate is not None:
                         es_g = 2.0 * torch.sigmoid(self.epistemic_slots_gate(h_split))
                         delta_long = delta_long + es_g * self.epistemic_slots(
-                            h_split, self.woodbury.last_epistemic_uncertainty
+                            h_split, self.woodbury.last_epistemic_uncertainty, h_lex=e_lex
                         )
             return delta_long
 
@@ -990,8 +1005,10 @@ def compute_v2_state_cache_kb(cfg: CalciteV2Config, seq_len: int = 2048) -> floa
     if cfg.topology == "interleaved":
         wood_b += _wood_bytes(max(2, cfg.mem_heads // 2), 1)
 
+    es_dk = max(8, int(cfg.epistemic_slots_dim) // 2)
+    es_dv = int(cfg.epistemic_slots_dim)
     slots_b = (
-        int(cfg.epistemic_slots_n * (2 * cfg.epistemic_slots_dim * 4 + 4) + 8)
+        int(2 * cfg.epistemic_slots_n * (es_dk + es_dv + 1) * 4 + 3 * 2 * es_dk * 4)
         if cfg.use_epistemic_slots
         else 0
     )
@@ -1010,6 +1027,11 @@ def compute_v2_state_cache_kb(cfg: CalciteV2Config, seq_len: int = 2048) -> floa
             else 0
         )
         + (24 if cfg.use_byte_engram else 0)
+        + (
+            (2 * int(cfg.byte_induct_slots) * (8 + int(cfg.byte_induct_dim) + 1) * 4 + 56 + cfg.d_model * 4)
+            if cfg.use_byte_induct_cache
+            else 0
+        )
     )
     fb_b = cfg.d_model * 2 if cfg.use_latent_feedback else 0
     tr_b = cfg.d_model * 2 if cfg.use_temporal_residual else 0
@@ -1041,6 +1063,9 @@ def build_calcite_v2_tier_config(
     use_byte_engram: bool = False,
     engram_slots: int = 4096,
     engram_dim: int = 32,
+    use_byte_induct_cache: bool = False,
+    byte_induct_slots: int = 1024,
+    byte_induct_dim: int = 16,
     use_temporal_residual: bool = False,
     tr_train_passes: int = 4,
     tr_eval_passes: int = 8,
@@ -1108,6 +1133,9 @@ def build_calcite_v2_tier_config(
         use_byte_engram=bool(use_byte_engram),
         engram_slots=int(engram_slots),
         engram_dim=int(engram_dim),
+        use_byte_induct_cache=bool(use_byte_induct_cache),
+        byte_induct_slots=int(byte_induct_slots),
+        byte_induct_dim=int(byte_induct_dim),
         use_temporal_residual=bool(use_temporal_residual),
         tr_train_passes=int(tr_train_passes),
         tr_eval_passes=int(tr_eval_passes),

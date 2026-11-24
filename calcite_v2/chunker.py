@@ -35,6 +35,8 @@ from simvq_split.chunker import (
 )
 from simvq_split.quant_lut import PackedLUT2BitLinear, quantize_ternary_ste, quantize_ternary_weights_ls
 
+from .byte_induct_cache import ByteInductionCache, ByteInductionStreamState
+
 
 @dataclass
 class ChunkContext:
@@ -71,6 +73,8 @@ class ChunkerStreamState:
     credits: torch.Tensor          # (B,) int64
     step_idx: int
     has_chunk: bool
+    last_tok: torch.Tensor | None = None
+    byte_induct: ByteInductionStreamState | None = None
 
     def memory_bytes(self) -> int:
         b = max(1, int(self.ring_char.size(0)))
@@ -95,7 +99,10 @@ class ChunkerStreamState:
             self.credits,
         ):
             total += int(t.numel() * t.element_size())
-        return total // b
+        out = total // b
+        if self.byte_induct is not None:
+            out += self.byte_induct.memory_bytes()
+        return out
 
 
 class CalciteV2Chunker(nn.Module):
@@ -120,6 +127,9 @@ class CalciteV2Chunker(nn.Module):
         use_byte_engram: bool = False,
         engram_slots: int = 4096,
         engram_dim: int = 32,
+        use_byte_induct_cache: bool = False,
+        byte_induct_slots: int = 1024,
+        byte_induct_dim: int = 16,
         use_fast_kernels: bool = True,
     ):
         super().__init__()
@@ -144,6 +154,9 @@ class CalciteV2Chunker(nn.Module):
         self.use_byte_engram = bool(use_byte_engram)
         self.engram_slots = int(engram_slots)
         self.engram_dim = int(engram_dim)
+        self.use_byte_induct_cache = bool(use_byte_induct_cache)
+        self.byte_induct_slots = int(byte_induct_slots)
+        self.byte_induct_dim = int(byte_induct_dim)
         self.use_fast_kernels = bool(use_fast_kernels)
 
         self.refill_int = 100
@@ -277,6 +290,17 @@ class CalciteV2Chunker(nn.Module):
             self.engram_norm = None
             self.engram_proj = None
             self.engram_gate = None
+
+        if self.use_byte_induct_cache:
+            self.byte_induct_cache = ByteInductionCache(
+                vocab_size=self.vocab_size,
+                d_model=d_model,
+                n_slots=self.byte_induct_slots,
+                d_sig=8,
+                d_v=self.byte_induct_dim,
+            )
+        else:
+            self.byte_induct_cache = None
 
         self.dec_fuse_norm = RMSNorm(d_model + 8 * self.d_byte)
         self.dec_fuse = nn.Linear(d_model + 8 * self.d_byte, d_model, bias=False)
@@ -788,6 +812,8 @@ class CalciteV2Chunker(nn.Module):
             e_eng = (self.engram_emb2(h2) + self.engram_emb3(h3)).to(dec_in.dtype)
             eg = torch.sigmoid(self.engram_gate(dec_in))
             dec_in = dec_in + eg * self.engram_proj(self.engram_norm(e_eng))
+        if self.use_byte_induct_cache and self.byte_induct_cache is not None:
+            dec_in = dec_in + self.byte_induct_cache(ctx.token_ids, dec_in)
         return dec_in + self.dec_mlp(self.dec_norm(dec_in))
 
     # ------------------------------------------------------------------
@@ -866,6 +892,12 @@ class CalciteV2Chunker(nn.Module):
             credits=torch.full((batch_size,), self.burst_int, device=device, dtype=torch.long),
             step_idx=0,
             has_chunk=False,
+            last_tok=torch.zeros(batch_size, device=device, dtype=torch.long),
+            byte_induct=(
+                self.byte_induct_cache.init_stream_state(batch_size, device, dtype)
+                if (self.use_byte_induct_cache and self.byte_induct_cache is not None)
+                else None
+            ),
         )
 
     @torch.no_grad()
@@ -901,6 +933,8 @@ class CalciteV2Chunker(nn.Module):
         if self.use_byte_engram and state.ring_tok3.size(1) == 3:
             state.ring_tok3[:, :-1] = state.ring_tok3[:, 1:].clone()
             state.ring_tok3[:, -1] = token_t
+        if self.use_byte_induct_cache:
+            state.last_tok = token_t
 
         c_norm_t = self.enc_norm_in(c_win8_t)
         h_enc0 = e_tok_t + self.enc_up(c_norm_t)
@@ -1126,4 +1160,11 @@ class CalciteV2Chunker(nn.Module):
             e_eng = (self.engram_emb2(h2) + self.engram_emb3(h3)).to(dt)
             eg = torch.sigmoid(self.engram_gate(dec_in))
             dec_in = dec_in + eg * self.engram_proj(self.engram_norm(e_eng))
+        if (
+            self.use_byte_induct_cache
+            and self.byte_induct_cache is not None
+            and state.byte_induct is not None
+            and state.last_tok is not None
+        ):
+            dec_in = dec_in + self.byte_induct_cache.step(state.last_tok, dec_in, state.byte_induct)
         return dec_in + self.dec_mlp(self.dec_norm(dec_in))

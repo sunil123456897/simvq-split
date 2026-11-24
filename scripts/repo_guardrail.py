@@ -77,6 +77,7 @@ def collect_guarded_markdown_paths(root: Path) -> list[Path]:
         root / "Phase_K_System1_Scaling_Report.md",
         root / "Phase_L_Calcite_v2_Report.md",
         root / "Phase_M_Calcite_v3_Report.md",
+        root / "Phase_N_Calcite_v31_Report.md",
         root / "Post_Transformer_Architecture_v5_Blueprint.md",
         root / "AGENTS.md",
         root / "CODING_STANDARDS.md",

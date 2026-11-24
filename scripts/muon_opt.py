@@ -68,8 +68,10 @@ class MuonAdamWHybrid:
                 continue
             if protect_crystal and (name.startswith("crystal.") or name.startswith("crystal_2.") or ".crystal." in name):
                 cryst_p.append(p)
-            elif "woodbury" in name or "epistemic_slots" in name:
+            elif "woodbury" in name:
                 wood_p.append(p)
+            elif "epistemic_slots" in name or "byte_induct_cache" in name:
+                no_decay_p.append(p)
             elif p.ndim < 2 or "norm" in name or "bias" in name or "emb" in name or "lm_head" in name or "router_" in name:
                 no_decay_p.append(p)
             elif p.ndim == 2 and min(p.shape) >= 32:

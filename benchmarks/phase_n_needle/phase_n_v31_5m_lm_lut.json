@@ -1,0 +1,256 @@
+{
+  "meta": {
+    "phase": "Phase_N_Stage2_Calcite_v31_5M_LM_L32K_LUT",
+    "params": 6009429,
+    "cache_kb_o1": 221.55,
+    "byte_induct_slots": 512,
+    "steps_fp": 700,
+    "steps_qat": 250,
+    "fp_train_seconds": 600.75,
+    "qat_seconds": 632.09,
+    "smoke": false
+  },
+  "eval_fp": {
+    "val_bpb": 2.1002,
+    "ow6_mean_bpb": 2.2409,
+    "ow6_domains": {
+      "1_GSM8K_EN": 2.2898,
+      "2_Russian_UTF8": 2.9366,
+      "3_Python_Code": 2.5352,
+      "4_ARC_JSON": 0.7116,
+      "5_CJK_UTF8": 2.3748,
+      "6_Emoji_4Byte": 2.5971
+    },
+    "long_context": {
+      "L_2048": {
+        "bpb": 2.159,
+        "head_bpb": 2.1685,
+        "tail_bpb": 2.1627,
+        "tail_minus_head": -0.0058
+      },
+      "L_8192": {
+        "bpb": 1.9812,
+        "head_bpb": 1.9103,
+        "tail_bpb": 1.9234,
+        "tail_minus_head": 0.0131
+      },
+      "L_32768": {
+        "bpb": 1.76,
+        "head_bpb": 1.5586,
+        "tail_bpb": 1.6491,
+        "tail_minus_head": 0.0905
+      }
+    },
+    "ood_verbatim_ladder": {
+      "L_512": {
+        "haystack_bytes": 512,
+        "n_samples": 16,
+        "needle_bpb_with": 0.1793,
+        "needle_bpb_without": 7.4737,
+        "recall_gain_bpb": 7.2944,
+        "byte_acc_pct": 99.22,
+        "exact_match_pct": 93.75
+      },
+      "L_1500": {
+        "haystack_bytes": 1500,
+        "n_samples": 16,
+        "needle_bpb_with": 0.1613,
+        "needle_bpb_without": 7.3994,
+        "recall_gain_bpb": 7.2382,
+        "byte_acc_pct": 98.44,
+        "exact_match_pct": 87.5
+      },
+      "L_4096": {
+        "haystack_bytes": 4096,
+        "n_samples": 16,
+        "needle_bpb_with": 0.7977,
+        "needle_bpb_without": 7.6803,
+        "recall_gain_bpb": 6.8826,
+        "byte_acc_pct": 90.62,
+        "exact_match_pct": 43.75
+      },
+      "L_8192": {
+        "haystack_bytes": 8192,
+        "n_samples": 16,
+        "needle_bpb_with": 0.9184,
+        "needle_bpb_without": 7.2134,
+        "recall_gain_bpb": 6.295,
+        "byte_acc_pct": 90.62,
+        "exact_match_pct": 56.25
+      },
+      "L_32768": {
+        "haystack_bytes": 32768,
+        "n_samples": 16,
+        "needle_bpb_with": 1.1759,
+        "needle_bpb_without": 7.2024,
+        "recall_gain_bpb": 6.0265,
+        "byte_acc_pct": 86.72,
+        "exact_match_pct": 50.0
+      },
+      "OrigRefCode_1500B": {
+        "haystack_bytes": 1500,
+        "n_samples": 16,
+        "needle_bpb_with": 0.7482,
+        "needle_bpb_without": 6.6819,
+        "recall_gain_bpb": 5.9337,
+        "byte_acc_pct": 90.62,
+        "exact_match_pct": 31.25
+      }
+    },
+    "overwrite_needle_1500b": {
+      "haystack_bytes": 1500,
+      "n_samples": 16,
+      "new_byte_acc_pct": 97.66,
+      "new_exact_pct": 81.25,
+      "stale_old_exact_pct": 0.0
+    }
+  },
+  "eval_lut": {
+    "val_bpb": 2.1668,
+    "ow6_mean_bpb": 2.3394,
+    "ow6_domains": {
+      "1_GSM8K_EN": 2.3399,
+      "2_Russian_UTF8": 3.0186,
+      "3_Python_Code": 2.6368,
+      "4_ARC_JSON": 0.809,
+      "5_CJK_UTF8": 2.4627,
+      "6_Emoji_4Byte": 2.7694
+    },
+    "long_context": {
+      "L_2048": {
+        "bpb": 2.2357,
+        "head_bpb": 2.2326,
+        "tail_bpb": 2.2322,
+        "tail_minus_head": -0.0005
+      },
+      "L_8192": {
+        "bpb": 2.0132,
+        "head_bpb": 1.9863,
+        "tail_bpb": 1.9054,
+        "tail_minus_head": -0.0809
+      },
+      "L_32768": {
+        "bpb": 1.7994,
+        "head_bpb": 1.6601,
+        "tail_bpb": 1.6637,
+        "tail_minus_head": 0.0037
+      }
+    },
+    "ood_verbatim_ladder": {
+      "L_512": {
+        "haystack_bytes": 512,
+        "n_samples": 16,
+        "needle_bpb_with": 0.1062,
+        "needle_bpb_without": 7.054,
+        "recall_gain_bpb": 6.9479,
+        "byte_acc_pct": 99.22,
+        "exact_match_pct": 93.75
+      },
+      "L_1500": {
+        "haystack_bytes": 1500,
+        "n_samples": 16,
+        "needle_bpb_with": 0.1884,
+        "needle_bpb_without": 6.9704,
+        "recall_gain_bpb": 6.782,
+        "byte_acc_pct": 98.44,
+        "exact_match_pct": 87.5
+      },
+      "L_4096": {
+        "haystack_bytes": 4096,
+        "n_samples": 16,
+        "needle_bpb_with": 0.4245,
+        "needle_bpb_without": 6.8617,
+        "recall_gain_bpb": 6.4372,
+        "byte_acc_pct": 96.88,
+        "exact_match_pct": 75.0
+      },
+      "L_8192": {
+        "haystack_bytes": 8192,
+        "n_samples": 16,
+        "needle_bpb_with": 0.695,
+        "needle_bpb_without": 6.7801,
+        "recall_gain_bpb": 6.085,
+        "byte_acc_pct": 92.19,
+        "exact_match_pct": 68.75
+      },
+      "L_32768": {
+        "haystack_bytes": 32768,
+        "n_samples": 16,
+        "needle_bpb_with": 0.817,
+        "needle_bpb_without": 6.7408,
+        "recall_gain_bpb": 5.9238,
+        "byte_acc_pct": 92.19,
+        "exact_match_pct": 62.5
+      },
+      "OrigRefCode_1500B": {
+        "haystack_bytes": 1500,
+        "n_samples": 16,
+        "needle_bpb_with": 0.7058,
+        "needle_bpb_without": 6.4048,
+        "recall_gain_bpb": 5.699,
+        "byte_acc_pct": 89.84,
+        "exact_match_pct": 37.5
+      }
+    },
+    "overwrite_needle_1500b": {
+      "haystack_bytes": 1500,
+      "n_samples": 16,
+      "new_byte_acc_pct": 97.66,
+      "new_exact_pct": 87.5,
+      "stale_old_exact_pct": 0.0
+    }
+  },
+  "lut_footprint": {
+    "num_lut_layers": 92,
+    "packed_weights_count": 5643456,
+    "packed_u8_bytes": 1410864,
+    "packed_u8_kb": 1377.8,
+    "scales_fp16_bytes": 352962,
+    "scales_fp16_kb": 344.69,
+    "fp16_other_bytes": 731700,
+    "fp16_other_kb": 714.55,
+    "total_lut_kb": 2437.04,
+    "orig_fp32_matrix_kb": 22044.75,
+    "matrix_compression_vs_fp32": 16.0,
+    "effective_matrix_compression_with_scales": 12.7982
+  },
+  "stream_cpu": {
+    "device": "cpu",
+    "stream_vs_batch_max_err": 6e-06,
+    "state_bytes_prompt": 310300,
+    "state_bytes_after_gen": 310300,
+    "strict_o1_ram_invariant": true,
+    "state_kb": 303.03,
+    "generated_bytes": 128,
+    "backbone_ticks": 46,
+    "total_bytes_processed": 212,
+    "effective_chunk_ratio": 4.61,
+    "bytes_per_sec": 57.9,
+    "ms_per_byte": 17.275,
+    "sample_preview": "Calcite v2 post-transformer streaming check: \u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440! \u6771\u4eac \ud83d\ude80 2026 - 2662\nThe general number of the fore. The because of the minimum of the visit equilable with shape the tourself supporting serv"
+  },
+  "stream_needle_lut": {
+    "haystack_bytes": 1500,
+    "n_samples": 4,
+    "stream_greedy_exact_pct": 50.0,
+    "state_kb": 303.03,
+    "strict_o1_ram": true,
+    "examples": [
+      {
+        "target": "JW72E44C",
+        "generated": "which is",
+        "exact": "False"
+      },
+      {
+        "target": "76NT9F6M",
+        "generated": "76NT9F6M",
+        "exact": "True"
+      },
+      {
+        "target": "SV2SANBQ",
+        "generated": "the same",
+        "exact": "False"
+      }
+    ]
+  }
+}

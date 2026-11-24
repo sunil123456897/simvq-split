@@ -1,0 +1,307 @@
+{
+  "meta": {
+    "phase": "Phase_N_Probe_B_Dense_MQAR_5M",
+    "steps": 450,
+    "batch_size": 64,
+    "seed": 2026,
+    "smoke": false,
+    "elapsed_s": 392.8
+  },
+  "cells": {
+    "B0_RoPE_5M": {
+      "name": "B0_RoPE_5M",
+      "params": 5328896,
+      "cache_kb_o1": 12288.0,
+      "train_seconds": 58.63,
+      "ood_verbatim_eval": {
+        "L_256": {
+          "haystack_bytes": 256,
+          "n_samples": 24,
+          "needle_bpb_with": 1.8167,
+          "needle_bpb_without": 6.8192,
+          "recall_gain_bpb": 5.0025,
+          "byte_acc_pct": 66.67,
+          "exact_match_pct": 0.0
+        },
+        "L_512": {
+          "haystack_bytes": 512,
+          "n_samples": 24,
+          "needle_bpb_with": 1.9175,
+          "needle_bpb_without": 6.676,
+          "recall_gain_bpb": 4.7584,
+          "byte_acc_pct": 64.58,
+          "exact_match_pct": 0.0
+        },
+        "L_1500": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 4.0882,
+          "needle_bpb_without": 6.2822,
+          "recall_gain_bpb": 2.194,
+          "byte_acc_pct": 28.65,
+          "exact_match_pct": 0.0
+        },
+        "L_4096": {
+          "haystack_bytes": 4096,
+          "n_samples": 24,
+          "needle_bpb_with": 8.1389,
+          "needle_bpb_without": 8.2698,
+          "recall_gain_bpb": 0.1309,
+          "byte_acc_pct": 0.52,
+          "exact_match_pct": 0.0
+        },
+        "L_8192": {
+          "haystack_bytes": 8192,
+          "n_samples": 24,
+          "needle_bpb_with": 8.2637,
+          "needle_bpb_without": 8.2393,
+          "recall_gain_bpb": -0.0245,
+          "byte_acc_pct": 0.52,
+          "exact_match_pct": 0.0
+        },
+        "OrigRefCode_1500B": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 7.0658,
+          "needle_bpb_without": 7.3811,
+          "recall_gain_bpb": 0.3154,
+          "byte_acc_pct": 2.08,
+          "exact_match_pct": 0.0
+        }
+      },
+      "slots_telemetry": {}
+    },
+    "B1_Calcite_v3_5M": {
+      "name": "B1_Calcite_v3_5M",
+      "params": 5983886,
+      "cache_kb_o1": 120.5,
+      "train_seconds": 284.86,
+      "ood_verbatim_eval": {
+        "L_256": {
+          "haystack_bytes": 256,
+          "n_samples": 24,
+          "needle_bpb_with": 5.9919,
+          "needle_bpb_without": 5.9895,
+          "recall_gain_bpb": -0.0025,
+          "byte_acc_pct": 0.52,
+          "exact_match_pct": 0.0
+        },
+        "L_512": {
+          "haystack_bytes": 512,
+          "n_samples": 24,
+          "needle_bpb_with": 5.7657,
+          "needle_bpb_without": 5.7671,
+          "recall_gain_bpb": 0.0013,
+          "byte_acc_pct": 2.08,
+          "exact_match_pct": 0.0
+        },
+        "L_1500": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 5.5445,
+          "needle_bpb_without": 5.5451,
+          "recall_gain_bpb": 0.0006,
+          "byte_acc_pct": 4.17,
+          "exact_match_pct": 0.0
+        },
+        "L_4096": {
+          "haystack_bytes": 4096,
+          "n_samples": 24,
+          "needle_bpb_with": 5.4177,
+          "needle_bpb_without": 5.4211,
+          "recall_gain_bpb": 0.0034,
+          "byte_acc_pct": 3.12,
+          "exact_match_pct": 0.0
+        },
+        "L_8192": {
+          "haystack_bytes": 8192,
+          "n_samples": 24,
+          "needle_bpb_with": 5.4743,
+          "needle_bpb_without": 5.474,
+          "recall_gain_bpb": -0.0003,
+          "byte_acc_pct": 2.6,
+          "exact_match_pct": 0.0
+        },
+        "OrigRefCode_1500B": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 5.8333,
+          "needle_bpb_without": 5.8315,
+          "recall_gain_bpb": -0.0018,
+          "byte_acc_pct": 3.12,
+          "exact_match_pct": 0.0
+        }
+      },
+      "slots_telemetry": {}
+    },
+    "B2_Calcite_v3_InductSlots": {
+      "name": "B2_Calcite_v3_InductSlots",
+      "params": 6117920,
+      "cache_kb_o1": 145.5,
+      "train_seconds": 335.32,
+      "ood_verbatim_eval": {
+        "L_256": {
+          "haystack_bytes": 256,
+          "n_samples": 24,
+          "needle_bpb_with": 5.8165,
+          "needle_bpb_without": 5.817,
+          "recall_gain_bpb": 0.0005,
+          "byte_acc_pct": 2.08,
+          "exact_match_pct": 0.0
+        },
+        "L_512": {
+          "haystack_bytes": 512,
+          "n_samples": 24,
+          "needle_bpb_with": 5.7838,
+          "needle_bpb_without": 5.7845,
+          "recall_gain_bpb": 0.0007,
+          "byte_acc_pct": 2.08,
+          "exact_match_pct": 0.0
+        },
+        "L_1500": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 5.7378,
+          "needle_bpb_without": 5.7383,
+          "recall_gain_bpb": 0.0005,
+          "byte_acc_pct": 5.21,
+          "exact_match_pct": 0.0
+        },
+        "L_4096": {
+          "haystack_bytes": 4096,
+          "n_samples": 24,
+          "needle_bpb_with": 5.7729,
+          "needle_bpb_without": 5.7763,
+          "recall_gain_bpb": 0.0034,
+          "byte_acc_pct": 3.65,
+          "exact_match_pct": 0.0
+        },
+        "L_8192": {
+          "haystack_bytes": 8192,
+          "n_samples": 24,
+          "needle_bpb_with": 5.7082,
+          "needle_bpb_without": 5.7108,
+          "recall_gain_bpb": 0.0026,
+          "byte_acc_pct": 4.17,
+          "exact_match_pct": 0.0
+        },
+        "OrigRefCode_1500B": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 5.3415,
+          "needle_bpb_without": 5.3394,
+          "recall_gain_bpb": -0.0021,
+          "byte_acc_pct": 3.12,
+          "exact_match_pct": 0.0
+        }
+      },
+      "slots_telemetry": {
+        "last_write_rate": 0.4196,
+        "lex_weight": 0.4954,
+        "lag_weights": [
+          [
+            0.8118,
+            0.1379,
+            0.0503
+          ],
+          [
+            0.8095,
+            0.1392,
+            0.0513
+          ]
+        ],
+        "read_scale": [
+          9.998,
+          9.982
+        ],
+        "null_logit": [
+          1.973,
+          2.01
+        ],
+        "write_bias": [
+          0.173,
+          0.296
+        ],
+        "slots_gate_bias": -0.503
+      }
+    },
+    "B3_Calcite_v3_ByteInductCache": {
+      "name": "B3_Calcite_v3_ByteInductCache",
+      "params": 6009429,
+      "cache_kb_o1": 321.55,
+      "train_seconds": 319.05,
+      "ood_verbatim_eval": {
+        "L_256": {
+          "haystack_bytes": 256,
+          "n_samples": 24,
+          "needle_bpb_with": 0.006,
+          "needle_bpb_without": 7.4164,
+          "recall_gain_bpb": 7.4105,
+          "byte_acc_pct": 100.0,
+          "exact_match_pct": 100.0
+        },
+        "L_512": {
+          "haystack_bytes": 512,
+          "n_samples": 24,
+          "needle_bpb_with": 0.0045,
+          "needle_bpb_without": 7.5725,
+          "recall_gain_bpb": 7.5681,
+          "byte_acc_pct": 100.0,
+          "exact_match_pct": 100.0
+        },
+        "L_1500": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 0.0024,
+          "needle_bpb_without": 7.3492,
+          "recall_gain_bpb": 7.3469,
+          "byte_acc_pct": 100.0,
+          "exact_match_pct": 100.0
+        },
+        "L_4096": {
+          "haystack_bytes": 4096,
+          "n_samples": 24,
+          "needle_bpb_with": 0.0034,
+          "needle_bpb_without": 7.2246,
+          "recall_gain_bpb": 7.2212,
+          "byte_acc_pct": 100.0,
+          "exact_match_pct": 100.0
+        },
+        "L_8192": {
+          "haystack_bytes": 8192,
+          "n_samples": 24,
+          "needle_bpb_with": 0.0051,
+          "needle_bpb_without": 7.1397,
+          "recall_gain_bpb": 7.1346,
+          "byte_acc_pct": 100.0,
+          "exact_match_pct": 100.0
+        },
+        "OrigRefCode_1500B": {
+          "haystack_bytes": 1500,
+          "n_samples": 24,
+          "needle_bpb_with": 0.2305,
+          "needle_bpb_without": 6.0495,
+          "recall_gain_bpb": 5.819,
+          "byte_acc_pct": 97.4,
+          "exact_match_pct": 87.5
+        }
+      },
+      "slots_telemetry": {
+        "last_write_rate": 0.0025,
+        "read_scale": [
+          7.879,
+          8.04
+        ],
+        "read_thresh": [
+          0.335,
+          0.384
+        ],
+        "write_bias": [
+          0.514,
+          0.499
+        ],
+        "out_gate_bias": 0.062
+      }
+    }
+  }
+}

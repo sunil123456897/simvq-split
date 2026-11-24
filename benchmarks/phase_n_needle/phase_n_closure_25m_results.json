@@ -1,0 +1,599 @@
+{
+  "meta": {
+    "phase": "Phase_N_Closure_Calcite_v31_S2_25M",
+    "params": 26628271,
+    "cache_kb_o1": 443.29,
+    "byte_induct_slots": 1024,
+    "steps": {
+      "s1a": 2000,
+      "s1b": 500,
+      "s2": 1600,
+      "qat": 800
+    },
+    "seed": 2026,
+    "smoke": false,
+    "elapsed_s": 7742.8,
+    "router_max_abs_diff": 0.0,
+    "lut_checkpoint": "checkpoints\\calcite_v31_s2_25m_utf8_lut.pt",
+    "lut_checkpoint_bytes": 10031363,
+    "qat_seconds": 1982.4,
+    "stage1_gates": {
+      "s1a_s5_k2": 54.6875,
+      "s1_s5_k2": 56.25,
+      "s1_ov_long": 95.3125,
+      "s1_trap_long": 95.3125
+    }
+  },
+  "eval_fp": {
+    "val_bpb": 2.0701,
+    "extrap_4x": {
+      "bpb_L512": 1.9271,
+      "bpb_L2048": 1.8864,
+      "bpb_L2048_head": 1.9176,
+      "bpb_L2048_tail": 1.8838,
+      "extrap_delta_bpb": -0.0407,
+      "tail_minus_head_bpb": -0.0338
+    },
+    "openweb_6": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.8354,
+          "bytes_per_chunk": 4.118,
+          "cp_per_chunk": 4.116,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 124.3,
+          "m_max": 145
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 2.3272,
+          "bytes_per_chunk": 7.531,
+          "cp_per_chunk": 5.385,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 68.0,
+          "m_max": 93
+        },
+        "3_Python_Code": {
+          "byte_bpb": 1.979,
+          "bytes_per_chunk": 4.534,
+          "cp_per_chunk": 4.534,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 112.9,
+          "m_max": 137
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 0.5149,
+          "bytes_per_chunk": 3.727,
+          "cp_per_chunk": 3.727,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 137.4,
+          "m_max": 159
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 2.7059,
+          "bytes_per_chunk": 12.423,
+          "cp_per_chunk": 4.179,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 41.2,
+          "m_max": 42
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 3.8858,
+          "bytes_per_chunk": 14.1,
+          "cp_per_chunk": 3.981,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 36.3,
+          "m_max": 37
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 2.208
+    },
+    "cognitive": {
+      "s5": {
+        "k2": {
+          "exact_pct": 61.33,
+          "token_pct": 99.33,
+          "ok": 92,
+          "n": 150,
+          "wilson_95": [
+            53.35,
+            68.75
+          ]
+        },
+        "k4": {
+          "exact_pct": 18.67,
+          "token_pct": 98.4,
+          "ok": 28,
+          "n": 150,
+          "wilson_95": [
+            13.24,
+            25.66
+          ]
+        },
+        "k8": {
+          "exact_pct": 2.0,
+          "token_pct": 96.68,
+          "ok": 3,
+          "n": 150,
+          "wilson_95": [
+            0.68,
+            5.71
+          ]
+        },
+        "k16": {
+          "exact_pct": 1.33,
+          "token_pct": 96.11,
+          "ok": 2,
+          "n": 150,
+          "wilson_95": [
+            0.37,
+            4.73
+          ]
+        }
+      },
+      "s5_sum": 83.33,
+      "overwrite": {
+        "in_dist": {
+          "exact_pct": 97.33,
+          "token_pct": 99.66,
+          "ok": 146,
+          "n": 150,
+          "wilson_95": [
+            93.34,
+            98.96
+          ]
+        },
+        "ood_med": {
+          "exact_pct": 94.0,
+          "token_pct": 99.22,
+          "ok": 141,
+          "n": 150,
+          "wilson_95": [
+            88.99,
+            96.81
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 92.0,
+          "token_pct": 98.9,
+          "ok": 138,
+          "n": 150,
+          "wilson_95": [
+            86.54,
+            95.36
+          ]
+        }
+      },
+      "trap": {
+        "in_dist": {
+          "exact_pct": 96.0,
+          "token_pct": 99.56,
+          "ok": 144,
+          "n": 150,
+          "wilson_95": [
+            91.55,
+            98.15
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 88.0,
+          "token_pct": 98.67,
+          "ok": 132,
+          "n": 150,
+          "wilson_95": [
+            81.83,
+            92.27
+          ]
+        }
+      },
+      "selective_f1_in": 96.66,
+      "selective_f1_ood_long": 89.96,
+      "crystal_norm_drift_L2048": 4.8e-07
+    }
+  },
+  "long_fp": {
+    "L_2048": {
+      "bpb": 2.1747,
+      "head_bpb": 2.1809,
+      "tail_bpb": 2.1398,
+      "tail_minus_head": -0.0411
+    },
+    "L_8192": {
+      "bpb": 1.9074,
+      "head_bpb": 1.8966,
+      "tail_bpb": 1.8288,
+      "tail_minus_head": -0.0678
+    },
+    "L_32768": {
+      "bpb": 1.7351,
+      "head_bpb": 1.5538,
+      "tail_bpb": 1.5489,
+      "tail_minus_head": -0.0049
+    }
+  },
+  "needle_fp": {
+    "L_512": {
+      "haystack_bytes": 512,
+      "n_samples": 16,
+      "needle_bpb_with": 0.3518,
+      "needle_bpb_without": 6.0342,
+      "recall_gain_bpb": 5.6824,
+      "byte_acc_pct": 95.31,
+      "exact_match_pct": 68.75
+    },
+    "L_1500": {
+      "haystack_bytes": 1500,
+      "n_samples": 16,
+      "needle_bpb_with": 0.1467,
+      "needle_bpb_without": 6.0425,
+      "recall_gain_bpb": 5.8958,
+      "byte_acc_pct": 97.66,
+      "exact_match_pct": 87.5
+    },
+    "L_4096": {
+      "haystack_bytes": 4096,
+      "n_samples": 16,
+      "needle_bpb_with": 1.083,
+      "needle_bpb_without": 5.9111,
+      "recall_gain_bpb": 4.8281,
+      "byte_acc_pct": 82.03,
+      "exact_match_pct": 50.0
+    },
+    "L_8192": {
+      "haystack_bytes": 8192,
+      "n_samples": 16,
+      "needle_bpb_with": 1.448,
+      "needle_bpb_without": 6.0547,
+      "recall_gain_bpb": 4.6067,
+      "byte_acc_pct": 75.78,
+      "exact_match_pct": 31.25
+    },
+    "L_32768": {
+      "haystack_bytes": 32768,
+      "n_samples": 16,
+      "needle_bpb_with": 3.9944,
+      "needle_bpb_without": 5.8311,
+      "recall_gain_bpb": 1.8367,
+      "byte_acc_pct": 32.81,
+      "exact_match_pct": 6.25
+    },
+    "OrigRefCode_1500B": {
+      "haystack_bytes": 1500,
+      "n_samples": 16,
+      "needle_bpb_with": 0.726,
+      "needle_bpb_without": 5.7554,
+      "recall_gain_bpb": 5.0294,
+      "byte_acc_pct": 88.28,
+      "exact_match_pct": 68.75
+    }
+  },
+  "overwrite_needle_fp": {
+    "haystack_bytes": 1500,
+    "n_samples": 16,
+    "new_byte_acc_pct": 97.66,
+    "new_exact_pct": 81.25,
+    "stale_old_exact_pct": 0.0
+  },
+  "eval_lut": {
+    "val_bpb": 2.1118,
+    "extrap_4x": {
+      "bpb_L512": 1.9722,
+      "bpb_L2048": 1.927,
+      "bpb_L2048_head": 1.9565,
+      "bpb_L2048_tail": 1.9254,
+      "extrap_delta_bpb": -0.0453,
+      "tail_minus_head_bpb": -0.0311
+    },
+    "openweb_6": {
+      "regimes": {
+        "1_GSM8K_EN": {
+          "byte_bpb": 1.8861,
+          "bytes_per_chunk": 4.106,
+          "cp_per_chunk": 4.104,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 124.7,
+          "m_max": 144
+        },
+        "2_Russian_UTF8": {
+          "byte_bpb": 2.3737,
+          "bytes_per_chunk": 7.511,
+          "cp_per_chunk": 5.37,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 68.2,
+          "m_max": 93
+        },
+        "3_Python_Code": {
+          "byte_bpb": 2.042,
+          "bytes_per_chunk": 4.537,
+          "cp_per_chunk": 4.537,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 112.9,
+          "m_max": 137
+        },
+        "4_ARC_JSON": {
+          "byte_bpb": 0.5329,
+          "bytes_per_chunk": 3.727,
+          "cp_per_chunk": 3.727,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 137.4,
+          "m_max": 159
+        },
+        "5_CJK_UTF8": {
+          "byte_bpb": 2.5905,
+          "bytes_per_chunk": 12.423,
+          "cp_per_chunk": 4.179,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 41.2,
+          "m_max": 42
+        },
+        "6_Emoji_4Byte": {
+          "byte_bpb": 3.4423,
+          "bytes_per_chunk": 14.1,
+          "cp_per_chunk": 3.981,
+          "mid_utf8_split_pct": 0.0,
+          "m_mean": 36.3,
+          "m_max": 37
+        }
+      },
+      "max_mid_utf8_split_pct": 0.0,
+      "mean_openweb_bpb": 2.1446
+    },
+    "cognitive": {
+      "s5": {
+        "k2": {
+          "exact_pct": 60.67,
+          "token_pct": 99.35,
+          "ok": 91,
+          "n": 150,
+          "wilson_95": [
+            52.68,
+            68.12
+          ]
+        },
+        "k4": {
+          "exact_pct": 18.67,
+          "token_pct": 98.35,
+          "ok": 28,
+          "n": 150,
+          "wilson_95": [
+            13.24,
+            25.66
+          ]
+        },
+        "k8": {
+          "exact_pct": 0.67,
+          "token_pct": 96.71,
+          "ok": 1,
+          "n": 150,
+          "wilson_95": [
+            0.12,
+            3.68
+          ]
+        },
+        "k16": {
+          "exact_pct": 1.33,
+          "token_pct": 96.17,
+          "ok": 2,
+          "n": 150,
+          "wilson_95": [
+            0.37,
+            4.73
+          ]
+        }
+      },
+      "s5_sum": 81.34,
+      "overwrite": {
+        "in_dist": {
+          "exact_pct": 97.33,
+          "token_pct": 99.66,
+          "ok": 146,
+          "n": 150,
+          "wilson_95": [
+            93.34,
+            98.96
+          ]
+        },
+        "ood_med": {
+          "exact_pct": 94.67,
+          "token_pct": 99.31,
+          "ok": 142,
+          "n": 150,
+          "wilson_95": [
+            89.83,
+            97.27
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 92.0,
+          "token_pct": 98.98,
+          "ok": 138,
+          "n": 150,
+          "wilson_95": [
+            86.54,
+            95.36
+          ]
+        }
+      },
+      "trap": {
+        "in_dist": {
+          "exact_pct": 94.67,
+          "token_pct": 99.41,
+          "ok": 142,
+          "n": 150,
+          "wilson_95": [
+            89.83,
+            97.27
+          ]
+        },
+        "ood_long": {
+          "exact_pct": 93.33,
+          "token_pct": 99.26,
+          "ok": 140,
+          "n": 150,
+          "wilson_95": [
+            88.16,
+            96.34
+          ]
+        }
+      },
+      "selective_f1_in": 95.98,
+      "selective_f1_ood_long": 92.66,
+      "crystal_norm_drift_L2048": 9.5e-07
+    }
+  },
+  "long_lut": {
+    "L_2048": {
+      "bpb": 2.2238,
+      "head_bpb": 2.2191,
+      "tail_bpb": 2.1972,
+      "tail_minus_head": -0.0218
+    },
+    "L_8192": {
+      "bpb": 1.9413,
+      "head_bpb": 1.9474,
+      "tail_bpb": 1.8418,
+      "tail_minus_head": -0.1056
+    },
+    "L_32768": {
+      "bpb": 1.7523,
+      "head_bpb": 1.6391,
+      "tail_bpb": 1.6066,
+      "tail_minus_head": -0.0325
+    }
+  },
+  "needle_lut": {
+    "L_512": {
+      "haystack_bytes": 512,
+      "n_samples": 16,
+      "needle_bpb_with": 0.3162,
+      "needle_bpb_without": 6.0174,
+      "recall_gain_bpb": 5.7012,
+      "byte_acc_pct": 96.88,
+      "exact_match_pct": 75.0
+    },
+    "L_1500": {
+      "haystack_bytes": 1500,
+      "n_samples": 16,
+      "needle_bpb_with": 0.2494,
+      "needle_bpb_without": 6.0121,
+      "recall_gain_bpb": 5.7627,
+      "byte_acc_pct": 96.88,
+      "exact_match_pct": 81.25
+    },
+    "L_4096": {
+      "haystack_bytes": 4096,
+      "n_samples": 16,
+      "needle_bpb_with": 1.4492,
+      "needle_bpb_without": 5.8784,
+      "recall_gain_bpb": 4.4292,
+      "byte_acc_pct": 76.56,
+      "exact_match_pct": 31.25
+    },
+    "L_8192": {
+      "haystack_bytes": 8192,
+      "n_samples": 16,
+      "needle_bpb_with": 1.4636,
+      "needle_bpb_without": 5.8663,
+      "recall_gain_bpb": 4.4027,
+      "byte_acc_pct": 75.78,
+      "exact_match_pct": 25.0
+    },
+    "L_32768": {
+      "haystack_bytes": 32768,
+      "n_samples": 16,
+      "needle_bpb_with": 4.098,
+      "needle_bpb_without": 5.8612,
+      "recall_gain_bpb": 1.7632,
+      "byte_acc_pct": 33.59,
+      "exact_match_pct": 0.0
+    },
+    "OrigRefCode_1500B": {
+      "haystack_bytes": 1500,
+      "n_samples": 16,
+      "needle_bpb_with": 0.7504,
+      "needle_bpb_without": 5.8474,
+      "recall_gain_bpb": 5.097,
+      "byte_acc_pct": 88.28,
+      "exact_match_pct": 62.5
+    }
+  },
+  "overwrite_needle_lut": {
+    "haystack_bytes": 1500,
+    "n_samples": 16,
+    "new_byte_acc_pct": 95.31,
+    "new_exact_pct": 75.0,
+    "stale_old_exact_pct": 0.0
+  },
+  "lut_gaps": {
+    "val_bpb_gap": 0.0417,
+    "ow6_mean_bpb_gap": -0.0634
+  },
+  "lut_footprint": {
+    "num_lut_layers": 112,
+    "packed_weights_count": 26197376,
+    "packed_u8_bytes": 6549568,
+    "packed_u8_kb": 6396.06,
+    "scales_fp16_bytes": 1637590,
+    "scales_fp16_kb": 1599.21,
+    "fp16_other_bytes": 861536,
+    "fp16_other_kb": 841.34,
+    "total_lut_kb": 8836.62,
+    "orig_fp32_matrix_kb": 102333.5,
+    "matrix_compression_vs_fp32": 15.9995,
+    "effective_matrix_compression_with_scales": 12.7993
+  },
+  "stream_cpu_rt": {
+    "device": "cpu",
+    "stream_vs_batch_max_err": 1.3e-05,
+    "state_bytes_prompt": 645636,
+    "state_bytes_after_gen": 645636,
+    "strict_o1_ram_invariant": true,
+    "state_kb": 630.5,
+    "generated_bytes": 256,
+    "backbone_ticks": 71,
+    "total_bytes_processed": 340,
+    "effective_chunk_ratio": 4.79,
+    "bytes_per_sec": 52.3,
+    "ms_per_byte": 19.119,
+    "sample_preview": "Calcite v2 post-transformer streaming check: \u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440! \u6771\u4eac \ud83d\ude80 2026 bottle of the distriction. In calculate the landson is the form can be multiplying the converted techniques of hospite converting post-transformer distriction of one and polysical soon and mai"
+  },
+  "stream_gpu_rt": {
+    "device": "cuda",
+    "stream_vs_batch_max_err": 7e-06,
+    "state_bytes_prompt": 645636,
+    "state_bytes_after_gen": 645636,
+    "strict_o1_ram_invariant": true,
+    "state_kb": 630.5,
+    "generated_bytes": 256,
+    "backbone_ticks": 72,
+    "total_bytes_processed": 340,
+    "effective_chunk_ratio": 4.72,
+    "bytes_per_sec": 37.5,
+    "ms_per_byte": 26.663,
+    "sample_preview": "Calcite v2 post-transformer streaming check: \u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440! \u6771\u4eac \ud83d\ude80 2026 Figure\n\n#### The views of prevention to get a location of which the ratio of condition settings as a parameter or in sense of special solution of a work belief in fragment to see for the order"
+  },
+  "stream_needle_lut": {
+    "haystack_bytes": 1500,
+    "n_samples": 4,
+    "stream_greedy_exact_pct": 50.0,
+    "state_kb": 630.5,
+    "strict_o1_ram": true,
+    "examples": [
+      {
+        "target": "JW72E44C",
+        "generated": "See the ",
+        "exact": "False"
+      },
+      {
+        "target": "76NT9F6M",
+        "generated": "76NT9F6M",
+        "exact": "True"
+      },
+      {
+        "target": "SV2SANBQ",
+        "generated": "SV2SANBQ",
+        "exact": "True"
+      }
+    ]
+  }
+}

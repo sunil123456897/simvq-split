@@ -282,6 +282,7 @@ def test_l5_standalone_router_pretrain_utf8_safety_and_tiers() -> None:
         ("M6_sparse_deltanet2", {"woodbury_sub_banks": 4, "woodbury_top_k_banks": 1, "use_deltanet2_gates": True}),
         ("M7_canon_chunks", {"use_canon_chunks": True}),
         ("M8_byte_engram", {"use_byte_engram": True, "engram_slots": 256, "engram_dim": 16}),
+        ("N1_byte_induct_cache", {"use_byte_induct_cache": True, "byte_induct_slots": 128, "byte_induct_dim": 16}),
         (
             "M_v3_combo",
             {
@@ -355,7 +356,7 @@ def test_m_axes_init_std_live_grads_causality_and_stream_parity(
     for name, p in model.named_parameters():
         if p.requires_grad:
             if p.grad is None or float(p.grad.abs().max().item()) == 0.0:
-                if "byte_offset_emb" in name or "engram_emb" in name:
+                if "byte_offset_emb" in name or "engram_emb" in name or "val_emb" in name:
                     continue
                 dead.append(name)
     assert not dead, f"Dead gradients in {axis_name}: {dead}"
@@ -483,5 +484,38 @@ def test_interleaved_canon_stream_parity_and_unsupported_axes_guard() -> None:
     opt2.load_state_dict(sd)
     assert len(opt2.muon_bufs) == len(opt.muon_bufs) == 1
     assert torch.allclose(opt2.muon_bufs[id(lin.weight)], opt.muon_bufs[id(lin.weight)])
+
+
+def test_byte_induct_cache_multiblock_exact_stream_parity() -> None:
+    """Verifies ByteInductionCache blocked dual form (3 blocks, T=600) matches 1-byte O(1) stream to <1e-5."""
+    from calcite_v2.byte_induct_cache import ByteInductionCache
+
+    torch.manual_seed(2026)
+    mod = ByteInductionCache(vocab_size=259, d_model=64, n_slots=128, d_sig=8, d_v=16, block_size=256).eval()
+    # Repeat patterns across block boundaries (t=10..40 repeated at t=300 and t=540)
+    base = torch.randint(3, 128, (2, 600), dtype=torch.long)
+    base[:, 300:340] = base[:, 10:50]
+    base[:, 540:580] = base[:, 10:50]
+    h = torch.randn(2, 600, 64)
+
+    with torch.no_grad():
+        out_batch = mod(base, h)
+        st = mod.init_stream_state(2, base.device, h.dtype)
+        outs = []
+        for t in range(600):
+            outs.append(mod.step(base[:, t], h[:, t], st))
+        out_stream = torch.stack(outs, dim=1)
+    err = float((out_batch - out_stream).abs().max().item())
+    assert err < 1e-5, f"Multi-block ByteInductionCache stream parity mismatch: {err}"
+    assert st.memory_bytes() == mod.compute_state_bytes()
+
+    # Verify 2-bit LUT packing compatibility (`FastPackedLUT2BitLinear` has no `.weight`)
+    lut_mod = pack_fast_model_2bit_lut(mod, backend="pytorch_vec").eval()
+    with torch.no_grad():
+        ob_l = lut_mod(base[:, :96], h[:, :96])
+        stl = lut_mod.init_stream_state(2, base.device, h.dtype)
+        os_l = torch.stack([lut_mod.step(base[:, t], h[:, t], stl) for t in range(96)], dim=1)
+    assert float((ob_l - os_l).abs().max().item()) < 1e-4
+
 
 

@@ -194,7 +194,7 @@ class CalciteStreamEngine:
                 if m.epistemic_slots is not None and m.epistemic_slots_gate is not None and state.epistemic_slots is not None:
                     es_g = 2.0 * torch.sigmoid(m.epistemic_slots_gate(ws_in))
                     h = h + es_g * m.epistemic_slots.step(
-                        ws_in, m.woodbury.last_epistemic_uncertainty, state.epistemic_slots
+                        ws_in, m.woodbury.last_epistemic_uncertainty, state.epistemic_slots, h_lex_t=h_lex_t
                     )
             h = h + m.mid_mlp(m.mid_mlp_norm(h))
 
@@ -283,7 +283,7 @@ class CalciteStreamEngine:
                 if m.epistemic_slots is not None and m.epistemic_slots_gate is not None and state.epistemic_slots is not None:
                     es_g = 2.0 * torch.sigmoid(m.epistemic_slots_gate(h_split))
                     delta_l = delta_l + es_g * m.epistemic_slots.step(
-                        h_split, m.woodbury.last_epistemic_uncertainty, state.epistemic_slots
+                        h_split, m.woodbury.last_epistemic_uncertainty, state.epistemic_slots, h_lex_t=h_lex_t
                     )
                 return delta_l
 
