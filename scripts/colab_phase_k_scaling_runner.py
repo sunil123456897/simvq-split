@@ -20,6 +20,7 @@ import copy
 from dataclasses import asdict
 import gc
 import glob
+import inspect
 import json
 import math
 from pathlib import Path
@@ -28,7 +29,7 @@ import re
 import statistics
 import sys
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -47,11 +48,14 @@ from experiments.scaling_phase_k.byte_baselines import (  # noqa: E402
 )
 from experiments.scaling_phase_k.eval_suite import (  # noqa: E402
     check_gate2_block_std_parity,
+    encode_utf8_fast,
+    encode_utf8_fast_np,
     eval_cognitive_suites_any_byte_lm,
     eval_length_extrapolation_bpb,
     eval_openweb_6domains_any_byte_lm,
     eval_val_memmap_bpb,
     has_usable_cuda,
+    load_utf8_corpus_array,
     measure_infer_latency_ms,
     sample_memmap_batch,
     sync_if_cuda,
@@ -434,7 +438,7 @@ class StratifiedSystem1Batcher:
 
     def __init__(
         self,
-        train_mm: np.memmap,
+        train_mm: np.ndarray,
         tr_docs: Sequence[str],
         tr_sents: Sequence[str],
         tok: ByteBPETokenizer,
@@ -447,6 +451,10 @@ class StratifiedSystem1Batcher:
         self.tok = tok
         self.seq_len = int(seq_len)
         self.train_wins = {k: v for k, v in (train_wins or {}).items() if v}
+        self._train_wins_np: Dict[str, List[np.ndarray]] = {
+            k: [np.asarray(w, dtype=np.int64) for w in v]
+            for k, v in self.train_wins.items()
+        }
         self.domain_keys = sorted(self.train_wins.keys())
         self.rng_np = np.random.default_rng(seed)
         self.rng_py = random.Random(seed + 17)
@@ -455,7 +463,7 @@ class StratifiedSystem1Batcher:
         random.Random(seed + 31).shuffle(docs)
         p_stream: List[int] = []
         for d in docs:
-            p_stream.extend(self.tok.encode(d, add_bos=True, add_eos=True))
+            p_stream.extend(encode_utf8_fast(self.tok, d, add_bos=True, add_eos=True))
         tw = self.seq_len + 1
         self.prose_chunks: List[List[int]] = [
             p_stream[i : i + tw]
@@ -464,12 +472,16 @@ class StratifiedSystem1Batcher:
         if not self.prose_chunks and len(p_stream) >= 2:
             chunk = p_stream[:tw] + [self.tok.PAD_ID] * max(0, tw - len(p_stream))
             self.prose_chunks = [chunk]
+        self._prose_chunks_np: List[np.ndarray] = [
+            np.asarray(c, dtype=np.int64) for c in self.prose_chunks
+        ]
 
-    def _sample_cog_row(
+    def _sample_cog_row_np(
         self, kind: str, local_frac: float = 1.0, stage1: bool = False
-    ) -> Tuple[List[int], int]:
+    ) -> Tuple[np.ndarray, int]:
         tw = self.seq_len + 1
         dr_map = {0: (2, 2), 1: (1, 1), 2: (0, 1), 3: (0, 1), 4: (0, 1)}
+        fast_raw = not getattr(self.tok, "merges", None)
         for attempt in range(96):
             n_distr = 2 if attempt < 48 else 1
             if kind == "s5":
@@ -507,31 +519,61 @@ class StratifiedSystem1Batcher:
                     n_distr,
                     0.25,
                 )
-            p_ids = self.tok.encode(p, add_bos=True, add_eos=False)
-            f_ids = self.tok.encode(p + t, add_bos=True, add_eos=True)
-            if len(f_ids) <= tw and f_ids[: len(p_ids)] == p_ids:
-                return f_ids, len(p_ids)
+            if fast_raw:
+                p_arr = encode_utf8_fast_np(self.tok, p, add_bos=True, add_eos=False)
+                t_arr = encode_utf8_fast_np(self.tok, t, add_bos=False, add_eos=True)
+                if len(p_arr) + len(t_arr) <= tw:
+                    return np.concatenate((p_arr, t_arr)), int(len(p_arr))
+            else:
+                p_ids = self.tok.encode(p, add_bos=True, add_eos=False)
+                f_ids = self.tok.encode(p + t, add_bos=True, add_eos=True)
+                if len(f_ids) <= tw and f_ids[: len(p_ids)] == p_ids:
+                    return np.asarray(f_ids, dtype=np.int64), len(p_ids)
         # Compact guaranteed-fit short S_5 fallback
         p, t, _ = make_s5_story(self.rng_py, 1, self.tr_sents, (0, 0))
+        if fast_raw:
+            p_arr = encode_utf8_fast_np(self.tok, p, add_bos=True, add_eos=False)
+            t_arr = encode_utf8_fast_np(self.tok, t, add_bos=False, add_eos=True)
+            f_arr = np.concatenate((p_arr, t_arr))[:tw]
+            return f_arr, min(int(len(p_arr)), int(len(f_arr)) - 1)
         p_ids = self.tok.encode(p, add_bos=True, add_eos=False)
         f_ids = self.tok.encode(p + t, add_bos=True, add_eos=True)[:tw]
-        return f_ids, min(len(p_ids), len(f_ids) - 1)
+        return np.asarray(f_ids, dtype=np.int64), min(len(p_ids), len(f_ids) - 1)
+
+    def _sample_cog_row(
+        self, kind: str, local_frac: float = 1.0, stage1: bool = False
+    ) -> Tuple[List[int], int]:
+        arr, p_len = self._sample_cog_row_np(kind, local_frac=local_frac, stage1=stage1)
+        return arr.tolist(), p_len
+
+    def _finalize_pair(
+        self, xb_np: np.ndarray, yb_np: np.ndarray, device: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        xb_t = torch.from_numpy(xb_np)
+        yb_t = torch.from_numpy(yb_np)
+        if device == "cuda" and has_usable_cuda():
+            xb_t = xb_t.pin_memory().to(device=device, non_blocking=True)
+            yb_t = yb_t.pin_memory().to(device=device, non_blocking=True)
+        elif device != "cpu":
+            xb_t = xb_t.to(device=device)
+            yb_t = yb_t.to(device=device)
+        return xb_t, yb_t
 
     def sample_prose_batch(
         self, batch_size: int, device: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Samples unmasked English prose (`tr_docs`) for dense pre-lock router alignment."""
-        if not self.prose_chunks:
+        if not self._prose_chunks_np:
             return sample_memmap_batch(
                 self.train_mm, batch_size, self.seq_len, self.rng_np, device
             )
-        xb = torch.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
-        yb = torch.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
+        xb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
+        yb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
         for ri in range(batch_size):
-            ch = self.rng_py.choice(self.prose_chunks)
-            xb[ri] = torch.tensor(ch[:-1], dtype=torch.long)
-            yb[ri] = torch.tensor(ch[1:], dtype=torch.long)
-        return xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            ch = self.rng_py.choice(self._prose_chunks_np)
+            xb_np[ri] = ch[:-1]
+            yb_np[ri] = ch[1:]
+        return self._finalize_pair(xb_np, yb_np, device)
 
     def sample_batch(
         self,
@@ -542,8 +584,10 @@ class StratifiedSystem1Batcher:
         total_steps: int = 3700,
         s1b_steps: int = 500,
         s1a_offset: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_is_web: bool = False,
+    ) -> Tuple[Any, ...]:
         del total_steps
+        is_web_batch = False
         if step <= grok_steps:
             s1b_eff = (
                 int(s1b_steps)
@@ -563,60 +607,53 @@ class StratifiedSystem1Batcher:
                 stage1_flag = False
                 p_prose = 0.10
                 p_s5_end, p_ov_end = 0.30, 0.82
-            xb = torch.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
-            yb = torch.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
+            xb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
+            yb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
             for ri in range(batch_size):
                 u = self.rng_py.random()
-                if u < p_prose and self.prose_chunks:
-                    ch = self.rng_py.choice(self.prose_chunks)
-                    xb[ri] = torch.tensor(ch[:-1], dtype=torch.long)
-                    yb[ri] = torch.tensor(ch[1:], dtype=torch.long)
+                if u < p_prose and self._prose_chunks_np:
+                    ch = self.rng_py.choice(self._prose_chunks_np)
+                    xb_np[ri] = ch[:-1]
+                    yb_np[ri] = ch[1:]
                 else:
                     kind = "s5" if u < p_s5_end else ("ov" if u < p_ov_end else "trap")
-                    f_ids, p_len = self._sample_cog_row(kind, local_frac=local_frac, stage1=stage1_flag)
-                    ls = len(f_ids)
-                    xb[ri, : ls - 1] = torch.tensor(f_ids[:-1], dtype=torch.long)
-                    yb[ri, p_len - 1 : ls - 1] = torch.tensor(f_ids[p_len:], dtype=torch.long)
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
+                    f_arr, p_len = self._sample_cog_row_np(kind, local_frac=local_frac, stage1=stage1_flag)
+                    ls = len(f_arr)
+                    xb_np[ri, : ls - 1] = f_arr[:-1]
+                    yb_np[ri, p_len - 1 : ls - 1] = f_arr[p_len:]
         else:
             # Stage 2 (`68%` pure 6-domain OpenWeb batches / `32%` pure cognitive maintenance batches)
             is_cog = self.rng_py.random() < 0.32
             if not is_cog:
-                dom_keys = [k for k in self.domain_keys if self.train_wins.get(k)]
+                is_web_batch = True
+                dom_keys = [k for k in self.domain_keys if self._train_wins_np.get(k)]
                 n_dom = (
                     len(dom_keys)
                     if (dom_keys and batch_size >= 16)
                     else (min(len(dom_keys), max(1, batch_size // 4)) if (dom_keys and batch_size >= 4) else 0)
                 )
                 n_web = max(0, batch_size - n_dom)
-                parts_x: List[torch.Tensor] = []
-                parts_y: List[torch.Tensor] = []
+                xb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
+                yb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
                 if n_web > 0:
-                    xw, yw = sample_memmap_batch(self.train_mm, n_web, self.seq_len, self.rng_np, device)
-                    parts_x.append(xw)
-                    parts_y.append(yw)
+                    xw, yw = sample_memmap_batch(self.train_mm, n_web, self.seq_len, self.rng_np, "cpu")
+                    xb_np[:n_web] = xw.numpy()
+                    yb_np[:n_web] = yw.numpy()
                 if n_dom > 0:
-                    xb_dom = torch.full((n_dom, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
-                    yb_dom = torch.full((n_dom, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
                     chosen = (
                         dom_keys
                         if n_dom == len(dom_keys)
                         else [self.rng_py.choice(dom_keys) for _ in range(n_dom)]
                     )
                     for di, dk in enumerate(chosen):
-                        w = self.rng_py.choice(self.train_wins[dk])[: self.seq_len + 1]
+                        w = self.rng_py.choice(self._train_wins_np[dk])[: self.seq_len + 1]
                         lw = len(w) - 1
                         if lw > 0:
-                            xb_dom[di, :lw] = torch.tensor(w[:-1], dtype=torch.long)
-                            yb_dom[di, :lw] = torch.tensor(w[1:], dtype=torch.long)
-                    parts_x.append(xb_dom.to(device, non_blocking=True))
-                    parts_y.append(yb_dom.to(device, non_blocking=True))
-                xb = torch.cat(parts_x, dim=0)
-                yb = torch.cat(parts_y, dim=0)
+                            xb_np[n_web + di, :lw] = w[:-1]
+                            yb_np[n_web + di, :lw] = w[1:]
             else:
-                xb = torch.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
-                yb = torch.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=torch.long)
+                xb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
+                yb_np = np.full((batch_size, self.seq_len), self.tok.PAD_ID, dtype=np.int64)
                 n_s5 = max(1, int(round(batch_size * 0.60)))
                 n_ov = max(0, int(round(batch_size * 0.28)))
                 while n_s5 + n_ov > batch_size:
@@ -627,15 +664,16 @@ class StratifiedSystem1Batcher:
                 kinds = ["s5"] * n_s5 + ["ov"] * n_ov + ["trap"] * (batch_size - n_s5 - n_ov)
                 self.rng_py.shuffle(kinds)
                 for ri, kn in enumerate(kinds):
-                    f_ids, p_len = self._sample_cog_row(kn, local_frac=1.0, stage1=False)
-                    ls = len(f_ids)
-                    xb[ri, : ls - 1] = torch.tensor(f_ids[:-1], dtype=torch.long)
-                    yb[ri, p_len - 1 : ls - 1] = torch.tensor(f_ids[p_len:], dtype=torch.long)
-                xb = xb.to(device, non_blocking=True)
-                yb = yb.to(device, non_blocking=True)
+                    f_arr, p_len = self._sample_cog_row_np(kn, local_frac=1.0, stage1=False)
+                    ls = len(f_arr)
+                    xb_np[ri, : ls - 1] = f_arr[:-1]
+                    yb_np[ri, p_len - 1 : ls - 1] = f_arr[p_len:]
 
-        perm = torch.from_numpy(self.rng_np.permutation(xb.size(0))).to(device=device, dtype=torch.long)
-        return xb[perm], yb[perm]
+        perm = self.rng_np.permutation(batch_size)
+        xb_t, yb_t = self._finalize_pair(xb_np[perm], yb_np[perm], device)
+        if return_is_web:
+            return xb_t, yb_t, is_web_batch
+        return xb_t, yb_t
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +832,53 @@ class _FusedChunkedCEKLFn(torch.autograd.Function):
         return g_out, None, None, None, None, None, None, None, None, None
 
 
+_SIG_KWARG_CACHE: Dict[Tuple[type, str], bool] = {}
+
+
+def _model_supports_kwarg(model: nn.Module, kwarg: str) -> bool:
+    key = (type(model), kwarg)
+    val = _SIG_KWARG_CACHE.get(key)
+    if val is None:
+        try:
+            val = kwarg in inspect.signature(model.forward).parameters
+        except (TypeError, ValueError):
+            val = False
+        _SIG_KWARG_CACHE[key] = val
+    return val
+
+
+def _clone_from_inference(obj: Any) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.clone() if obj.is_inference() else obj
+    if isinstance(obj, dict):
+        return {k: _clone_from_inference(v) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(_clone_from_inference(v) for v in obj)
+    if isinstance(obj, list):
+        return [_clone_from_inference(v) for v in obj]
+    return obj
+
+
+def _slice_precomputed_chunks(
+    student: nn.Module, obj: Any, s0: int, s1: int, full_bs: int
+) -> Any:
+    bc = getattr(student, "byte_chunker", None)
+    slicer = getattr(bc, "slice_precomputed_chunks", None)
+    if callable(slicer) and isinstance(obj, dict):
+        return slicer(obj, s0, s1)
+    if isinstance(obj, torch.Tensor):
+        if obj.ndim >= 1 and int(obj.size(0)) == full_bs:
+            return obj[s0:s1]
+        return obj
+    if isinstance(obj, dict):
+        return {k: _slice_precomputed_chunks(student, v, s0, s1, full_bs) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(_slice_precomputed_chunks(student, v, s0, s1, full_bs) for v in obj)
+    if isinstance(obj, list):
+        return [_slice_precomputed_chunks(student, v, s0, s1, full_bs) for v in obj]
+    return obj
+
+
 def _qat_micro_step(
     teacher: nn.Module,
     student: nn.Module,
@@ -806,31 +891,192 @@ def _qat_micro_step(
     use_amp: bool,
     cur_acc: int,
 ) -> torch.Tensor:
+    bc_s = getattr(student, "byte_chunker", None)
+    can_reuse = bool(
+        _model_supports_kwarg(teacher, "return_chunks")
+        and _model_supports_kwarg(student, "precomputed_chunks")
+        and (bc_s is not None)
+        and bool(getattr(bc_s, "router_locked", False))
+    )
     try:
         taps_fp.clear()
-        with torch.no_grad():
+        ch_c: Optional[Any] = None
+        with torch.inference_mode():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                z_fp = teacher(xb)
+                if can_reuse:
+                    out_t = teacher(xb, return_chunks=True)
+                    if isinstance(out_t, tuple) and len(out_t) >= 2:
+                        z_fp, ch_raw = out_t[0], out_t[1]
+                        ch_c = ch_raw
+                    else:
+                        z_fp = out_t
+                else:
+                    z_fp = teacher(xb)
+        z_fp_c = _clone_from_inference(z_fp)
+        taps_fp_c = [_clone_from_inference(t) for t in taps_fp]
+        if ch_c is not None:
+            ch_c = _clone_from_inference(ch_c)
         taps_q.clear()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            z_qat = student(xb)
+            if ch_c is not None:
+                z_qat = student(xb, precomputed_chunks=ch_c)
+            else:
+                z_qat = student(xb)
             commit = student.get_commitment_loss()
         valid_b = yb != pad_id
         valid_f = valid_b.float()
         denom = valid_f.sum(dim=1).clamp(min=1.0)
         ce_kl_l, ce_l = _FusedChunkedCEKLFn.apply(
-            z_qat, z_fp, yb, valid_f, denom, kl_temp, 0.35, 0.45, pad_id, 16384
+            z_qat, z_fp_c, yb, valid_f, denom, kl_temp, 0.35, 0.45, pad_id, 16384
         )
-        assert len(taps_fp) == 4 and len(taps_q) == 4, (
-            f"4-tap hook count mismatch: fp={len(taps_fp)} qat={len(taps_q)}"
+        assert len(taps_fp_c) == 4 and len(taps_q) == 4, (
+            f"4-tap hook count mismatch: fp={len(taps_fp_c)} qat={len(taps_q)}"
         )
-        blk_l = _compute_4tap_loss(taps_fp, taps_q, last_mask=valid_b)
+        blk_l = _compute_4tap_loss(taps_fp_c, taps_q, last_mask=valid_b)
         loss = ce_kl_l + 0.20 * blk_l + 0.04 * commit.float()
         (loss / float(cur_acc)).backward()
         return ce_l.detach()
     finally:
         taps_fp.clear()
         taps_q.clear()
+
+
+def _run_4tap_qat_step(
+    teacher: nn.Module,
+    student: nn.Module,
+    taps_fp: List[torch.Tensor],
+    taps_q: List[torch.Tensor],
+    xb_full: torch.Tensor,
+    yb_full: torch.Tensor,
+    micro_bs: int,
+    opt: Any,
+    pad_id: int,
+    kl_temp: float,
+    use_amp: bool,
+    device: str,
+    step_tag: str,
+    teacher_bs: Optional[int] = None,
+    w_ce: float = 0.35,
+    w_kl: float = 0.45,
+    w_4tap: float = 0.20,
+    w_commit: float = 0.04,
+    extra_loss_fn: Optional[Callable[[torch.Tensor, int, int, int], Optional[torch.Tensor]]] = None,
+    use_chunk_reuse: bool = True,
+) -> Tuple[int, Optional[torch.Tensor]]:
+    """
+    Batched frozen-teacher 4-Tap + Logit-KL STE QAT step.
+
+    Runs the frozen FP teacher in super-batches (`teacher_bs` = 32/64) under `torch.inference_mode()`,
+    shares frozen router boundaries via `return_chunks=True` / `slice_precomputed_chunks` /
+    `precomputed_chunks` (guaranteeing exact `M_max` parity even with tight eval chunking while
+    skipping student router + compaction), and accumulates student microbatches with OOM backoff.
+    """
+    batch_size = int(xb_full.size(0))
+    bc_s = getattr(student, "byte_chunker", None)
+    static_m_cap = (bc_s is None) or bool(getattr(bc_s, "use_static_m_cap", False))
+    can_reuse_chunks = bool(
+        use_chunk_reuse
+        and _model_supports_kwarg(teacher, "return_chunks")
+        and _model_supports_kwarg(student, "precomputed_chunks")
+        and (bc_s is not None)
+        and bool(getattr(bc_s, "router_locked", False))
+    )
+    can_superbatch = bool(can_reuse_chunks or static_m_cap)
+
+    while True:
+        try:
+            opt.zero_grad(set_to_none=True)
+            n_acc = max(1, (batch_size + micro_bs - 1) // micro_bs)
+            acc_t: Optional[torch.Tensor] = None
+            t_bs = (
+                min(batch_size, max(int(micro_bs), int(teacher_bs or 32)))
+                if can_superbatch
+                else int(micro_bs)
+            )
+            # Align teacher super-batch to a multiple of student `micro_bs` so every student slice stays inside one super-batch.
+            if t_bs > micro_bs:
+                t_bs = max(micro_bs, (t_bs // micro_bs) * micro_bs)
+
+            for ts0 in range(0, batch_size, t_bs):
+                ts1 = min(batch_size, ts0 + t_bs)
+                sup_bs = ts1 - ts0
+                taps_fp.clear()
+                ch_sup: Optional[Any] = None
+                with torch.inference_mode():
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                        if can_reuse_chunks:
+                            out_t = teacher(xb_full[ts0:ts1], return_chunks=True)
+                            if isinstance(out_t, tuple) and len(out_t) >= 2:
+                                z_sup_raw, ch_sup_raw = out_t[0], out_t[1]
+                                ch_sup = ch_sup_raw
+                            else:
+                                z_sup_raw = out_t
+                                can_reuse_chunks = False
+                        else:
+                            z_sup_raw = teacher(xb_full[ts0:ts1])
+                z_sup = _clone_from_inference(z_sup_raw)
+                taps_sup = [_clone_from_inference(t) for t in taps_fp] if w_4tap > 0.0 else []
+                taps_fp.clear()
+                if ch_sup is not None:
+                    ch_sup = _clone_from_inference(ch_sup)
+
+                for loc0 in range(0, sup_bs, micro_bs):
+                    loc1 = min(sup_bs, loc0 + micro_bs)
+                    s0, s1 = ts0 + loc0, ts0 + loc1
+                    xb = xb_full[s0:s1]
+                    yb = yb_full[s0:s1]
+                    z_fp_s = z_sup[loc0:loc1]
+                    taps_fp_s = [tf[loc0:loc1] for tf in taps_sup]
+                    try:
+                        taps_q.clear()
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                            if ch_sup is not None:
+                                ch_s = _slice_precomputed_chunks(student, ch_sup, loc0, loc1, sup_bs)
+                                try:
+                                    z_qat = student(xb, precomputed_chunks=ch_s)
+                                except TypeError:
+                                    ch_sup = None
+                                    can_reuse_chunks = False
+                                    z_qat = student(xb)
+                            else:
+                                z_qat = student(xb)
+                            commit = student.get_commitment_loss()
+
+                        valid_b = yb != pad_id
+                        valid_f = valid_b.float()
+                        denom = valid_f.sum(dim=1).clamp(min=1.0)
+                        ce_kl_l, ce_l = _FusedChunkedCEKLFn.apply(
+                            z_qat, z_fp_s, yb, valid_f, denom, kl_temp, w_ce, w_kl, pad_id, 16384
+                        )
+                        loss = ce_kl_l + float(w_commit) * commit.float()
+                        if w_4tap > 0.0:
+                            assert len(taps_fp_s) == 4 and len(taps_q) == 4, (
+                                f"4-tap hook count mismatch: fp={len(taps_fp_s)} qat={len(taps_q)}"
+                            )
+                            blk_l = _compute_4tap_loss(taps_fp_s, taps_q, last_mask=valid_b)
+                            loss = loss + float(w_4tap) * blk_l
+                        if extra_loss_fn is not None:
+                            ext_l = extra_loss_fn(z_qat, s0, s1, n_acc)
+                            if ext_l is not None:
+                                loss = loss + ext_l
+                        (loss / float(n_acc)).backward()
+                        ce_det = ce_l.detach()
+                        acc_t = ce_det if acc_t is None else (acc_t + ce_det)
+                    finally:
+                        taps_q.clear()
+                del z_sup, taps_sup, ch_sup
+            return micro_bs, acc_t
+        except Exception as exc:
+            taps_fp.clear()
+            taps_q.clear()
+            if _is_oom_error(exc) and micro_bs > 8:
+                opt.zero_grad(set_to_none=True)
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                micro_bs = max(8, micro_bs // 2)
+                print(f"  [OOM-Fallback] {step_tag}: micro_bs -> {micro_bs}", flush=True)
+                continue
+            raise
 
 
 def _snapshot_router_params(model: CalciteLeanSystem1LM) -> Dict[str, torch.Tensor]:
@@ -1043,20 +1289,26 @@ def _compute_4tap_loss(
     taps_q: Sequence[torch.Tensor],
     last_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Branchless, zero-sync 4-tap RMS-normalized SmoothL1 + cosine distillation loss."""
     acc = torch.zeros((), device=taps_q[0].device, dtype=torch.float32)
     n_t = len(taps_q)
     for idx, (tf, tq) in enumerate(zip(taps_fp, taps_q)):
         af, aq = tf.float(), tq.float()
-        if last_mask is not None and idx == n_t - 1:
-            m = last_mask.reshape(-1) > 0.5
-            if int(m.sum().item()) == 0:
-                continue
-            af_f, aq_f = af.reshape(-1, af.size(-1))[m], aq.reshape(-1, aq.size(-1))[m]
-        else:
-            af_f, aq_f = af.reshape(-1, af.size(-1)), aq.reshape(-1, aq.size(-1))
+        af_f = af.reshape(-1, af.size(-1))
+        aq_f = aq.reshape(-1, aq.size(-1))
         rms_f = af_f.pow(2).mean(dim=-1, keepdim=True).add(1e-5).sqrt().detach()
-        sl1 = F.smooth_l1_loss(aq_f / rms_f, af_f / rms_f)
-        cos_d = (1.0 - F.cosine_similarity(af_f, aq_f, dim=-1, eps=1e-6)).mean()
+        if last_mask is not None and idx == n_t - 1:
+            m_b = last_mask.reshape(-1) > 0.5
+            m_sum = m_b.float().sum()
+            inv_m = (m_sum > 0.0).float() / m_sum.clamp(min=1.0)
+            sl1_tok = F.smooth_l1_loss(aq_f / rms_f, af_f / rms_f, reduction="none").mean(dim=-1)
+            cos_tok = 1.0 - F.cosine_similarity(af_f, aq_f, dim=-1, eps=1e-6)
+            zeros = torch.zeros_like(sl1_tok)
+            sl1 = torch.where(m_b, sl1_tok, zeros).sum() * inv_m
+            cos_d = torch.where(m_b, cos_tok, zeros).sum() * inv_m
+        else:
+            sl1 = F.smooth_l1_loss(aq_f / rms_f, af_f / rms_f)
+            cos_d = (1.0 - F.cosine_similarity(af_f, aq_f, dim=-1, eps=1e-6)).mean()
         acc = acc + 0.5 * sl1 + 0.5 * cos_d
     return acc / float(n_t)
 
@@ -1075,13 +1327,17 @@ def _auto_micro_bs(device: str, tier_name: str, target_bs: int = 64, is_qat: boo
         if tier_name == "S2_25M":
             return min(32, target_bs) if is_qat else min(64, target_bs)
         return min(32, target_bs)
-    return 8 if tier_name in ("S2_25M", "S3_85M") else 16
+    if tier_name == "S1_5M":
+        return min(32, target_bs)
+    if tier_name == "S2_25M":
+        return min(16 if is_qat else 32, target_bs)
+    return 8
 
 
 def _eval_complete_cell(
     model: nn.Module,
     tok: ByteBPETokenizer,
-    val_mm: np.memmap,
+    val_mm: np.ndarray,
     eval_wins: Dict[str, List[List[int]]],
     s5_suites: dict,
     ov_suites: dict,
@@ -1096,6 +1352,7 @@ def _eval_complete_cell(
     extrap = eval_length_extrapolation_bpb(
         model, val_mm, device=device, l_in=seq_len, l_ood=1024 if smoke else 2048,
         n_batches=2 if smoke else 12, batch_size_ood=2 if smoke else 4,
+        reuse_l_in_bpb=val_bpb,
     )
     ow = eval_openweb_6domains_any_byte_lm(model, eval_wins, device=device, batch_size=8 if smoke else 16)
     cog = eval_cognitive_suites_any_byte_lm(model, tok, s5_suites, ov_suites, trap_suites, device=device, batch_size=16 if smoke else 32)
@@ -1746,9 +2003,9 @@ def _train_calcite_cell(
     qat_model.load_state_dict(fp_sd_cpu, strict=True)
     qat_model.set_fast_kernels(use_fast_kernels)
     if model.byte_chunker is not None:
-        model.byte_chunker.use_static_m_cap = False
+        model.byte_chunker.use_static_m_cap = True
     if qat_model.byte_chunker is not None:
-        qat_model.byte_chunker.use_static_m_cap = False
+        qat_model.byte_chunker.use_static_m_cap = True
         qat_model.byte_chunker.lock_router(True)
     router_snap = fp_router_snap if fp_router_snap else _snapshot_router_params(qat_model)
     qat_model.set_crystal_schedule(1, 1)
@@ -1795,16 +2052,20 @@ def _train_calcite_cell(
             is_log_q = (qs in (1, max(1, qat_steps // 2), qat_steps)) or (qs % 250 == 0)
             need_s_q = is_log_q or (qs % 50 == 0)
 
-            micro_bs_q, q_ce_sum_t = _run_accum_microbatches(
+            micro_bs_q, q_ce_sum_t = _run_4tap_qat_step(
+                model,
+                qat_model,
+                taps_fp,
+                taps_q,
                 xb_full,
                 yb_full,
                 micro_bs_q,
                 opt_q,
+                tok.PAD_ID,
+                kl_temp,
+                use_amp,
                 device,
                 f"{tier_name}/Calcite QAT qs={qs}",
-                lambda xb, yb, cur_acc, t_m=model, s_m=qat_model: _qat_micro_step(
-                    t_m, s_m, taps_fp, taps_q, kl_temp, xb, yb, tok.PAD_ID, use_amp, cur_acc
-                ),
             )
             torch.nn.utils.clip_grad_norm_(all_qp, 1.0)
             opt_q.step()
@@ -2162,8 +2423,8 @@ def main() -> int:
         _merge_and_save_scaling_results(cells_dir, out_json, selected_resolved, corpus_meta, device)
         return 0
 
-    train_mm = np.memmap(data_dir / "train_utf8.u16.bin", dtype=np.uint16, mode="r")
-    val_mm = np.memmap(data_dir / "val_utf8.u16.bin", dtype=np.uint16, mode="r")
+    train_mm = load_utf8_corpus_array(data_dir / "train_utf8.u16.bin")
+    val_mm = load_utf8_corpus_array(data_dir / "val_utf8.u16.bin")
     tok = ByteBPETokenizer(merges=[])
     tr_docs, te_docs, tr_sents, te_sents = load_gsm8k_corpora(ROOT_DIR)
     train_wins, eval_wins, _, _ = build_disjoint_openweb_corpora(ROOT_DIR, tok, tr_docs, te_docs, seq_len=args.seq_len)

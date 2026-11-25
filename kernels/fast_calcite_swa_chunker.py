@@ -1,18 +1,22 @@
 """
 fast_calcite_swa_chunker.py — Native CUDA kernels (`load_inline`, `nvcc`) + clean CPU/PyTorch
-fallbacks for the two remaining cortex & byte-chunker bottlenecks in `Calcite System-1`:
+fallbacks for the two remaining cortex & byte-chunker bottlenecks in `Calcite System-1 / v2 / v3.1`:
 
-1. **Fused Local Sliding-Window RoPE Attention (`W <= 16`, `head_dim == 64`, `BF16/FP16/FP32`):**
+1. **Fused Local Sliding-Window RoPE Attention (`1 <= W <= 32`, `head_dim in {32, 64}`, `BF16/FP16/FP32`):**
    - `get_cached_rope_cos_sin`: zero-copy cached RoPE `(cos, sin)` slices per `(T, device, dtype)`.
    - `fast_swa_rope_attn_cuda`: single-pass fused RoPE + `O(T * W)` SMEM sliding-window attention
      forward + zero-atomic deterministic analytical backward (`torch.library.custom_op` with
-     `register_fake` + `register_autograd` for zero-break `torch.compile(..., dynamic=True)`).
+     `register_fake` + `register_autograd` for zero-break `torch.compile(..., dynamic=True)`),
+     covering both chunk-cortex (`D=64, W<=32`) and `byte_swa` (`D=32, W=24`).
    - `patch_fast_swa_attention`: drop-in helper accelerating all local `CausalRoPEAttention`
      layers in `cortex_pre` / `cortex_post` with zero `simvq_split/` edits or `state_dict()` drift.
 
-2. **Zero-`argsort` UTF-8 Chunker + Locked-Router Fast Path:**
+2. **Zero-`argsort` UTF-8 Chunker + Offset + Locked-Router Fast Path:**
    - `utf8_span_and_compact_cuda`: single-pass UTF-8 continuation-shield + leaky-bucket guard +
-     compaction returning `(b_mask, chunk_counts, slot_idx, gather_pos)` with ZERO `argsort`.
+     compaction returning `(b_mask, chunk_counts, slot_idx, gather_pos)` with ZERO `argsort`,
+     registered via `torch.library.custom_op` + `register_fake` for zero graph breaks.
+   - `utf8_span_compact_and_offset_cuda`: single-pass extension also emitting `offset_in_chunk`
+     (`clamp(t - last_fire, 0, max_byte_span)`) directly from registers (`5`-tuple return).
    - `fast_encode_to_chunks`: skips redundant `quantize_ternary_ste` on the 5 frozen router
      linears when `chunker.router_locked` is `True` (`router_max_abs_diff == 0.0`), eliminates
      `argsort` + intermediate UTF-8 mask launches, and gathers `c_win8` before `lex_norm`/`lex_up`.
@@ -21,10 +25,9 @@ fallbacks for the two remaining cortex & byte-chunker bottlenecks in `Calcite Sy
 
 from __future__ import annotations
 
-from functools import lru_cache
 import math
 from pathlib import Path
-import shutil
+import sys
 import sysconfig
 import tempfile
 import types
@@ -34,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kernels.fast_calcite_scans import prepare_cuda_build_env
 from simvq_split.baselines import CausalRoPEAttention
 from simvq_split.chunker import (
     ByteChunkContext,
@@ -78,7 +82,8 @@ std::vector<torch::Tensor> utf8_span_and_compact_cuda_impl(
     int64_t cost_int,
     int64_t burst_int,
     int64_t m_cap,
-    bool return_masks
+    bool return_masks,
+    bool return_offset
 );
 
 std::vector<torch::Tensor> swa_rope_attn_fwd_cuda(
@@ -112,12 +117,13 @@ std::vector<torch::Tensor> utf8_span_and_compact_cuda(
     int64_t cost_int,
     int64_t burst_int,
     int64_t m_cap,
-    bool return_masks
+    bool return_masks,
+    bool return_offset
 ) {
     return utf8_span_and_compact_cuda_impl(
         token_ids, p_prob, pad_token_id,
         max_cp_span, max_byte_span, refill_int, cost_int, burst_int,
-        m_cap, return_masks
+        m_cap, return_masks, return_offset
     );
 }
 """
@@ -134,9 +140,10 @@ _CUDA_KERNEL_SOURCE = r"""
 
 namespace {
 
-__device__ __forceinline__ float warp_sum32(float v) {
+template <int HALF_D>
+__device__ __forceinline__ float group_sum(float v) {
     #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
+    for (int off = HALF_D / 2; off > 0; off >>= 1) {
         v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
     }
     return v;
@@ -206,31 +213,42 @@ __device__ __forceinline__ void store_pair_f32<at::Half>(at::Half* ptr, int lane
 }
 
 // ---------------------------------------------------------------------------
-// 1a. Fused Local Sliding-Window RoPE Attention Forward (`D == 64, W <= 16`)
+// 1a. Fused Local Sliding-Window RoPE Attention Forward (`D in {32, 64}, W <= 32`)
+//     - `D == 64`: 1 warp (32 lanes) per row, `N_GROUPS = 8`, static SMEM <= 32 KB.
+//     - `D == 32`: 1 half-warp (16 lanes) per row, `N_GROUPS = 16`, static SMEM <= 16 KB.
+//     - All `__shfl_xor_sync(0xFFFFFFFFu, ...)` loops use warp-uniform iteration bounds.
 // ---------------------------------------------------------------------------
-template <typename scalar_t, int MAX_W>
+template <typename scalar_t, int HEAD_DIM, int MAX_W>
 __global__ void swa_rope_attn_fwd_kernel(
-    const scalar_t* __restrict__ qkv,      // (B, T, 3, H, 64)
-    const scalar_t* __restrict__ cos_ptr,  // (T, 32)
-    const scalar_t* __restrict__ sin_ptr,  // (T, 32)
-    scalar_t* __restrict__ out,            // (B, T, H, 64)
+    const scalar_t* __restrict__ qkv,      // (B, T, 3, H, HEAD_DIM)
+    const scalar_t* __restrict__ cos_ptr,  // (T, HEAD_DIM/2)
+    const scalar_t* __restrict__ sin_ptr,  // (T, HEAD_DIM/2)
+    scalar_t* __restrict__ out,            // (B, T, H, HEAD_DIM)
     float* __restrict__ lse,               // (B, H, T)
     int64_t T,
     int64_t H,
     int W
 ) {
+    constexpr int HALF_D = HEAD_DIM / 2;
+    constexpr int SUBS = 32 / HALF_D;           // 1 for D=64, 2 for D=32
     constexpr int BT = 32;
     constexpr int N_WARPS = 8;
+    constexpr int N_GROUPS = N_WARPS * SUBS;    // 8 for D=64, 16 for D=32
+    constexpr int R_PER_GROUP = BT / N_GROUPS;  // 4 for D=64, 2 for D=32
     constexpr int BKV_MAX = BT + MAX_W;
-    constexpr float scale = 0.125f;
+    constexpr float scale = (HEAD_DIM == 64) ? 0.125f : 0.17677669529663687f;
 
-    __shared__ float sh_Ke[BKV_MAX][32];
-    __shared__ float sh_Ko[BKV_MAX][32];
-    __shared__ float sh_Ve[BKV_MAX][32];
-    __shared__ float sh_Vo[BKV_MAX][32];
+    __shared__ float sh_Ke[BKV_MAX][HALF_D];
+    __shared__ float sh_Ko[BKV_MAX][HALF_D];
+    __shared__ float sh_Ve[BKV_MAX][HALF_D];
+    __shared__ float sh_Vo[BKV_MAX][HALF_D];
 
     const int lane = static_cast<int>(threadIdx.x);
     const int warp_id = static_cast<int>(threadIdx.y);
+    const int sub_id = (SUBS == 2) ? (lane >> 4) : 0;
+    const int sub_lane = (SUBS == 2) ? (lane & 15) : lane;
+    const int group_id = warp_id * SUBS + sub_id;
+
     const int64_t t0 = static_cast<int64_t>(blockIdx.x) * BT;
     const int64_t h = static_cast<int64_t>(blockIdx.y);
     const int64_t b = static_cast<int64_t>(blockIdx.z);
@@ -238,106 +256,126 @@ __global__ void swa_rope_attn_fwd_kernel(
     const int64_t kv_start = (t0 - (W - 1) > 0) ? (t0 - (W - 1)) : 0;
     const int kv_count = static_cast<int>(t_end - kv_start);
 
-    for (int row = warp_id; row < kv_count; row += N_WARPS) {
+    for (int row = group_id; row < kv_count; row += N_GROUPS) {
         const int64_t t_kv = kv_start + row;
-        const int64_t k_off = (((b * T + t_kv) * 3 + 1) * H + h) * 64;
-        const int64_t v_off = (((b * T + t_kv) * 3 + 2) * H + h) * 64;
+        const int64_t k_off = (((b * T + t_kv) * 3 + 1) * H + h) * HEAD_DIM;
+        const int64_t v_off = (((b * T + t_kv) * 3 + 2) * H + h) * HEAD_DIM;
         float ke, ko, ve, vo;
-        load_pair_f32<scalar_t>(qkv + k_off, lane, ke, ko);
-        load_pair_f32<scalar_t>(qkv + v_off, lane, ve, vo);
-        const int64_t cs_off = t_kv * 32 + lane;
+        load_pair_f32<scalar_t>(qkv + k_off, sub_lane, ke, ko);
+        load_pair_f32<scalar_t>(qkv + v_off, sub_lane, ve, vo);
+        const int64_t cs_off = t_kv * HALF_D + sub_lane;
         const float c = static_cast<float>(cos_ptr[cs_off]);
         const float s = static_cast<float>(sin_ptr[cs_off]);
-        sh_Ke[row][lane] = ke * c - ko * s;
-        sh_Ko[row][lane] = ke * s + ko * c;
-        sh_Ve[row][lane] = ve;
-        sh_Vo[row][lane] = vo;
+        sh_Ke[row][sub_lane] = ke * c - ko * s;
+        sh_Ko[row][sub_lane] = ke * s + ko * c;
+        sh_Ve[row][sub_lane] = ve;
+        sh_Vo[row][sub_lane] = vo;
     }
     __syncthreads();
 
-    for (int r = warp_id; r < BT; r += N_WARPS) {
+    for (int ri = 0; ri < R_PER_GROUP; ++ri) {
+        const int r = group_id + ri * N_GROUPS;
         const int64_t t = t0 + r;
-        if (t >= T) break;
+        const bool active = (t < T);
+        const int64_t t_safe = active ? t : (T - 1);
 
-        const int64_t q_off = (((b * T + t) * 3 + 0) * H + h) * 64;
+        const int64_t q_off = (((b * T + t_safe) * 3 + 0) * H + h) * HEAD_DIM;
         float qe, qo;
-        load_pair_f32<scalar_t>(qkv + q_off, lane, qe, qo);
-        const int64_t cs_off = t * 32 + lane;
+        load_pair_f32<scalar_t>(qkv + q_off, sub_lane, qe, qo);
+        const int64_t cs_off = t_safe * HALF_D + sub_lane;
         const float c = static_cast<float>(cos_ptr[cs_off]);
         const float s = static_cast<float>(sin_ptr[cs_off]);
         const float qre = qe * c - qo * s;
         const float qro = qe * s + qo * c;
 
-        const int64_t win_start = (t - (W - 1) > 0) ? (t - (W - 1)) : 0;
-        const int count = static_cast<int>(t - win_start + 1);
+        const int64_t win_start = (t_safe - (W - 1) > 0) ? (t_safe - (W - 1)) : 0;
+        const int my_count = active ? static_cast<int>(t_safe - win_start + 1) : 0;
         const int base_row = static_cast<int>(win_start - kv_start);
+        const int peer_count = (SUBS == 2)
+            ? __shfl_xor_sync(0xFFFFFFFFu, my_count, 16)
+            : my_count;
+        const int loop_count = (my_count > peer_count) ? my_count : peer_count;
 
         float scores[MAX_W];
         float m_max = -1e38f;
-        for (int idx = 0; idx < count; ++idx) {
-            const int kv_row = base_row + idx;
-            const float prod = qre * sh_Ke[kv_row][lane] + qro * sh_Ko[kv_row][lane];
-            const float dot = warp_sum32(prod) * scale;
-            scores[idx] = dot;
-            if (idx == 0 || dot > m_max) m_max = dot;
+        for (int idx = 0; idx < loop_count; ++idx) {
+            const int safe_idx = (idx < my_count) ? idx : 0;
+            const int kv_row = base_row + safe_idx;
+            const float prod = qre * sh_Ke[kv_row][sub_lane] + qro * sh_Ko[kv_row][sub_lane];
+            const float dot = group_sum<HALF_D>(prod) * scale;
+            if (idx < my_count) {
+                scores[idx] = dot;
+                if (idx == 0 || dot > m_max) m_max = dot;
+            }
         }
 
-        float denom = 0.0f;
-        for (int idx = 0; idx < count; ++idx) {
-            const float p = expf(scores[idx] - m_max);
-            scores[idx] = p;
-            denom += p;
-        }
-        const float inv_denom = 1.0f / denom;
+        if (active) {
+            float denom = 0.0f;
+            for (int idx = 0; idx < my_count; ++idx) {
+                const float p = expf(scores[idx] - m_max);
+                scores[idx] = p;
+                denom += p;
+            }
+            const float inv_denom = 1.0f / denom;
 
-        float acc_e = 0.0f;
-        float acc_o = 0.0f;
-        for (int idx = 0; idx < count; ++idx) {
-            const float p = scores[idx] * inv_denom;
-            const int kv_row = base_row + idx;
-            acc_e += p * sh_Ve[kv_row][lane];
-            acc_o += p * sh_Vo[kv_row][lane];
-        }
+            float acc_e = 0.0f;
+            float acc_o = 0.0f;
+            for (int idx = 0; idx < my_count; ++idx) {
+                const float p = scores[idx] * inv_denom;
+                const int kv_row = base_row + idx;
+                acc_e += p * sh_Ve[kv_row][sub_lane];
+                acc_o += p * sh_Vo[kv_row][sub_lane];
+            }
 
-        const int64_t out_off = ((b * T + t) * H + h) * 64;
-        store_pair_f32<scalar_t>(out + out_off, lane, acc_e, acc_o);
-        if (lane == 0) {
-            lse[(b * H + h) * T + t] = m_max + logf(denom);
+            const int64_t out_off = ((b * T + t) * H + h) * HEAD_DIM;
+            store_pair_f32<scalar_t>(out + out_off, sub_lane, acc_e, acc_o);
+            if (sub_lane == 0) {
+                lse[(b * H + h) * T + t] = m_max + logf(denom);
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// 1b. Exact Zero-Atomic Analytical Backward (`D == 64, W <= 16`)
+// 1b. Exact Zero-Atomic Analytical Backward (`D in {32, 64}, W <= 32`)
+//     - Static SMEM: <= 32.5 KB (`D=64, MAX_W=32`), <= 16.5 KB (`D=32, MAX_W=32`).
+//     - Strictly warp-uniform loops around every `__shfl_xor_sync` and `__syncthreads`.
 // ---------------------------------------------------------------------------
-template <typename scalar_t, int MAX_W>
+template <typename scalar_t, int HEAD_DIM, int MAX_W>
 __global__ void swa_rope_attn_bwd_kernel(
-    const scalar_t* __restrict__ qkv,      // (B, T, 3, H, 64)
-    const scalar_t* __restrict__ cos_ptr,  // (T, 32)
-    const scalar_t* __restrict__ sin_ptr,  // (T, 32)
-    const scalar_t* __restrict__ out,      // (B, T, H, 64)
+    const scalar_t* __restrict__ qkv,      // (B, T, 3, H, HEAD_DIM)
+    const scalar_t* __restrict__ cos_ptr,  // (T, HEAD_DIM/2)
+    const scalar_t* __restrict__ sin_ptr,  // (T, HEAD_DIM/2)
+    const scalar_t* __restrict__ out,      // (B, T, H, HEAD_DIM)
     const float* __restrict__ lse,         // (B, H, T)
-    const scalar_t* __restrict__ grad_out, // (B, T, H, 64)
-    scalar_t* __restrict__ grad_qkv,       // (B, T, 3, H, 64)
+    const scalar_t* __restrict__ grad_out, // (B, T, H, HEAD_DIM)
+    scalar_t* __restrict__ grad_qkv,       // (B, T, 3, H, HEAD_DIM)
     int64_t T,
     int64_t H,
     int W
 ) {
+    constexpr int HALF_D = HEAD_DIM / 2;
+    constexpr int SUBS = 32 / HALF_D;           // 1 for D=64, 2 for D=32
     constexpr int BT = 32;
     constexpr int N_WARPS = 8;
-    constexpr int R_PER_WARP = BT / N_WARPS;
+    constexpr int N_GROUPS = N_WARPS * SUBS;    // 8 for D=64, 16 for D=32
+    constexpr int R_PER_GROUP = BT / N_GROUPS;  // 4 for D=64, 2 for D=32
     constexpr int BKV_MAX = BT + MAX_W;
-    constexpr float scale = 0.125f;
+    constexpr float scale = (HEAD_DIM == 64) ? 0.125f : 0.17677669529663687f;
 
-    __shared__ float sh_A_e[BKV_MAX][32];
-    __shared__ float sh_A_o[BKV_MAX][32];
-    __shared__ float sh_B_e[BKV_MAX][32];
-    __shared__ float sh_B_o[BKV_MAX][32];
+    __shared__ float sh_A_e[BKV_MAX][HALF_D];
+    __shared__ float sh_A_o[BKV_MAX][HALF_D];
+    __shared__ float sh_B_e[BKV_MAX][HALF_D];
+    __shared__ float sh_B_o[BKV_MAX][HALF_D];
     __shared__ float sh_lse[BKV_MAX];
     __shared__ float sh_D[BKV_MAX];
 
     const int lane = static_cast<int>(threadIdx.x);
     const int warp_id = static_cast<int>(threadIdx.y);
+    const int sub_id = (SUBS == 2) ? (lane >> 4) : 0;
+    const int sub_lane = (SUBS == 2) ? (lane & 15) : lane;
+    const int group_id = warp_id * SUBS + sub_id;
+
     const int64_t t0 = static_cast<int64_t>(blockIdx.x) * BT;
     const int64_t h = static_cast<int64_t>(blockIdx.y);
     const int64_t b = static_cast<int64_t>(blockIdx.z);
@@ -346,48 +384,49 @@ __global__ void swa_rope_attn_bwd_kernel(
     const int kv_count = static_cast<int>(t_end - kv_start);
 
     // Load K_rot and V for [kv_start, t_end)
-    for (int row = warp_id; row < kv_count; row += N_WARPS) {
+    for (int row = group_id; row < kv_count; row += N_GROUPS) {
         const int64_t t_kv = kv_start + row;
-        const int64_t k_off = (((b * T + t_kv) * 3 + 1) * H + h) * 64;
-        const int64_t v_off = (((b * T + t_kv) * 3 + 2) * H + h) * 64;
+        const int64_t k_off = (((b * T + t_kv) * 3 + 1) * H + h) * HEAD_DIM;
+        const int64_t v_off = (((b * T + t_kv) * 3 + 2) * H + h) * HEAD_DIM;
         float ke, ko, ve, vo;
-        load_pair_f32<scalar_t>(qkv + k_off, lane, ke, ko);
-        load_pair_f32<scalar_t>(qkv + v_off, lane, ve, vo);
-        const int64_t cs_off = t_kv * 32 + lane;
+        load_pair_f32<scalar_t>(qkv + k_off, sub_lane, ke, ko);
+        load_pair_f32<scalar_t>(qkv + v_off, sub_lane, ve, vo);
+        const int64_t cs_off = t_kv * HALF_D + sub_lane;
         const float c = static_cast<float>(cos_ptr[cs_off]);
         const float s = static_cast<float>(sin_ptr[cs_off]);
-        sh_A_e[row][lane] = ke * c - ko * s;
-        sh_A_o[row][lane] = ke * s + ko * c;
-        sh_B_e[row][lane] = ve;
-        sh_B_o[row][lane] = vo;
+        sh_A_e[row][sub_lane] = ke * c - ko * s;
+        sh_A_o[row][sub_lane] = ke * s + ko * c;
+        sh_B_e[row][sub_lane] = ve;
+        sh_B_o[row][sub_lane] = vo;
     }
     __syncthreads();
 
-    float my_ke[R_PER_WARP], my_ko[R_PER_WARP];
-    float my_ve[R_PER_WARP], my_vo[R_PER_WARP];
-    float my_qe[R_PER_WARP], my_qo[R_PER_WARP];
-    float my_doe[R_PER_WARP], my_doo[R_PER_WARP];
+    float my_ke[R_PER_GROUP], my_ko[R_PER_GROUP];
+    float my_ve[R_PER_GROUP], my_vo[R_PER_GROUP];
+    float my_qe[R_PER_GROUP], my_qo[R_PER_GROUP];
+    float my_doe[R_PER_GROUP], my_doo[R_PER_GROUP];
 
     // Phase 1: Compute dQ for [t0, t_end) and cache local K_rot, V, Q_rot, dO
-    for (int ri = 0; ri < R_PER_WARP; ++ri) {
-        const int local_t = warp_id + ri * N_WARPS;
+    for (int ri = 0; ri < R_PER_GROUP; ++ri) {
+        const int local_t = group_id + ri * N_GROUPS;
         const int64_t t = t0 + local_t;
-        if (t >= T) break;
+        const bool active = (t < T);
+        const int64_t t_safe = active ? t : (T - 1);
 
-        const int self_kv_row = static_cast<int>(t - kv_start);
-        my_ke[ri] = sh_A_e[self_kv_row][lane];
-        my_ko[ri] = sh_A_o[self_kv_row][lane];
-        my_ve[ri] = sh_B_e[self_kv_row][lane];
-        my_vo[ri] = sh_B_o[self_kv_row][lane];
+        const int self_kv_row = static_cast<int>(t_safe - kv_start);
+        my_ke[ri] = sh_A_e[self_kv_row][sub_lane];
+        my_ko[ri] = sh_A_o[self_kv_row][sub_lane];
+        my_ve[ri] = sh_B_e[self_kv_row][sub_lane];
+        my_vo[ri] = sh_B_o[self_kv_row][sub_lane];
 
-        const int64_t q_off = (((b * T + t) * 3 + 0) * H + h) * 64;
-        const int64_t o_off = ((b * T + t) * H + h) * 64;
+        const int64_t q_off = (((b * T + t_safe) * 3 + 0) * H + h) * HEAD_DIM;
+        const int64_t o_off = ((b * T + t_safe) * H + h) * HEAD_DIM;
         float qe, qo, oe, oo, doe, doo;
-        load_pair_f32<scalar_t>(qkv + q_off, lane, qe, qo);
-        load_pair_f32<scalar_t>(out + o_off, lane, oe, oo);
-        load_pair_f32<scalar_t>(grad_out + o_off, lane, doe, doo);
+        load_pair_f32<scalar_t>(qkv + q_off, sub_lane, qe, qo);
+        load_pair_f32<scalar_t>(out + o_off, sub_lane, oe, oo);
+        load_pair_f32<scalar_t>(grad_out + o_off, sub_lane, doe, doo);
 
-        const int64_t cs_off = t * 32 + lane;
+        const int64_t cs_off = t_safe * HALF_D + sub_lane;
         const float c = static_cast<float>(cos_ptr[cs_off]);
         const float s = static_cast<float>(sin_ptr[cs_off]);
         const float qre = qe * c - qo * s;
@@ -398,123 +437,152 @@ __global__ void swa_rope_attn_bwd_kernel(
         my_doe[ri] = doe;
         my_doo[ri] = doo;
 
-        const float D_t = warp_sum32(doe * oe + doo * oo);
-        const float lse_t = lse[(b * H + h) * T + t];
-        if (lane == 0) {
+        const float D_t = group_sum<HALF_D>(doe * oe + doo * oo);
+        const float lse_t = lse[(b * H + h) * T + t_safe];
+        if (active && sub_lane == 0) {
             sh_lse[local_t] = lse_t;
             sh_D[local_t] = D_t;
         }
 
-        const int64_t win_start = (t - (W - 1) > 0) ? (t - (W - 1)) : 0;
-        const int count = static_cast<int>(t - win_start + 1);
+        const int64_t win_start = (t_safe - (W - 1) > 0) ? (t_safe - (W - 1)) : 0;
+        const int my_count = active ? static_cast<int>(t_safe - win_start + 1) : 0;
         const int base_row = static_cast<int>(win_start - kv_start);
+        const int peer_count = (SUBS == 2)
+            ? __shfl_xor_sync(0xFFFFFFFFu, my_count, 16)
+            : my_count;
+        const int loop_count = (my_count > peer_count) ? my_count : peer_count;
 
         float dq_re = 0.0f;
         float dq_ro = 0.0f;
-        for (int idx = 0; idx < count; ++idx) {
-            const int kv_row = base_row + idx;
-            const float kr_e = sh_A_e[kv_row][lane];
-            const float kr_o = sh_A_o[kv_row][lane];
-            const float dot = warp_sum32(qre * kr_e + qro * kr_o) * scale;
-            const float p = expf(dot - lse_t);
-            const float dp = warp_sum32(doe * sh_B_e[kv_row][lane] + doo * sh_B_o[kv_row][lane]);
-            const float ds = p * (dp - D_t);
-            dq_re += ds * kr_e;
-            dq_ro += ds * kr_o;
+        for (int idx = 0; idx < loop_count; ++idx) {
+            const int safe_idx = (idx < my_count) ? idx : 0;
+            const int kv_row = base_row + safe_idx;
+            const float kr_e = sh_A_e[kv_row][sub_lane];
+            const float kr_o = sh_A_o[kv_row][sub_lane];
+            const float dot = group_sum<HALF_D>(qre * kr_e + qro * kr_o) * scale;
+            const float dp = group_sum<HALF_D>(
+                doe * sh_B_e[kv_row][sub_lane] + doo * sh_B_o[kv_row][sub_lane]
+            );
+            if (idx < my_count) {
+                const float p = expf(dot - lse_t);
+                const float ds = p * (dp - D_t);
+                dq_re += ds * kr_e;
+                dq_ro += ds * kr_o;
+            }
         }
-        dq_re *= scale;
-        dq_ro *= scale;
-        const float dq_e = dq_re * c + dq_ro * s;
-        const float dq_o = -dq_re * s + dq_ro * c;
-        store_pair_f32<scalar_t>(grad_qkv + q_off, lane, dq_e, dq_o);
+        if (active) {
+            dq_re *= scale;
+            dq_ro *= scale;
+            const float dq_e = dq_re * c + dq_ro * s;
+            const float dq_o = -dq_re * s + dq_ro * c;
+            store_pair_f32<scalar_t>(grad_qkv + q_off, sub_lane, dq_e, dq_o);
+        }
     }
     __syncthreads();
 
     // Repopulate sh_A = Q_rot, sh_B = dO for [t0, min(T, t0 + BT + W - 1))
-    for (int ri = 0; ri < R_PER_WARP; ++ri) {
-        const int local_t = warp_id + ri * N_WARPS;
-        if (t0 + local_t >= T) break;
-        sh_A_e[local_t][lane] = my_qe[ri];
-        sh_A_o[local_t][lane] = my_qo[ri];
-        sh_B_e[local_t][lane] = my_doe[ri];
-        sh_B_o[local_t][lane] = my_doo[ri];
+    for (int ri = 0; ri < R_PER_GROUP; ++ri) {
+        const int local_t = group_id + ri * N_GROUPS;
+        if (t0 + local_t < T) {
+            sh_A_e[local_t][sub_lane] = my_qe[ri];
+            sh_A_o[local_t][sub_lane] = my_qo[ri];
+            sh_B_e[local_t][sub_lane] = my_doe[ri];
+            sh_B_o[local_t][sub_lane] = my_doo[ri];
+        }
     }
     const int64_t q_end = (t0 + BT + W - 1 < T) ? (t0 + BT + W - 1) : T;
     const int halo_start = static_cast<int>(t_end - t0);
     const int halo_end = static_cast<int>(q_end - t0);
-    for (int local_t = halo_start + warp_id; local_t < halo_end; local_t += N_WARPS) {
-        const int64_t t = t0 + local_t;
-        const int64_t q_off = (((b * T + t) * 3 + 0) * H + h) * 64;
-        const int64_t o_off = ((b * T + t) * H + h) * 64;
+    const int halo_len = halo_end - halo_start;
+    const int halo_iters = (halo_len > 0) ? ((halo_len + N_GROUPS - 1) / N_GROUPS) : 0;
+    for (int hi = 0; hi < halo_iters; ++hi) {
+        const int local_t = halo_start + group_id + hi * N_GROUPS;
+        const bool h_active = (local_t < halo_end);
+        const int64_t t_h = h_active ? (t0 + local_t) : (T - 1);
+        const int64_t q_off = (((b * T + t_h) * 3 + 0) * H + h) * HEAD_DIM;
+        const int64_t o_off = ((b * T + t_h) * H + h) * HEAD_DIM;
         float qe, qo, oe, oo, doe, doo;
-        load_pair_f32<scalar_t>(qkv + q_off, lane, qe, qo);
-        load_pair_f32<scalar_t>(out + o_off, lane, oe, oo);
-        load_pair_f32<scalar_t>(grad_out + o_off, lane, doe, doo);
-        const int64_t cs_off = t * 32 + lane;
+        load_pair_f32<scalar_t>(qkv + q_off, sub_lane, qe, qo);
+        load_pair_f32<scalar_t>(out + o_off, sub_lane, oe, oo);
+        load_pair_f32<scalar_t>(grad_out + o_off, sub_lane, doe, doo);
+        const int64_t cs_off = t_h * HALF_D + sub_lane;
         const float c = static_cast<float>(cos_ptr[cs_off]);
         const float s = static_cast<float>(sin_ptr[cs_off]);
-        sh_A_e[local_t][lane] = qe * c - qo * s;
-        sh_A_o[local_t][lane] = qe * s + qo * c;
-        sh_B_e[local_t][lane] = doe;
-        sh_B_o[local_t][lane] = doo;
-        const float D_t = warp_sum32(doe * oe + doo * oo);
-        if (lane == 0) {
-            sh_lse[local_t] = lse[(b * H + h) * T + t];
-            sh_D[local_t] = D_t;
+        const float D_t = group_sum<HALF_D>(doe * oe + doo * oo);
+        if (h_active) {
+            sh_A_e[local_t][sub_lane] = qe * c - qo * s;
+            sh_A_o[local_t][sub_lane] = qe * s + qo * c;
+            sh_B_e[local_t][sub_lane] = doe;
+            sh_B_o[local_t][sub_lane] = doo;
+            if (sub_lane == 0) {
+                sh_lse[local_t] = lse[(b * H + h) * T + t_h];
+                sh_D[local_t] = D_t;
+            }
         }
     }
     __syncthreads();
 
     // Phase 2: Compute dK and dV for j in [t0, t_end) (dual causal window j <= t <= min(T-1, j+W-1))
-    for (int ri = 0; ri < R_PER_WARP; ++ri) {
-        const int local_j = warp_id + ri * N_WARPS;
+    for (int ri = 0; ri < R_PER_GROUP; ++ri) {
+        const int local_j = group_id + ri * N_GROUPS;
         const int64_t j = t0 + local_j;
-        if (j >= T) break;
+        const bool active = (j < T);
+        const int64_t j_safe = active ? j : (T - 1);
 
         const float kr_e = my_ke[ri];
         const float kr_o = my_ko[ri];
         const float v_e = my_ve[ri];
         const float v_o = my_vo[ri];
 
-        const int64_t t_hi = (j + W - 1 < T - 1) ? (j + W - 1) : (T - 1);
-        const int count = static_cast<int>(t_hi - j + 1);
+        const int64_t t_hi = (j_safe + W - 1 < T - 1) ? (j_safe + W - 1) : (T - 1);
+        const int my_count = active ? static_cast<int>(t_hi - j_safe + 1) : 0;
+        const int peer_count = (SUBS == 2)
+            ? __shfl_xor_sync(0xFFFFFFFFu, my_count, 16)
+            : my_count;
+        const int loop_count = (my_count > peer_count) ? my_count : peer_count;
+        const int local_j_safe = active ? local_j : 0;
 
         float dk_re = 0.0f;
         float dk_ro = 0.0f;
         float dv_e = 0.0f;
         float dv_o = 0.0f;
-        for (int idx = 0; idx < count; ++idx) {
-            const int q_row = local_j + idx;
-            const float qr_e = sh_A_e[q_row][lane];
-            const float qr_o = sh_A_o[q_row][lane];
-            const float do_e = sh_B_e[q_row][lane];
-            const float do_o = sh_B_o[q_row][lane];
-            const float dot = warp_sum32(qr_e * kr_e + qr_o * kr_o) * scale;
-            const float p = expf(dot - sh_lse[q_row]);
-            const float dp = warp_sum32(do_e * v_e + do_o * v_o);
-            const float ds = p * (dp - sh_D[q_row]);
-            dk_re += ds * qr_e;
-            dk_ro += ds * qr_o;
-            dv_e += p * do_e;
-            dv_o += p * do_o;
+        for (int idx = 0; idx < loop_count; ++idx) {
+            const int safe_idx = (idx < my_count) ? idx : 0;
+            const int q_row = local_j_safe + safe_idx;
+            const float qr_e = sh_A_e[q_row][sub_lane];
+            const float qr_o = sh_A_o[q_row][sub_lane];
+            const float do_e = sh_B_e[q_row][sub_lane];
+            const float do_o = sh_B_o[q_row][sub_lane];
+            const float dot = group_sum<HALF_D>(qr_e * kr_e + qr_o * kr_o) * scale;
+            const float dp = group_sum<HALF_D>(do_e * v_e + do_o * v_o);
+            if (idx < my_count) {
+                const float p = expf(dot - sh_lse[q_row]);
+                const float ds = p * (dp - sh_D[q_row]);
+                dk_re += ds * qr_e;
+                dk_ro += ds * qr_o;
+                dv_e += p * do_e;
+                dv_o += p * do_o;
+            }
         }
-        dk_re *= scale;
-        dk_ro *= scale;
-        const int64_t cs_off = j * 32 + lane;
-        const float c = static_cast<float>(cos_ptr[cs_off]);
-        const float s = static_cast<float>(sin_ptr[cs_off]);
-        const float dk_e = dk_re * c + dk_ro * s;
-        const float dk_o = -dk_re * s + dk_ro * c;
+        if (active) {
+            dk_re *= scale;
+            dk_ro *= scale;
+            const int64_t cs_off = j * HALF_D + sub_lane;
+            const float c = static_cast<float>(cos_ptr[cs_off]);
+            const float s = static_cast<float>(sin_ptr[cs_off]);
+            const float dk_e = dk_re * c + dk_ro * s;
+            const float dk_o = -dk_re * s + dk_ro * c;
 
-        const int64_t k_off = (((b * T + j) * 3 + 1) * H + h) * 64;
-        const int64_t v_off = (((b * T + j) * 3 + 2) * H + h) * 64;
-        store_pair_f32<scalar_t>(grad_qkv + k_off, lane, dk_e, dk_o);
-        store_pair_f32<scalar_t>(grad_qkv + v_off, lane, dv_e, dv_o);
+            const int64_t k_off = (((b * T + j) * 3 + 1) * H + h) * HEAD_DIM;
+            const int64_t v_off = (((b * T + j) * 3 + 2) * H + h) * HEAD_DIM;
+            store_pair_f32<scalar_t>(grad_qkv + k_off, sub_lane, dk_e, dk_o);
+            store_pair_f32<scalar_t>(grad_qkv + v_off, sub_lane, dv_e, dv_o);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// 2. Single-Pass Zero-`argsort` UTF-8 Boundary Guard & Compaction Kernel
+// 2. Single-Pass Zero-`argsort` UTF-8 Boundary Guard, Offset & Compaction Kernel
 // ---------------------------------------------------------------------------
 __global__ void utf8_span_and_compact_kernel(
     const int64_t* __restrict__ token_ids,
@@ -525,6 +593,7 @@ __global__ void utf8_span_and_compact_kernel(
     int64_t* __restrict__ gather_pos,
     bool* __restrict__ valid_mask_out,
     bool* __restrict__ is_lead_out,
+    int64_t* __restrict__ offset_out,
     int64_t B,
     int64_t T,
     int64_t M_max,
@@ -543,6 +612,7 @@ __global__ void utf8_span_and_compact_kernel(
     int64_t credits = burst_int;
     int64_t cont_streak = 0;
     int64_t count = 0;
+    int64_t last_fire = 0;
     const int64_t max_slot = (M_max > 0) ? (M_max - 1) : 0;
     const int64_t base = b * T;
     const int64_t g_base = b * M_max;
@@ -598,10 +668,17 @@ __global__ void utf8_span_and_compact_kernel(
 
         b_mask[idx] = fire;
         if (fire) {
+            last_fire = t;
             if (count < M_max) {
                 gather_pos[g_base + count] = t;
             }
             ++count;
+        }
+        if (offset_out != nullptr) {
+            int64_t off = t - last_fire;
+            if (off > max_byte_span) off = max_byte_span;
+            if (off < 0) off = 0;
+            offset_out[idx] = off;
         }
         int64_t s = count - 1;
         if (s < 0) s = 0;
@@ -631,8 +708,8 @@ __global__ void utf8_span_and_compact_kernel(
     }
 }
 
-template <typename scalar_t>
-void launch_swa_fwd(
+template <typename scalar_t, int HEAD_DIM>
+void launch_swa_fwd_dim(
     const torch::Tensor& qkv_c,
     const torch::Tensor& cos_c,
     const torch::Tensor& sin_c,
@@ -647,12 +724,17 @@ void launch_swa_fwd(
     dim3 grid(static_cast<unsigned int>((T + 31) / 32), static_cast<unsigned int>(H), static_cast<unsigned int>(B));
     auto stream = c10::cuda::getCurrentCUDAStream();
     if (W <= 8) {
-        swa_rope_attn_fwd_kernel<scalar_t, 8><<<grid, block, 0, stream>>>(
+        swa_rope_attn_fwd_kernel<scalar_t, HEAD_DIM, 8><<<grid, block, 0, stream>>>(
+            qkv_c.data_ptr<scalar_t>(), cos_c.data_ptr<scalar_t>(), sin_c.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(), lse.data_ptr<float>(), T, H, W
+        );
+    } else if (W <= 16) {
+        swa_rope_attn_fwd_kernel<scalar_t, HEAD_DIM, 16><<<grid, block, 0, stream>>>(
             qkv_c.data_ptr<scalar_t>(), cos_c.data_ptr<scalar_t>(), sin_c.data_ptr<scalar_t>(),
             out.data_ptr<scalar_t>(), lse.data_ptr<float>(), T, H, W
         );
     } else {
-        swa_rope_attn_fwd_kernel<scalar_t, 16><<<grid, block, 0, stream>>>(
+        swa_rope_attn_fwd_kernel<scalar_t, HEAD_DIM, 32><<<grid, block, 0, stream>>>(
             qkv_c.data_ptr<scalar_t>(), cos_c.data_ptr<scalar_t>(), sin_c.data_ptr<scalar_t>(),
             out.data_ptr<scalar_t>(), lse.data_ptr<float>(), T, H, W
         );
@@ -660,7 +742,27 @@ void launch_swa_fwd(
 }
 
 template <typename scalar_t>
-void launch_swa_bwd(
+void launch_swa_fwd(
+    const torch::Tensor& qkv_c,
+    const torch::Tensor& cos_c,
+    const torch::Tensor& sin_c,
+    torch::Tensor& out,
+    torch::Tensor& lse,
+    int64_t B,
+    int64_t T,
+    int64_t H,
+    int64_t D,
+    int W
+) {
+    if (D == 32) {
+        launch_swa_fwd_dim<scalar_t, 32>(qkv_c, cos_c, sin_c, out, lse, B, T, H, W);
+    } else {
+        launch_swa_fwd_dim<scalar_t, 64>(qkv_c, cos_c, sin_c, out, lse, B, T, H, W);
+    }
+}
+
+template <typename scalar_t, int HEAD_DIM>
+void launch_swa_bwd_dim(
     const torch::Tensor& qkv_c,
     const torch::Tensor& cos_c,
     const torch::Tensor& sin_c,
@@ -677,17 +779,45 @@ void launch_swa_bwd(
     dim3 grid(static_cast<unsigned int>((T + 31) / 32), static_cast<unsigned int>(H), static_cast<unsigned int>(B));
     auto stream = c10::cuda::getCurrentCUDAStream();
     if (W <= 8) {
-        swa_rope_attn_bwd_kernel<scalar_t, 8><<<grid, block, 0, stream>>>(
+        swa_rope_attn_bwd_kernel<scalar_t, HEAD_DIM, 8><<<grid, block, 0, stream>>>(
+            qkv_c.data_ptr<scalar_t>(), cos_c.data_ptr<scalar_t>(), sin_c.data_ptr<scalar_t>(),
+            out_c.data_ptr<scalar_t>(), lse_c.data_ptr<float>(), go_c.data_ptr<scalar_t>(),
+            dqkv.data_ptr<scalar_t>(), T, H, W
+        );
+    } else if (W <= 16) {
+        swa_rope_attn_bwd_kernel<scalar_t, HEAD_DIM, 16><<<grid, block, 0, stream>>>(
             qkv_c.data_ptr<scalar_t>(), cos_c.data_ptr<scalar_t>(), sin_c.data_ptr<scalar_t>(),
             out_c.data_ptr<scalar_t>(), lse_c.data_ptr<float>(), go_c.data_ptr<scalar_t>(),
             dqkv.data_ptr<scalar_t>(), T, H, W
         );
     } else {
-        swa_rope_attn_bwd_kernel<scalar_t, 16><<<grid, block, 0, stream>>>(
+        swa_rope_attn_bwd_kernel<scalar_t, HEAD_DIM, 32><<<grid, block, 0, stream>>>(
             qkv_c.data_ptr<scalar_t>(), cos_c.data_ptr<scalar_t>(), sin_c.data_ptr<scalar_t>(),
             out_c.data_ptr<scalar_t>(), lse_c.data_ptr<float>(), go_c.data_ptr<scalar_t>(),
             dqkv.data_ptr<scalar_t>(), T, H, W
         );
+    }
+}
+
+template <typename scalar_t>
+void launch_swa_bwd(
+    const torch::Tensor& qkv_c,
+    const torch::Tensor& cos_c,
+    const torch::Tensor& sin_c,
+    const torch::Tensor& out_c,
+    const torch::Tensor& lse_c,
+    const torch::Tensor& go_c,
+    torch::Tensor& dqkv,
+    int64_t B,
+    int64_t T,
+    int64_t H,
+    int64_t D,
+    int W
+) {
+    if (D == 32) {
+        launch_swa_bwd_dim<scalar_t, 32>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, W);
+    } else {
+        launch_swa_bwd_dim<scalar_t, 64>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, W);
     }
 }
 
@@ -701,15 +831,19 @@ std::vector<torch::Tensor> swa_rope_attn_fwd_cuda_impl(
 ) {
     c10::cuda::CUDAGuard device_guard(qkv.device());
     auto qkv_c = qkv.contiguous();
-    auto cos_c = cos.to(qkv_c.scalar_type()).reshape({-1, 32}).contiguous();
-    auto sin_c = sin.to(qkv_c.scalar_type()).reshape({-1, 32}).contiguous();
     const int64_t B = qkv_c.size(0);
     const int64_t T = qkv_c.size(1);
     const int64_t H = qkv_c.size(3);
     const int64_t D = qkv_c.size(4);
     const int W = static_cast<int>(window_size);
-    TORCH_CHECK(qkv_c.dim() == 5 && qkv_c.size(2) == 3 && D == 64, "swa_rope_attn_fwd_cuda requires (B, T, 3, H, 64)");
-    TORCH_CHECK(W >= 1 && W <= 16, "swa_rope_attn_fwd_cuda requires 1 <= window_size <= 16");
+    TORCH_CHECK(
+        qkv_c.dim() == 5 && qkv_c.size(2) == 3 && (D == 32 || D == 64),
+        "swa_rope_attn_fwd_cuda requires (B, T, 3, H, 32|64)"
+    );
+    TORCH_CHECK(W >= 1 && W <= 32, "swa_rope_attn_fwd_cuda requires 1 <= window_size <= 32");
+
+    auto cos_c = cos.to(qkv_c.scalar_type()).reshape({-1, D / 2}).contiguous();
+    auto sin_c = sin.to(qkv_c.scalar_type()).reshape({-1, D / 2}).contiguous();
     TORCH_CHECK(cos_c.size(0) >= T && sin_c.size(0) >= T, "cos/sin length must be >= T");
 
     auto out = torch::empty({B, T, H, D}, qkv_c.options());
@@ -717,11 +851,11 @@ std::vector<torch::Tensor> swa_rope_attn_fwd_cuda_impl(
     if (B == 0 || T == 0 || H == 0) return {out, lse};
 
     if (qkv_c.scalar_type() == torch::kBFloat16) {
-        launch_swa_fwd<at::BFloat16>(qkv_c, cos_c, sin_c, out, lse, B, T, H, W);
+        launch_swa_fwd<at::BFloat16>(qkv_c, cos_c, sin_c, out, lse, B, T, H, D, W);
     } else if (qkv_c.scalar_type() == torch::kFloat32) {
-        launch_swa_fwd<float>(qkv_c, cos_c, sin_c, out, lse, B, T, H, W);
+        launch_swa_fwd<float>(qkv_c, cos_c, sin_c, out, lse, B, T, H, D, W);
     } else if (qkv_c.scalar_type() == torch::kFloat16) {
-        launch_swa_fwd<at::Half>(qkv_c, cos_c, sin_c, out, lse, B, T, H, W);
+        launch_swa_fwd<at::Half>(qkv_c, cos_c, sin_c, out, lse, B, T, H, D, W);
     } else {
         TORCH_CHECK(false, "Unsupported dtype for swa_rope_attn_fwd_cuda");
     }
@@ -740,29 +874,32 @@ torch::Tensor swa_rope_attn_bwd_cuda_impl(
 ) {
     c10::cuda::CUDAGuard device_guard(qkv.device());
     auto qkv_c = qkv.contiguous();
-    auto cos_c = cos.to(qkv_c.scalar_type()).reshape({-1, 32}).contiguous();
-    auto sin_c = sin.to(qkv_c.scalar_type()).reshape({-1, 32}).contiguous();
-    auto out_c = out.to(qkv_c.scalar_type()).contiguous();
-    auto lse_c = lse.to(torch::kFloat32).contiguous();
-    auto go_c = grad_out.to(qkv_c.scalar_type()).contiguous();
-
     const int64_t B = qkv_c.size(0);
     const int64_t T = qkv_c.size(1);
     const int64_t H = qkv_c.size(3);
     const int64_t D = qkv_c.size(4);
     const int W = static_cast<int>(window_size);
-    TORCH_CHECK(qkv_c.dim() == 5 && qkv_c.size(2) == 3 && D == 64, "swa_rope_attn_bwd_cuda requires (B, T, 3, H, 64)");
-    TORCH_CHECK(W >= 1 && W <= 16, "swa_rope_attn_bwd_cuda requires 1 <= window_size <= 16");
+    TORCH_CHECK(
+        qkv_c.dim() == 5 && qkv_c.size(2) == 3 && (D == 32 || D == 64),
+        "swa_rope_attn_bwd_cuda requires (B, T, 3, H, 32|64)"
+    );
+    TORCH_CHECK(W >= 1 && W <= 32, "swa_rope_attn_bwd_cuda requires 1 <= window_size <= 32");
+
+    auto cos_c = cos.to(qkv_c.scalar_type()).reshape({-1, D / 2}).contiguous();
+    auto sin_c = sin.to(qkv_c.scalar_type()).reshape({-1, D / 2}).contiguous();
+    auto out_c = out.to(qkv_c.scalar_type()).contiguous();
+    auto lse_c = lse.to(torch::kFloat32).contiguous();
+    auto go_c = grad_out.to(qkv_c.scalar_type()).contiguous();
 
     auto dqkv = torch::empty_like(qkv_c);
     if (B == 0 || T == 0 || H == 0) return dqkv;
 
     if (qkv_c.scalar_type() == torch::kBFloat16) {
-        launch_swa_bwd<at::BFloat16>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, W);
+        launch_swa_bwd<at::BFloat16>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, D, W);
     } else if (qkv_c.scalar_type() == torch::kFloat32) {
-        launch_swa_bwd<float>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, W);
+        launch_swa_bwd<float>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, D, W);
     } else if (qkv_c.scalar_type() == torch::kFloat16) {
-        launch_swa_bwd<at::Half>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, W);
+        launch_swa_bwd<at::Half>(qkv_c, cos_c, sin_c, out_c, lse_c, go_c, dqkv, B, T, H, D, W);
     } else {
         TORCH_CHECK(false, "Unsupported dtype for swa_rope_attn_bwd_cuda");
     }
@@ -780,7 +917,8 @@ std::vector<torch::Tensor> utf8_span_and_compact_cuda_impl(
     int64_t cost_int,
     int64_t burst_int,
     int64_t m_cap,
-    bool return_masks
+    bool return_masks,
+    bool return_offset
 ) {
     c10::cuda::CUDAGuard device_guard(token_ids.device());
     auto ids_c = token_ids.to(torch::kInt64).contiguous();
@@ -797,9 +935,13 @@ std::vector<torch::Tensor> utf8_span_and_compact_cuda_impl(
     auto gather_pos = torch::zeros({B, M_max}, long_opts);
     torch::Tensor valid_mask;
     torch::Tensor is_lead;
+    torch::Tensor offset_in_chunk;
     if (return_masks) {
         valid_mask = torch::empty({B, T}, bool_opts);
         is_lead = torch::empty({B, T}, bool_opts);
+    }
+    if (return_offset) {
+        offset_in_chunk = torch::empty({B, T}, long_opts);
     }
 
     if (B > 0 && T > 0) {
@@ -814,16 +956,22 @@ std::vector<torch::Tensor> utf8_span_and_compact_cuda_impl(
             gather_pos.data_ptr<int64_t>(),
             return_masks ? valid_mask.data_ptr<bool>() : nullptr,
             return_masks ? is_lead.data_ptr<bool>() : nullptr,
+            return_offset ? offset_in_chunk.data_ptr<int64_t>() : nullptr,
             B, T, M_max,
             pad_token_id, max_cp_span, max_byte_span, refill_int, cost_int, burst_int
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
+    std::vector<torch::Tensor> out = {b_mask, chunk_counts, slot_idx, gather_pos};
     if (return_masks) {
-        return {b_mask, chunk_counts, slot_idx, gather_pos, valid_mask, is_lead};
+        out.push_back(valid_mask);
+        out.push_back(is_lead);
     }
-    return {b_mask, chunk_counts, slot_idx, gather_pos};
+    if (return_offset) {
+        out.push_back(offset_in_chunk);
+    }
+    return out;
 }
 """
 
@@ -835,25 +983,38 @@ def _has_python_headers() -> bool:
     return bool(inc) and (Path(inc) / "Python.h").is_file()
 
 
-@lru_cache(maxsize=1)
+_SWA_EXT_UNSET = object()
+_SWA_EXT_CACHE: object = _SWA_EXT_UNSET
+
+
 def _load_swa_chunker_cuda_ext():
-    global _CUDA_BUILD_ERROR
+    global _CUDA_BUILD_ERROR, _SWA_EXT_CACHE
+    if _SWA_EXT_CACHE is not _SWA_EXT_UNSET:
+        return _SWA_EXT_CACHE
     if not torch.cuda.is_available():
         _CUDA_BUILD_ERROR = "CUDA device unavailable"
+        _SWA_EXT_CACHE = None
         return None
-    if shutil.which("nvcc") is None:
-        _CUDA_BUILD_ERROR = "nvcc not found in PATH"
+    env_info = prepare_cuda_build_env()
+    if env_info["nvcc_path"] is None:
+        _CUDA_BUILD_ERROR = "nvcc not found in PATH or CUDA/pip directories"
+        _SWA_EXT_CACHE = None
+        return None
+    if sys.platform == "win32" and env_info["cxx_path"] is None:
+        _CUDA_BUILD_ERROR = "MSVC cl.exe not found (Visual Studio Build Tools missing)"
+        _SWA_EXT_CACHE = None
         return None
     if not _has_python_headers():
         _CUDA_BUILD_ERROR = "Python.h dev headers missing"
+        _SWA_EXT_CACHE = None
         return None
     try:
         from torch.utils.cpp_extension import load_inline
 
-        build_dir = Path(tempfile.gettempdir()) / "calcite5_fast_swa_chunker_cuda_v1"
+        build_dir = Path(tempfile.gettempdir()) / "calcite5_fast_swa_chunker_cuda_v2"
         build_dir.mkdir(parents=True, exist_ok=True)
         mod = load_inline(
-            name="calcite5_fast_swa_chunker_cuda_ext_v1",
+            name="calcite5_fast_swa_chunker_cuda_ext_v2",
             cpp_sources=[_CUDA_CPP_SOURCE],
             cuda_sources=[_CUDA_KERNEL_SOURCE],
             functions=[
@@ -861,16 +1022,20 @@ def _load_swa_chunker_cuda_ext():
                 "swa_rope_attn_bwd_cuda",
                 "utf8_span_and_compact_cuda",
             ],
-            extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_cflags=list(env_info["extra_cflags"]),
+            extra_cuda_cflags=list(env_info["extra_cuda_cflags"]),
+            extra_ldflags=list(env_info["extra_ldflags"]) or None,
+            extra_include_paths=list(env_info["include_paths"]) or None,
             build_directory=str(build_dir),
             with_cuda=True,
             verbose=False,
         )
         _CUDA_BUILD_ERROR = None
+        _SWA_EXT_CACHE = mod
         return mod
     except Exception as exc:
         _CUDA_BUILD_ERROR = f"{type(exc).__name__}: {exc}"
+        _SWA_EXT_CACHE = None
         return None
 
 
@@ -909,14 +1074,14 @@ def _compute_rope_tables(
     base: float,
     inv_freq: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    with torch.no_grad():
+    with torch.inference_mode(False), torch.no_grad():
         if inv_freq is None:
             inv_f = 1.0 / (
                 float(base)
                 ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / float(head_dim))
             )
         else:
-            inv_f = inv_freq.detach().to(device=device, dtype=torch.float32)
+            inv_f = inv_freq.detach().to(device=device, dtype=torch.float32).clone()
         t = torch.arange(length, device=device, dtype=torch.float32)
         freqs = torch.outer(t, inv_f)
         cos = torch.cos(freqs).to(dtype).contiguous()
@@ -935,13 +1100,14 @@ def get_cached_rope_cos_sin(
     """
     Returns cached `(cos, sin)` of shape `(seq_len, head_dim // 2)` on `(device, dtype)`
     via zero-copy prefix slices from a pre-allocated table (`>= 2048`).
-    `torch.compile(..., dynamic=True)` safe: never caches `FakeTensor`s while tracing.
+    `torch.compile(..., dynamic=True)` and `torch.inference_mode()` safe: never caches
+    `FakeTensor`s while tracing or inference-mode tensors across eval/train boundaries.
     """
     compiling = _is_compiling()
     if inv_freq is None:
         key = (device.type, device.index, dtype, int(head_dim), float(base))
         cached = _ROPE_TABLE_CACHE.get(key)
-        if cached is not None and cached[0].size(0) >= seq_len:
+        if cached is not None and (not cached[0].is_inference()) and cached[0].size(0) >= seq_len:
             return cached[0][:seq_len], cached[1][:seq_len]
         if compiling:
             return _compute_rope_tables(seq_len, device, dtype, int(head_dim), float(base), None)
@@ -952,7 +1118,12 @@ def get_cached_rope_cos_sin(
 
     ckey = (id(inv_freq), device.type, device.index, dtype)
     ccached = _CUSTOM_ROPE_CACHE.get(ckey)
-    if ccached is not None and ccached[0]() is inv_freq and ccached[1].size(0) >= seq_len:
+    if (
+        ccached is not None
+        and ccached[0]() is inv_freq
+        and (not ccached[1].is_inference())
+        and ccached[1].size(0) >= seq_len
+    ):
         return ccached[1][:seq_len], ccached[2][:seq_len]
     if compiling:
         return _compute_rope_tables(seq_len, device, dtype, int(inv_freq.numel() * 2), float(base), inv_freq)
@@ -1113,8 +1284,8 @@ def _swa_fwd_dispatch(
         qkv.is_cuda
         and qkv.dim() == 5
         and qkv.size(2) == 3
-        and qkv.size(4) == 64
-        and 1 <= W <= 16
+        and qkv.size(4) in (32, 64)
+        and 1 <= W <= 32
         and qkv.dtype in (torch.bfloat16, torch.float32, torch.float16)
     ):
         ext = _load_swa_chunker_cuda_ext()
@@ -1138,8 +1309,8 @@ def _swa_bwd_dispatch(
         qkv.is_cuda
         and qkv.dim() == 5
         and qkv.size(2) == 3
-        and qkv.size(4) == 64
-        and 1 <= W <= 16
+        and qkv.size(4) in (32, 64)
+        and 1 <= W <= 32
         and qkv.dtype in (torch.bfloat16, torch.float32, torch.float16)
     ):
         ext = _load_swa_chunker_cuda_ext()
@@ -1251,14 +1422,14 @@ def fast_swa_rope_attn_cuda(
     window_size: int,
 ) -> torch.Tensor:
     """
-    Fused local sliding-window RoPE attention (`O(T * W)` SMEM CUDA kernel for `W <= 16`,
-    `head_dim == 64`, `BF16/FP16/FP32`, with exact analytical backward and CPU/PyTorch fallback).
+    Fused local sliding-window RoPE attention (`O(T * W)` SMEM CUDA kernel for `1 <= W <= 32`,
+    `head_dim in {32, 64}`, `BF16/FP16/FP32`, with exact analytical backward and CPU/PyTorch fallback).
 
     Args:
         qkv: `(B, T, 3, H, D)` packed Q/K/V tensor (e.g. `self.qkv(x).view(B, T, 3, H, D)`).
         cos: `(T, D//2)` or `(1, 1, T, D//2)` cosine RoPE table.
         sin: `(T, D//2)` or `(1, 1, T, D//2)` sine RoPE table.
-        window_size: Causal sliding window span `W >= 1` (`1 <= W <= 16` uses fused CUDA kernel).
+        window_size: Causal sliding window span `W >= 1` (`1 <= W <= 32` uses fused CUDA kernel).
 
     Returns:
         `out`: `(B, T, H, D)` attention output in `qkv.dtype`.
@@ -1399,7 +1570,20 @@ def _compact_b_mask_zero_argsort_pytorch(
     return chunk_counts, slot_idx, gather_pos
 
 
-def _utf8_span_and_compact_full(
+def _compute_offset_in_chunk_pytorch(
+    b_mask: torch.Tensor, max_byte_span: int
+) -> torch.Tensor:
+    """Strictly causal byte offset `0..max_byte_span` since the most recent boundary fire."""
+    B, T = b_mask.shape
+    if B == 0 or T == 0:
+        return torch.empty((B, T), device=b_mask.device, dtype=torch.long)
+    t_idx = torch.arange(T, device=b_mask.device, dtype=torch.long).unsqueeze(0).expand(B, T)
+    fire_pos = torch.where(b_mask, t_idx, torch.zeros_like(t_idx))
+    last_fire, _ = torch.cummax(fire_pos, dim=1)
+    return (t_idx - last_fire).clamp(0, max(0, int(max_byte_span)))
+
+
+def _utf8_span_and_compact_dispatch(
     token_ids: torch.Tensor,
     p_prob: torch.Tensor,
     pad_token_id: int,
@@ -1410,6 +1594,7 @@ def _utf8_span_and_compact_full(
     burst_int: int,
     m_cap: int,
     return_masks: bool,
+    return_offset: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     if token_ids.is_cuda:
         ext = _load_swa_chunker_cuda_ext()
@@ -1425,6 +1610,7 @@ def _utf8_span_and_compact_full(
                 int(burst_int),
                 int(m_cap),
                 bool(return_masks),
+                bool(return_offset),
             )
             return tuple(res)
 
@@ -1455,9 +1641,234 @@ def _utf8_span_and_compact_full(
         int(burst_int),
     )
     chunk_counts, slot_idx, gather_pos = _compact_b_mask_zero_argsort_pytorch(b_mask, int(m_cap))
+    out_list: list[torch.Tensor] = [b_mask, chunk_counts, slot_idx, gather_pos]
     if return_masks:
-        return b_mask, chunk_counts, slot_idx, gather_pos, valid_mask, is_lead_b
-    return b_mask, chunk_counts, slot_idx, gather_pos
+        out_list.extend((valid_mask, is_lead_b))
+    if return_offset:
+        out_list.append(_compute_offset_in_chunk_pytorch(b_mask, int(max_byte_span)))
+    return tuple(out_list)
+
+
+if _HAS_CUSTOM_OP:
+
+    @torch.library.custom_op("calcite_swa::utf8_span_and_compact", mutates_args=())
+    def _utf8_span_and_compact_op(
+        token_ids: torch.Tensor,
+        p_prob: torch.Tensor,
+        pad_token_id: int,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+        m_cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        res = _utf8_span_and_compact_dispatch(
+            token_ids,
+            p_prob,
+            pad_token_id,
+            max_cp_span,
+            max_byte_span,
+            refill_int,
+            cost_int,
+            burst_int,
+            m_cap,
+            return_masks=False,
+            return_offset=False,
+        )
+        return res[0], res[1], res[2], res[3]
+
+    @_utf8_span_and_compact_op.register_fake
+    def _utf8_span_and_compact_fake(
+        token_ids: torch.Tensor,
+        p_prob: torch.Tensor,
+        pad_token_id: int,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+        m_cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del p_prob, pad_token_id, max_cp_span, max_byte_span, refill_int, cost_int, burst_int
+        B, T = token_ids.shape
+        M_max = m_cap if m_cap > 0 else T
+        dev = token_ids.device
+        return (
+            torch.empty((B, T), device=dev, dtype=torch.bool),
+            torch.empty((B,), device=dev, dtype=torch.long),
+            torch.empty((B, T), device=dev, dtype=torch.long),
+            torch.empty((B, M_max), device=dev, dtype=torch.long),
+        )
+
+    @torch.library.custom_op("calcite_swa::utf8_span_compact_offset", mutates_args=())
+    def _utf8_span_compact_offset_op(
+        token_ids: torch.Tensor,
+        p_prob: torch.Tensor,
+        pad_token_id: int,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+        m_cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        res = _utf8_span_and_compact_dispatch(
+            token_ids,
+            p_prob,
+            pad_token_id,
+            max_cp_span,
+            max_byte_span,
+            refill_int,
+            cost_int,
+            burst_int,
+            m_cap,
+            return_masks=False,
+            return_offset=True,
+        )
+        return res[0], res[1], res[2], res[3], res[4]
+
+    @_utf8_span_compact_offset_op.register_fake
+    def _utf8_span_compact_offset_fake(
+        token_ids: torch.Tensor,
+        p_prob: torch.Tensor,
+        pad_token_id: int,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+        m_cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del p_prob, pad_token_id, max_cp_span, max_byte_span, refill_int, cost_int, burst_int
+        B, T = token_ids.shape
+        M_max = m_cap if m_cap > 0 else T
+        dev = token_ids.device
+        return (
+            torch.empty((B, T), device=dev, dtype=torch.bool),
+            torch.empty((B,), device=dev, dtype=torch.long),
+            torch.empty((B, T), device=dev, dtype=torch.long),
+            torch.empty((B, M_max), device=dev, dtype=torch.long),
+            torch.empty((B, T), device=dev, dtype=torch.long),
+        )
+
+    @torch.library.custom_op("calcite_swa::utf8_span_compact_masks", mutates_args=())
+    def _utf8_span_compact_masks_op(
+        token_ids: torch.Tensor,
+        p_prob: torch.Tensor,
+        pad_token_id: int,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+        m_cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        res = _utf8_span_and_compact_dispatch(
+            token_ids,
+            p_prob,
+            pad_token_id,
+            max_cp_span,
+            max_byte_span,
+            refill_int,
+            cost_int,
+            burst_int,
+            m_cap,
+            return_masks=True,
+            return_offset=False,
+        )
+        return res[0], res[1], res[2], res[3], res[4], res[5]
+
+    @_utf8_span_compact_masks_op.register_fake
+    def _utf8_span_compact_masks_fake(
+        token_ids: torch.Tensor,
+        p_prob: torch.Tensor,
+        pad_token_id: int,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+        m_cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del p_prob, pad_token_id, max_cp_span, max_byte_span, refill_int, cost_int, burst_int
+        B, T = token_ids.shape
+        M_max = m_cap if m_cap > 0 else T
+        dev = token_ids.device
+        return (
+            torch.empty((B, T), device=dev, dtype=torch.bool),
+            torch.empty((B,), device=dev, dtype=torch.long),
+            torch.empty((B, T), device=dev, dtype=torch.long),
+            torch.empty((B, M_max), device=dev, dtype=torch.long),
+            torch.empty((B, T), device=dev, dtype=torch.bool),
+            torch.empty((B, T), device=dev, dtype=torch.bool),
+        )
+
+
+def _utf8_span_and_compact_full(
+    token_ids: torch.Tensor,
+    p_prob: torch.Tensor,
+    pad_token_id: int,
+    max_cp_span: int,
+    max_byte_span: int,
+    refill_int: int,
+    cost_int: int,
+    burst_int: int,
+    m_cap: int,
+    return_masks: bool,
+    return_offset: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    p_det = p_prob.detach()
+    if _HAS_CUSTOM_OP:
+        if return_masks and not return_offset:
+            return _utf8_span_compact_masks_op(
+                token_ids,
+                p_det,
+                int(pad_token_id),
+                int(max_cp_span),
+                int(max_byte_span),
+                int(refill_int),
+                int(cost_int),
+                int(burst_int),
+                int(m_cap),
+            )
+        if return_offset and not return_masks:
+            return _utf8_span_compact_offset_op(
+                token_ids,
+                p_det,
+                int(pad_token_id),
+                int(max_cp_span),
+                int(max_byte_span),
+                int(refill_int),
+                int(cost_int),
+                int(burst_int),
+                int(m_cap),
+            )
+        if not return_masks and not return_offset:
+            return _utf8_span_and_compact_op(
+                token_ids,
+                p_det,
+                int(pad_token_id),
+                int(max_cp_span),
+                int(max_byte_span),
+                int(refill_int),
+                int(cost_int),
+                int(burst_int),
+                int(m_cap),
+            )
+    return _utf8_span_and_compact_dispatch(
+        token_ids,
+        p_det,
+        int(pad_token_id),
+        int(max_cp_span),
+        int(max_byte_span),
+        int(refill_int),
+        int(cost_int),
+        int(burst_int),
+        int(m_cap),
+        return_masks=return_masks,
+        return_offset=return_offset,
+    )
 
 
 def utf8_span_and_compact_cuda(
@@ -1494,8 +1905,49 @@ def utf8_span_and_compact_cuda(
         int(burst_int),
         resolved_cap,
         return_masks=False,
+        return_offset=False,
     )
     return b_mask, chunk_counts, slot_idx, gather_pos
+
+
+def utf8_span_compact_and_offset_cuda(
+    token_ids: torch.Tensor,
+    p_prob: torch.Tensor,
+    pad_token_id: int = 0,
+    max_cp_span: int = 10,
+    max_byte_span: int = 16,
+    refill_int: int = 3,
+    cost_int: int = 10,
+    burst_int: int = 250,
+    m_cap: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Single-pass UTF-8 boundary guard + compaction + causal `offset_in_chunk` (`0..max_byte_span`)
+    emitted directly from registers with ZERO `argsort` and ZERO `cummax`.
+    Returns `(b_mask, chunk_counts, slot_idx, gather_pos, offset_in_chunk)`.
+    """
+    T = int(token_ids.size(1))
+    resolved_cap = (
+        int(m_cap)
+        if m_cap is not None
+        else _compute_utf8_static_m_cap(
+            T, max_cp_span, max_byte_span, refill_int, cost_int, burst_int
+        )
+    )
+    b_mask, chunk_counts, slot_idx, gather_pos, offset_in_chunk = _utf8_span_and_compact_full(
+        token_ids,
+        p_prob,
+        int(pad_token_id),
+        int(max_cp_span),
+        int(max_byte_span),
+        int(refill_int),
+        int(cost_int),
+        int(burst_int),
+        resolved_cap,
+        return_masks=False,
+        return_offset=True,
+    )
+    return b_mask, chunk_counts, slot_idx, gather_pos, offset_in_chunk
 
 
 def _fast_locked_r_lin(lin: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -1718,10 +2170,14 @@ def patch_fast_chunker(model: nn.Module, enabled: bool = True) -> int:
 
 
 def get_fast_swa_chunker_backend_info() -> dict[str, object]:
+    env_info = prepare_cuda_build_env()
     ext = _load_swa_chunker_cuda_ext()
     return {
         "cuda_available": bool(torch.cuda.is_available()),
-        "nvcc_found": shutil.which("nvcc") is not None,
+        "nvcc_found": env_info["nvcc_path"] is not None,
+        "nvcc_path": env_info["nvcc_path"],
+        "cxx_path": env_info["cxx_path"],
+        "cuda_home": env_info["cuda_home"],
         "cuda_ext_available": ext is not None,
         "cuda_build_error": _CUDA_BUILD_ERROR,
         "custom_op_registered": _HAS_CUSTOM_OP,
@@ -1736,4 +2192,5 @@ __all__ = [
     "patch_fast_chunker",
     "patch_fast_swa_attention",
     "utf8_span_and_compact_cuda",
+    "utf8_span_compact_and_offset_cuda",
 ]

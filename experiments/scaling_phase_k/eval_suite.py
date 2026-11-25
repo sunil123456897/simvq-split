@@ -12,11 +12,16 @@ Evaluates all architectures on identical byte streams (`vocab_size = 259`):
 from __future__ import annotations
 
 import copy
+import ctypes
 import math
+import os
 from pathlib import Path
+import queue
 import statistics
+import sys
+import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -77,8 +82,235 @@ def is_lut_model(model: nn.Module) -> bool:
     return any(isinstance(m, PackedLUT2BitLinear) for m in model.modules())
 
 
+def _available_ram_mb() -> Optional[float]:
+    """Returns currently available host RAM in MiB, or `None` if unavailable."""
+    if sys.platform == "win32":
+        try:
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return float(st.ullAvailPhys) / (1024.0 * 1024.0)
+        except Exception:
+            return None
+    elif os.path.isfile("/proc/meminfo"):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return float(line.split()[1]) / 1024.0
+        except Exception:
+            return None
+    return None
+
+
+def load_utf8_corpus_array(
+    path: Union[Path, str],
+    max_ram_mb: int = 2048,
+    headroom_mb: int = 1024,
+) -> np.ndarray:
+    """
+    Loads a `uint16` UTF-8 corpus binary into RAM via sequential `np.fromfile` when the
+    file fits within `max_ram_mb` and host RAM has `>= headroom_mb` free, eliminating
+    random-seek HDD `np.memmap` stalls (`~960 ms -> 0.08 ms/batch`). Falls back cleanly
+    to read-only `np.memmap` when memory is constrained.
+    """
+    p = Path(path)
+    size_mb = float(p.stat().st_size) / (1024.0 * 1024.0)
+    avail_mb = _available_ram_mb()
+    fits_limit = size_mb <= float(max_ram_mb)
+    fits_host = (avail_mb is None) or (avail_mb >= size_mb + float(headroom_mb))
+    if fits_limit and fits_host:
+        return np.fromfile(str(p), dtype=np.uint16)
+    return np.memmap(str(p), dtype=np.uint16, mode="r")
+
+
+def encode_utf8_fast_np(
+    tok: ByteBPETokenizer,
+    text: str,
+    add_bos: bool = False,
+    add_eos: bool = False,
+) -> np.ndarray:
+    """Fast raw-UTF8 byte encoding (`merges=[]`) returning `np.int64` without Python byte loops."""
+    if getattr(tok, "merges", None):
+        return np.asarray(tok.encode(text, add_bos=add_bos, add_eos=add_eos), dtype=np.int64)
+    raw = text.encode("utf-8")
+    byte_off = int(getattr(tok, "BYTE_OFFSET", 3))
+    n = len(raw)
+    total = n + int(add_bos) + int(add_eos)
+    out = np.empty(total, dtype=np.int64)
+    pos = 0
+    if add_bos:
+        out[0] = int(tok.BOS_ID)
+        pos = 1
+    if n > 0:
+        out[pos : pos + n] = np.frombuffer(raw, dtype=np.uint8).astype(np.int64) + byte_off
+        pos += n
+    if add_eos:
+        out[pos] = int(tok.EOS_ID)
+    return out
+
+
+def encode_utf8_fast(
+    tok: ByteBPETokenizer,
+    text: str,
+    add_bos: bool = False,
+    add_eos: bool = False,
+) -> List[int]:
+    """Drop-in fast equivalent of `ByteBPETokenizer.encode` for raw-UTF8 (`merges=[]`) tokenizers."""
+    if getattr(tok, "merges", None):
+        return tok.encode(text, add_bos=add_bos, add_eos=add_eos)
+    return encode_utf8_fast_np(tok, text, add_bos=add_bos, add_eos=add_eos).tolist()
+
+
+def _pin_tree(obj: Any) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.pin_memory() if obj.device.type == "cpu" else obj
+    if isinstance(obj, tuple):
+        return tuple(_pin_tree(x) for x in obj)
+    if isinstance(obj, list):
+        return [_pin_tree(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _pin_tree(v) for k, v in obj.items()}
+    return obj
+
+
+def _to_device_non_blocking(obj: Any, device: str) -> Any:
+    if isinstance(obj, torch.Tensor):
+        if str(obj.device) == device:
+            return obj
+        return obj.to(device=device, non_blocking=(device == "cuda"))
+    if isinstance(obj, tuple):
+        return tuple(_to_device_non_blocking(x, device) for x in obj)
+    if isinstance(obj, list):
+        return [_to_device_non_blocking(x, device) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_device_non_blocking(v, device) for k, v in obj.items()}
+    return obj
+
+
+class BatchPrefetcher:
+    """
+    Single-worker background CPU batch prefetcher with `pin_memory()` and async
+    `non_blocking=True` H2D transfer on the consumer (main) thread.
+
+    Preserves exact deterministic step order of `sample_fn()` and shuts down cleanly
+    as a context manager without leaking daemon threads.
+    """
+
+    def __init__(
+        self,
+        sample_fn: Callable[[], Any],
+        device: str,
+        total_steps: Optional[int] = None,
+        prefetch_depth: int = 4,
+        enabled: bool = True,
+    ):
+        self._sample_fn = sample_fn
+        self._device = device
+        self._total_steps = total_steps
+        self._pin = bool(device == "cuda" and has_usable_cuda())
+        self._enabled = bool(enabled and prefetch_depth > 0)
+        self._produced = 0
+        self._stop = threading.Event()
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(prefetch_depth)))
+        self._sentinel = object()
+        self._thread: Optional[threading.Thread] = None
+        self._closed = False
+        if self._enabled:
+            self._thread = threading.Thread(
+                target=self._worker,
+                name="calcite-batch-prefetcher",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _worker(self) -> None:
+        try:
+            step = 0
+            while not self._stop.is_set():
+                if self._total_steps is not None and step >= self._total_steps:
+                    break
+                item = self._sample_fn()
+                if self._pin:
+                    item = _pin_tree(item)
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put(("ok", item), timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+                step += 1
+        except BaseException as exc:
+            try:
+                self._queue.put(("err", exc), timeout=1.0)
+            except queue.Full:
+                pass
+        finally:
+            try:
+                self._queue.put(("end", self._sentinel), timeout=0.5)
+            except queue.Full:
+                pass
+
+    def next_batch(self) -> Any:
+        if not self._enabled:
+            if self._total_steps is not None and self._produced >= self._total_steps:
+                raise StopIteration
+            self._produced += 1
+            item = self._sample_fn()
+            if self._pin:
+                item = _pin_tree(item)
+            return _to_device_non_blocking(item, self._device)
+
+        kind, payload = self._queue.get()
+        if kind == "err":
+            self.close()
+            raise payload
+        if kind == "end":
+            self.close()
+            raise StopIteration
+        return _to_device_non_blocking(payload, self._device)
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
+
+    def __next__(self) -> Any:
+        return self.next_batch()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def __enter__(self) -> "BatchPrefetcher":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
 def sample_memmap_batch(
-    mm: np.memmap,
+    mm: np.ndarray,
     batch_size: int,
     seq_len: int,
     rng: np.random.Generator,
@@ -97,7 +329,11 @@ def sample_memmap_batch(
             else:
                 break
         rows[r_idx] = mm[s : s + seq_len + 1]
-    t = torch.from_numpy(rows).to(device=device, dtype=torch.long)
+    t = torch.from_numpy(rows)
+    if device == "cuda" and has_usable_cuda():
+        t = t.pin_memory().to(device=device, non_blocking=True)
+    elif device != "cpu":
+        t = t.to(device=device)
     return t[:, :-1], t[:, 1:]
 
 
@@ -194,10 +430,10 @@ def check_gate2_block_std_parity(model_fp: nn.Module, device: str) -> Dict[str, 
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_val_memmap_bpb(
     model: nn.Module,
-    val_mm: np.memmap,
+    val_mm: np.ndarray,
     seq_len: int,
     n_batches: int,
     batch_size: int,
@@ -207,64 +443,70 @@ def eval_val_memmap_bpb(
     if hasattr(model, "set_snap_alpha"):
         model.set_snap_alpha(1.0)
     rng = np.random.default_rng(42)
-    nlls: List[float] = []
+    nlls: List[torch.Tensor] = []
     use_amp = (device == "cuda") and has_usable_cuda() and (not is_lut_model(model))
     for _ in range(n_batches):
         xb, yb = sample_memmap_batch(val_mm, batch_size, seq_len, rng, device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             lg = model(xb)
         ce = F.cross_entropy(lg.float().transpose(1, 2), yb, ignore_index=0)
-        nlls.append(float(ce.item()))
-    return round(float(statistics.mean(nlls)) / math.log(2.0), 4)
+        nlls.append(ce.detach())
+    mean_nll = float(torch.stack(nlls).mean().item())
+    return round(mean_nll / math.log(2.0), 4)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_length_extrapolation_bpb(
     model: nn.Module,
-    val_mm: np.memmap,
+    val_mm: np.ndarray,
     device: str,
     l_in: int = 512,
     l_ood: int = 2048,
     n_batches: int = 16,
     batch_size_ood: int = 4,
+    reuse_l_in_bpb: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Evaluates in-distribution `L = l_in` BPB vs `4x` OOD `L = l_ood` BPB, splitting
     OOD positions into head `[0..l_in)` and tail `[l_ood//2..l_ood)` to expose RoPE collapse.
+    Pass `reuse_l_in_bpb` to reuse a freshly computed `L = l_in` validation BPB cleanly.
     """
     model.eval()
     if hasattr(model, "set_snap_alpha"):
         model.set_snap_alpha(1.0)
     use_amp = (device == "cuda") and has_usable_cuda() and (not is_lut_model(model))
+    inv_ln2 = 1.0 / math.log(2.0)
 
-    rng_in = np.random.default_rng(142)
-    in_nlls: List[float] = []
-    for _ in range(n_batches):
-        xb, yb = sample_memmap_batch(val_mm, max(4, batch_size_ood * 2), l_in, rng_in, device)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            lg = model(xb)
-        ce = F.cross_entropy(lg.float().transpose(1, 2), yb, ignore_index=0)
-        in_nlls.append(float(ce.item()))
+    if reuse_l_in_bpb is not None:
+        bpb_in = float(reuse_l_in_bpb)
+    else:
+        rng_in = np.random.default_rng(142)
+        in_nlls: List[torch.Tensor] = []
+        for _ in range(n_batches):
+            xb, yb = sample_memmap_batch(val_mm, max(4, batch_size_ood * 2), l_in, rng_in, device)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                lg = model(xb)
+            ce = F.cross_entropy(lg.float().transpose(1, 2), yb, ignore_index=0)
+            in_nlls.append(ce.detach())
+        bpb_in = float(torch.stack(in_nlls).mean().item()) * inv_ln2
 
     rng_ood = np.random.default_rng(242)
-    ood_all_nlls: List[float] = []
-    ood_head_nlls: List[float] = []
-    ood_tail_nlls: List[float] = []
+    ood_all_nlls: List[torch.Tensor] = []
+    ood_head_nlls: List[torch.Tensor] = []
+    ood_tail_nlls: List[torch.Tensor] = []
     tail_start = l_ood // 2
     for _ in range(n_batches):
         xb, yb = sample_memmap_batch(val_mm, batch_size_ood, l_ood, rng_ood, device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             lg = model(xb)
         tok_nll = F.cross_entropy(lg.float().transpose(1, 2), yb, ignore_index=0, reduction="none")
-        ood_all_nlls.append(float(tok_nll.mean().item()))
-        ood_head_nlls.append(float(tok_nll[:, :l_in].mean().item()))
-        ood_tail_nlls.append(float(tok_nll[:, tail_start:].mean().item()))
+        ood_all_nlls.append(tok_nll.mean().detach())
+        ood_head_nlls.append(tok_nll[:, :l_in].mean().detach())
+        ood_tail_nlls.append(tok_nll[:, tail_start:].mean().detach())
 
-    inv_ln2 = 1.0 / math.log(2.0)
-    bpb_in = float(statistics.mean(in_nlls)) * inv_ln2
-    bpb_ood = float(statistics.mean(ood_all_nlls)) * inv_ln2
-    bpb_head = float(statistics.mean(ood_head_nlls)) * inv_ln2
-    bpb_tail = float(statistics.mean(ood_tail_nlls)) * inv_ln2
+    bpb_ood = float(torch.stack(ood_all_nlls).mean().item()) * inv_ln2
+    bpb_head = float(torch.stack(ood_head_nlls).mean().item()) * inv_ln2
+    bpb_tail = float(torch.stack(ood_tail_nlls).mean().item()) * inv_ln2
     return {
         f"bpb_L{l_in}": round(bpb_in, 4),
         f"bpb_L{l_ood}": round(bpb_ood, 4),
@@ -275,14 +517,14 @@ def eval_length_extrapolation_bpb(
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_openweb_6domains_any_byte_lm(
     model: nn.Module,
     eval_wins: Dict[str, List[List[int]]],
     device: str,
     batch_size: int = 16,
 ) -> Dict[str, object]:
-    """Evaluates all 6 disjoint UTF-8 open-web domains for any byte-level LM."""
+    """Evaluates all 6 disjoint UTF-8 open-web domains for any byte-level LM (single-pass chunk capture)."""
     model.eval()
     if hasattr(model, "set_snap_alpha"):
         model.set_snap_alpha(1.0)
@@ -290,56 +532,79 @@ def eval_openweb_6domains_any_byte_lm(
     bc = getattr(model, "byte_chunker", None)
     regimes_out: Dict[str, Dict[str, object]] = {}
 
-    for r_name, wins in eval_wins.items():
-        x = torch.tensor([w[:-1] for w in wins], dtype=torch.long, device=device)
-        y = torch.tensor([w[1:] for w in wins], dtype=torch.long, device=device)
-        nlls: List[torch.Tensor] = []
-        bms: List[torch.Tensor] = []
-        vms: List[torch.Tensor] = []
-        for s in range(0, x.size(0), batch_size):
-            xb = x[s : s + batch_size]
-            yb = y[s : s + batch_size]
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                if bc is not None:
-                    _, _, ctx = bc.encode_to_chunks(model.tok_emb(xb), xb)
-                    bms.append(ctx.b_mask.cpu())
-                    vms.append(ctx.valid_mask.cpu())
-                lg = model(xb)
-            nll = F.cross_entropy(
-                lg.float().transpose(1, 2), yb, ignore_index=0, reduction="none"
-            ).mean(dim=1)
-            nlls.append(nll.cpu())
+    captured_ctx: List[Any] = []
+    orig_enc = None
+    if bc is not None and hasattr(bc, "encode_to_chunks"):
+        orig_enc = bc.encode_to_chunks
 
-        bpb = round(float(torch.cat(nlls).mean().item()) / math.log(2.0), 4)
-        if bc is not None and bms:
-            b_mask = torch.cat(bms, dim=0)
-            v_mask = torch.cat(vms, dim=0)
-            x_cpu = x.cpu()
-            is_byte = x_cpu >= 3
-            raw_v = (x_cpu - 3).clamp(min=0)
-            is_cont = is_byte & (torch.bitwise_and(raw_v, 0xC0) == 0x80)
-            is_cp = is_byte & (~is_cont)
-            n_bytes = int(is_byte.sum().item())
-            n_cps = int(is_cp.sum().item())
-            n_chunks = int(b_mask.sum().item())
-            b_int = b_mask[:, 1:] & v_mask[:, 1:]
-            n_int = int(b_int.sum().item())
-            n_mid = int((b_int & is_cont[:, 1:]).sum().item())
-            regimes_out[r_name] = {
-                "byte_bpb": bpb,
-                "bytes_per_chunk": round(n_bytes / max(1, n_chunks), 3),
-                "cp_per_chunk": round(n_cps / max(1, n_chunks), 3),
-                "mid_utf8_split_pct": round(100.0 * n_mid / max(1, n_int), 4),
-                "m_mean": round(float(b_mask.sum(dim=1).float().mean().item()), 1),
-                "m_max": int(b_mask.sum(dim=1).max().item()),
-            }
-        else:
-            regimes_out[r_name] = {
-                "byte_bpb": bpb,
-                "bytes_per_chunk": 1.0,
-                "cp_per_chunk": 1.0,
-                "mid_utf8_split_pct": 0.0,
-            }
+        def _capturing_enc(*args, **kwargs):
+            res = orig_enc(*args, **kwargs)
+            if isinstance(res, tuple) and len(res) >= 3:
+                captured_ctx.append(res[2])
+            return res
+
+        bc.encode_to_chunks = _capturing_enc
+
+    try:
+        for r_name, wins in eval_wins.items():
+            x_cpu = torch.tensor([w[:-1] for w in wins], dtype=torch.long)
+            y_cpu = torch.tensor([w[1:] for w in wins], dtype=torch.long)
+            x = x_cpu.to(device=device, non_blocking=(device == "cuda"))
+            y = y_cpu.to(device=device, non_blocking=(device == "cuda"))
+            nlls: List[torch.Tensor] = []
+            bms: List[torch.Tensor] = []
+            vms: List[torch.Tensor] = []
+            for s in range(0, x.size(0), batch_size):
+                xb = x[s : s + batch_size]
+                yb = y[s : s + batch_size]
+                if bc is not None:
+                    captured_ctx.clear()
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    lg = model(xb)
+                    if bc is not None and not captured_ctx and orig_enc is not None:
+                        _, _, ctx_fb = orig_enc(model.tok_emb(xb), xb)
+                        captured_ctx.append(ctx_fb)
+                if bc is not None and captured_ctx:
+                    ctx = captured_ctx[-1]
+                    bms.append(ctx.b_mask.detach().cpu())
+                    vms.append(ctx.valid_mask.detach().cpu())
+                nll = F.cross_entropy(
+                    lg.float().transpose(1, 2), yb, ignore_index=0, reduction="none"
+                ).mean(dim=1)
+                nlls.append(nll.detach().cpu())
+
+            bpb = round(float(torch.cat(nlls).mean().item()) / math.log(2.0), 4)
+            if bc is not None and bms:
+                b_mask = torch.cat(bms, dim=0)
+                v_mask = torch.cat(vms, dim=0)
+                is_byte = x_cpu >= 3
+                raw_v = (x_cpu - 3).clamp(min=0)
+                is_cont = is_byte & (torch.bitwise_and(raw_v, 0xC0) == 0x80)
+                is_cp = is_byte & (~is_cont)
+                n_bytes = int(is_byte.sum().item())
+                n_cps = int(is_cp.sum().item())
+                n_chunks = int(b_mask.sum().item())
+                b_int = b_mask[:, 1:] & v_mask[:, 1:]
+                n_int = int(b_int.sum().item())
+                n_mid = int((b_int & is_cont[:, 1:]).sum().item())
+                regimes_out[r_name] = {
+                    "byte_bpb": bpb,
+                    "bytes_per_chunk": round(n_bytes / max(1, n_chunks), 3),
+                    "cp_per_chunk": round(n_cps / max(1, n_chunks), 3),
+                    "mid_utf8_split_pct": round(100.0 * n_mid / max(1, n_int), 4),
+                    "m_mean": round(float(b_mask.sum(dim=1).float().mean().item()), 1),
+                    "m_max": int(b_mask.sum(dim=1).max().item()),
+                }
+            else:
+                regimes_out[r_name] = {
+                    "byte_bpb": bpb,
+                    "bytes_per_chunk": 1.0,
+                    "cp_per_chunk": 1.0,
+                    "mid_utf8_split_pct": 0.0,
+                }
+    finally:
+        if bc is not None and orig_enc is not None:
+            bc.encode_to_chunks = orig_enc
 
     return {
         "regimes": regimes_out,
@@ -350,7 +615,7 @@ def eval_openweb_6domains_any_byte_lm(
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_cognitive_suites_any_byte_lm(
     model: nn.Module,
     tok: ByteBPETokenizer,
@@ -406,7 +671,7 @@ def eval_cognitive_suites_any_byte_lm(
     return out
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def measure_infer_latency_ms(
     model: nn.Module,
     vocab_size: int,

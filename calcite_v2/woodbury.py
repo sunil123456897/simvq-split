@@ -28,8 +28,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kernels.fast_calcite_scans import fast_woodbury_forward
-from simvq_split.baselines import RMSNorm
 from simvq_split.quant_lut import PackedLUT2BitLinear, quantize_ternary_weights_ls
+
+from .norm import CalciteRMSNorm
 
 
 @dataclass
@@ -47,6 +48,8 @@ class WoodburyStreamState:
     buf_k: torch.Tensor       # (B, C, H, d_k)
     buf_k_epi: torch.Tensor   # (B, C, H, d_k)
     buf_pos: int
+    z3_ptr: int = 0           # circular write pointer for z_ring3 (chronological when 0)
+    latch_ptr: int = 0        # circular write pointer for sal/rw/epi rings (chronological when 0)
 
     def memory_bytes(self) -> int:
         b = max(1, int(self.z_cumsum.size(0)))
@@ -493,7 +496,7 @@ class CalciteV2WoodburyLayer(nn.Module):
         self.conf_slope = nn.Parameter(torch.full((self.H_epi,), 12.0))
         self.uncert_scale = nn.Parameter(torch.full((3 * self.H_epi,), 0.35))
 
-        self.out_norm = RMSNorm(self.total_dim)
+        self.out_norm = CalciteRMSNorm(self.total_dim)
         self.out_proj = nn.Linear(self.total_dim + 3 * self.H_epi, d_model, bias=False)
 
         self.last_epistemic_uncertainty: torch.Tensor | None = None
@@ -539,6 +542,14 @@ class CalciteV2WoodburyLayer(nn.Module):
         if self.qat_active_mix > 0.0 or isinstance(self.v_proj, PackedLUT2BitLinear):
             return 1.0
         w = self.v_proj.weight
+        # Avoid per-step GPU->CPU `.item()` sync during continuous FP training
+        if (
+            self.training
+            and self._tern_cache_key is not None
+            and self._tern_cache_val == 0.0
+            and int(w.data_ptr()) == self._tern_cache_key[0]
+        ):
+            return 0.0
         key = (int(w.data_ptr()), int(w._version))
         if self._tern_cache_key == key:
             return self._tern_cache_val
@@ -595,11 +606,17 @@ class CalciteV2WoodburyLayer(nn.Module):
         logits = sal_win + self.subj_lag_bias.float().view(1, 1, self.H_epi, K)
         att = F.softmax(logits, dim=-1)
 
-        rw_win = F.pad(phi_rw.reshape(B, T, self.epi_dim), (0, 0, K - 1, 0)).unfold(1, K, 1).view(B, T, self.H_epi, self.D, K)
-        latched_rw = self._safe_unit((rw_win * att.unsqueeze(3)).sum(dim=-1)).to(x.dtype)
-
-        epi_win = F.pad(phi_epi.reshape(B, T, self.epi_dim), (0, 0, K - 1, 0)).unfold(1, K, 1).view(B, T, self.H_epi, self.D, K)
-        latched_epi = self._safe_unit((epi_win * att.unsqueeze(3)).sum(dim=-1)).to(x.dtype)
+        # Fused single pad+unfold+matmul over `[phi_rw, phi_epi]` (avoids 2x 5D product materializations)
+        phi_both = torch.cat((phi_rw, phi_epi), dim=-1)  # (B, T, H_epi, 2*D)
+        both_win = (
+            F.pad(phi_both.reshape(B, T, self.epi_dim * 2), (0, 0, K - 1, 0))
+            .unfold(1, K, 1)
+            .view(B, T, self.H_epi, 2 * self.D, K)
+        )
+        both_agg = torch.matmul(both_win, att.unsqueeze(-1)).squeeze(-1)
+        rw_agg, epi_agg = both_agg.chunk(2, dim=-1)
+        latched_rw = self._safe_unit(rw_agg).to(x.dtype)
+        latched_epi = self._safe_unit(epi_agg).to(x.dtype)
         return latched_rw, latched_epi
 
     def forward(
@@ -654,7 +671,8 @@ class CalciteV2WoodburyLayer(nn.Module):
         v_tok = self.v_proj(x_chunks).view(B, M_len, C, self.H, self.D)
         v_seq = (v_tok * w_scores.to(x.dtype).unsqueeze(-1)).sum(dim=2)
 
-        z_head = (x_chunks.unsqueeze(3) * w_scores.to(x.dtype).unsqueeze(-1)).sum(dim=2).mean(dim=2)
+        # Lean z_head: algebraically identical to 5D `(B, M, C, H, D)` sum-then-mean, `H`x smaller
+        z_head = (x_chunks * w_scores.to(x.dtype).mean(dim=-1, keepdim=True)).sum(dim=2)
         if self.use_deltanet2_gates and self.erase_vec_proj is not None and self.write_vec_proj is not None and self.alpha_vec_proj is not None:
             e_vec = torch.sigmoid(self.erase_vec_proj(z_head)).view(B, M_len, self.H, self.D)
             w_vec = torch.sigmoid(self.write_vec_proj(z_head)).view(B, M_len, self.H, self.D)
@@ -881,6 +899,8 @@ class CalciteV2WoodburyLayer(nn.Module):
             buf_k=torch.zeros(batch_size, self.C, self.H, self.D, device=device, dtype=dtype),
             buf_k_epi=torch.zeros(batch_size, self.C, self.H, self.D, device=device, dtype=dtype),
             buf_pos=0,
+            z3_ptr=0,
+            latch_ptr=0,
         )
 
     @torch.no_grad()
@@ -910,12 +930,13 @@ class CalciteV2WoodburyLayer(nn.Module):
 
         if state.step_count == 1:
             state.z_ring3[:] = zc.unsqueeze(1).expand(B, 3, D_in)
+            state.z3_ptr = 0
+        zp = state.z3_ptr
         z0 = zc
-        z12 = state.z_ring3[:, 2] + state.z_ring3[:, 1]
-        z3 = state.z_ring3[:, 0] + 0.25 * state.z_ring3[:, 1]
-
-        state.z_ring3[:, :-1] = state.z_ring3[:, 1:].clone()
-        state.z_ring3[:, -1] = zc
+        z12 = state.z_ring3[:, (zp - 1) % 3] + state.z_ring3[:, (zp - 2) % 3]
+        z3 = state.z_ring3[:, zp] + 0.25 * state.z_ring3[:, (zp - 2) % 3]
+        state.z_ring3[:, zp] = zc
+        state.z3_ptr = (zp + 1) % 3
 
         sc_raw = math.sqrt(self.D)
         f1_r = self._safe_unit(self.f1_proj(z0).view(B, self.H_epi, self.D), sc_raw)
@@ -927,15 +948,26 @@ class CalciteV2WoodburyLayer(nn.Module):
 
         sal_t = self.subj_salience(x_t).float()  # (B, H_epi)
         if self.L_latch > 1:
-            sal_win = torch.cat([state.sal_ring, sal_t.unsqueeze(1)], dim=1).transpose(1, 2)  # (B, H_epi, K)
-            rw_win = torch.cat([state.rw_ring, phi_rw.unsqueeze(1)], dim=1).permute(0, 2, 3, 1)  # (B, H_epi, D, K)
-            epi_win = torch.cat([state.epi_ring, phi_epi.unsqueeze(1)], dim=1).permute(0, 2, 3, 1)
-            state.sal_ring[:, :-1] = state.sal_ring[:, 1:].clone()
-            state.sal_ring[:, -1] = sal_t
-            state.rw_ring[:, :-1] = state.rw_ring[:, 1:].clone()
-            state.rw_ring[:, -1] = phi_rw
-            state.epi_ring[:, :-1] = state.epi_ring[:, 1:].clone()
-            state.epi_ring[:, -1] = phi_epi
+            lp = state.latch_ptr
+            km1 = self.L_latch - 1
+            if lp == 0:
+                sal_win = torch.cat((state.sal_ring, sal_t.unsqueeze(1)), dim=1).transpose(1, 2)
+                rw_win = torch.cat((state.rw_ring, phi_rw.unsqueeze(1)), dim=1).permute(0, 2, 3, 1)
+                epi_win = torch.cat((state.epi_ring, phi_epi.unsqueeze(1)), dim=1).permute(0, 2, 3, 1)
+            else:
+                sal_win = torch.cat(
+                    (state.sal_ring[:, lp:], state.sal_ring[:, :lp], sal_t.unsqueeze(1)), dim=1
+                ).transpose(1, 2)
+                rw_win = torch.cat(
+                    (state.rw_ring[:, lp:], state.rw_ring[:, :lp], phi_rw.unsqueeze(1)), dim=1
+                ).permute(0, 2, 3, 1)
+                epi_win = torch.cat(
+                    (state.epi_ring[:, lp:], state.epi_ring[:, :lp], phi_epi.unsqueeze(1)), dim=1
+                ).permute(0, 2, 3, 1)
+            state.sal_ring[:, lp] = sal_t
+            state.rw_ring[:, lp] = phi_rw
+            state.epi_ring[:, lp] = phi_epi
+            state.latch_ptr = (lp + 1) % km1
         else:
             sal_win = sal_t.unsqueeze(-1)
             rw_win = phi_rw.unsqueeze(-1)
@@ -1004,7 +1036,7 @@ class CalciteV2WoodburyLayer(nn.Module):
             ket_h = self._safe_unit((state.buf_k_epi.float() * w_scores.unsqueeze(-1)).sum(dim=1))
             v_tok = self.v_proj(state.buf_x).view(B, self.C, self.H, self.D)
             vt_h = (v_tok.float() * w_scores.unsqueeze(-1)).sum(dim=1)
-            z_head = (state.buf_x.unsqueeze(2) * w_scores.to(dt).unsqueeze(-1)).sum(dim=1).mean(dim=1)
+            z_head = (state.buf_x * w_scores.to(dt).mean(dim=-1, keepdim=True)).sum(dim=1)
             if self.use_deltanet2_gates and self.erase_vec_proj is not None and self.write_vec_proj is not None and self.alpha_vec_proj is not None:
                 et_h = torch.sigmoid(self.erase_vec_proj(z_head)).float().view(B, self.H, self.D)
                 wt_h = torch.sigmoid(self.write_vec_proj(z_head)).float().view(B, self.H, self.D)
@@ -1109,13 +1141,8 @@ class CalciteV2WoodburyLayer(nn.Module):
             P_mid = 0.5 * (P_next + P_next.transpose(1, 2))
             if t_gate > 0.0:
                 rho_rec = ((1.0 - gt) * w_cov * 0.002 * t_gate).clamp(0.0, 0.002 * t_gate)
-                P0 = (
-                    torch.eye(self.D, device=x_t.device, dtype=torch.float32)
-                    .unsqueeze(0)
-                    .expand(BH_b, self.D, self.D)
-                    * self.inv_lam
-                )
-                P_new = (1.0 - rho_rec) * P_mid + rho_rec * P0
+                P_new = (1.0 - rho_rec) * P_mid
+                P_new.diagonal(dim1=-2, dim2=-1).add_(rho_rec.squeeze(-1) * self.inv_lam)
                 state.P_mat = 0.5 * (P_new + P_new.transpose(1, 2))
             else:
                 state.P_mat = P_mid

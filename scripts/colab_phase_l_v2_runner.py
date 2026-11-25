@@ -19,6 +19,7 @@ import argparse
 import copy
 from dataclasses import asdict
 import gc
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -50,15 +51,19 @@ from experiments.scaling_phase_k.byte_baselines import (  # noqa: E402
     compute_rope_cache_kb,
 )
 from experiments.scaling_phase_k.eval_suite import (  # noqa: E402
+    BatchPrefetcher,
+    encode_utf8_fast_np,
     eval_length_extrapolation_bpb,
     eval_openweb_6domains_any_byte_lm,
     eval_val_memmap_bpb,
     has_usable_cuda,
+    load_utf8_corpus_array,
     sample_memmap_batch,
     sync_if_cuda,
 )
 from run_simvq_split_benchmark import harmonic_mean  # noqa: E402
 from simvq_split.eval_utils import evaluate_suite_batched, wilson_ci_95  # noqa: E402
+import kernels.fast_calcite_scans as _fast_scans_mod  # noqa: E402
 from kernels.fast_calcite_scans import (  # noqa: E402
     clear_fast_qat_cache,
     unwrap_compiled_state_dict,
@@ -141,6 +146,31 @@ def ensure_phase_k_corpus(data_dir: Path) -> Tuple[Path, Path]:
 def build_eval_bundles(
     repo_root: Path, tok: ByteBPETokenizer, n_eval: int = 150, seq_len: int = 512
 ) -> Tuple[List[str], Dict[str, List[List[int]]], Dict[str, list], Dict[str, list], Dict[str, list]]:
+    use_cache = (n_eval >= 32) and (not getattr(tok, "merges", None))
+    cache_dir = repo_root / "data_cache"
+    cache_path = cache_dir / f"eval_bundle_cache_n{n_eval}_L{seq_len}.pt"
+    gsm_tr = repo_root / "benchmarks" / "gsm8k" / "train.jsonl"
+    gsm_te = repo_root / "benchmarks" / "gsm8k" / "test.jsonl"
+    fingerprint = (
+        gsm_tr.stat().st_size if gsm_tr.is_file() else 0,
+        gsm_te.stat().st_size if gsm_te.is_file() else 0,
+        int(n_eval),
+        int(seq_len),
+    )
+    if use_cache and cache_path.is_file():
+        try:
+            blob = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if blob.get("fingerprint") == fingerprint:
+                return (
+                    blob["tr_sents"],
+                    blob["eval_wins"],
+                    blob["s5_suites"],
+                    blob["ov_suites"],
+                    blob["trap_suites"],
+                )
+        except Exception:
+            pass
+
     tr_docs, te_docs, tr_sents, te_sents = load_gsm8k_corpora(repo_root)
     _, eval_wins, _, _ = build_disjoint_openweb_corpora(repo_root, tok, tr_docs, te_docs, seq_len=seq_len)
     s5_suites = {
@@ -158,6 +188,21 @@ def build_eval_bundles(
         "in_dist": build_eval_trap_suite(tok, te_sents, 4, 2, 2, n_eval, 5100),
         "ood_long": build_eval_trap_suite(tok, te_sents, 9, 5, 18, n_eval, 5300),
     }
+    if use_cache and cache_dir.is_dir():
+        try:
+            torch.save(
+                {
+                    "fingerprint": fingerprint,
+                    "tr_sents": tr_sents,
+                    "eval_wins": eval_wins,
+                    "s5_suites": s5_suites,
+                    "ov_suites": ov_suites,
+                    "trap_suites": trap_suites,
+                },
+                cache_path,
+            )
+        except OSError:
+            pass
     return tr_sents, eval_wins, s5_suites, ov_suites, trap_suites
 
 
@@ -187,21 +232,27 @@ def sample_cognitive_batch(
             prompt, ans, _ = make_overwrite_story(rng, rng.randint(4, 6), rng.randint(2, 3), tr_sents, rng.randint(2, 5))
         else:
             prompt, ans, _ = make_trap_overwrite_story(rng, rng.randint(4, 6), rng.randint(2, 3), tr_sents, rng.randint(2, 5))
-        p_ids = tok.encode(prompt)
-        a_ids = tok.encode(ans)
-        full = (p_ids + a_ids)[: seq_len + 1]
+        p_arr = encode_utf8_fast_np(tok, prompt)
+        a_arr = encode_utf8_fast_np(tok, ans)
+        full = np.concatenate((p_arr, a_arr))[: seq_len + 1]
         n = len(full) - 1
         if n <= 1:
             continue
         x_rows[bi, :n] = full[:-1]
         # Focus supervision on the answer span + last 25% of prompt so cognitive circuits sharpen fast
-        ans_start = max(0, len(p_ids) - 1)
+        ans_start = max(0, len(p_arr) - 1)
         if ans_start < n:
             y_rows[bi, ans_start:n] = full[ans_start + 1 : n + 1]
         else:
             y_rows[bi, :n] = full[1 : n + 1]
-    x_t = torch.from_numpy(x_rows).to(device=device, dtype=torch.long)
-    y_t = torch.from_numpy(y_rows).to(device=device, dtype=torch.long)
+    x_t = torch.from_numpy(x_rows)
+    y_t = torch.from_numpy(y_rows)
+    if device == "cuda" and has_usable_cuda():
+        x_t = x_t.pin_memory().to(device=device, non_blocking=True)
+        y_t = y_t.pin_memory().to(device=device, non_blocking=True)
+    elif device != "cpu":
+        x_t = x_t.to(device=device)
+        y_t = y_t.to(device=device)
     return x_t, y_t
 
 
@@ -270,20 +321,58 @@ def load_frozen_router_into(model: CalciteV2LM, router_state: Dict[str, torch.Te
     model.byte_chunker.lock_router(True)
 
 
-def compile_v2_swa_blocks(model: nn.Module) -> None:
-    """Compiles pure SWA blocks cleanly outside `calcite_v2/` on Linux CUDA (skips Windows without Triton)."""
-    if not torch.cuda.is_available() or sys.platform == "win32":
-        return
-    if isinstance(model, CalciteV2LM):
+def compile_v2_swa_blocks(model: nn.Module, mode: str = "default") -> bool:
+    """
+    Compiles `CalciteV2LM` SWA/chunker blocks cleanly outside `calcite_v2/` when CUDA + Triton
+    are available (including Windows with `triton-windows`). Prefers `compile_calcite_v2` from
+    `kernels.fast_calcite_scans` when exported. Returns `True` if compilation was applied.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if sys.platform == "win32" and importlib.util.find_spec("triton") is None:
+        return False
+    if not isinstance(model, CalciteV2LM):
+        return False
+    fn = getattr(_fast_scans_mod, "compile_calcite_v2", None)
+    if callable(fn):
+        try:
+            fn(model, mode=mode)
+            return True
+        except Exception as exc:
+            print(f"  [compile_v2_swa_blocks] compile_calcite_v2 fallback: {exc}", flush=True)
+    try:
         if model.swa_stages is not None:
             for stg in model.swa_stages:
                 for i in range(len(stg)):
-                    stg[i] = torch.compile(stg[i], dynamic=True)
+                    stg[i] = torch.compile(stg[i], mode=mode, dynamic=True)
         else:
             for i in range(len(model.cortex_pre)):
-                model.cortex_pre[i] = torch.compile(model.cortex_pre[i], dynamic=True)
+                model.cortex_pre[i] = torch.compile(model.cortex_pre[i], mode=mode, dynamic=True)
             for i in range(len(model.cortex_post)):
-                model.cortex_post[i] = torch.compile(model.cortex_post[i], dynamic=True)
+                model.cortex_post[i] = torch.compile(model.cortex_post[i], mode=mode, dynamic=True)
+        return True
+    except Exception as exc:
+        print(f"  [compile_v2_swa_blocks] skipped compile: {exc}", flush=True)
+        return False
+
+
+def inject_l2048_from_extrap(
+    long_res: Dict[str, object],
+    extrap_4x: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    """Reuses already-computed `extrap_4x` (`L=2048`) inside `long_context` to avoid duplicate eval."""
+    if extrap_4x and ("L_2048" not in long_res) and ("bpb_L2048" in extrap_4x):
+        out: Dict[str, object] = {
+            "L_2048": {
+                "bpb": float(extrap_4x["bpb_L2048"]),
+                "head_bpb": float(extrap_4x["bpb_L2048_head"]),
+                "tail_bpb": float(extrap_4x["bpb_L2048_tail"]),
+                "tail_minus_head": float(extrap_4x["tail_minus_head_bpb"]),
+            }
+        }
+        out.update(long_res)
+        return out
+    return long_res
 
 
 def build_optimizer_for_model(
@@ -346,6 +435,7 @@ def train_byte_lm(
         compile_v2_swa_blocks(model)
 
     opt = build_optimizer_for_model(model, base_lr=base_lr, weight_decay=weight_decay, device=device)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     rng_np = np.random.default_rng(seed)
     rng_py = random.Random(seed + 17)
 
@@ -360,65 +450,80 @@ def train_byte_lm(
     t0 = time.perf_counter()
     warmup = max(20, int(0.05 * total_steps))
     bytes_per_step = batch_size * seq_len
+    log_every = max(1, total_steps // 5)
 
-    for step in range(1, total_steps + 1):
-        model.train()
-        if is_calcite:
-            if keep_crystal_locked:
-                model.set_crystal_schedule(1, 1)
-                model.set_snap_alpha(1.0)
-            else:
-                model.set_crystal_schedule(step, total_steps)
-
-        if step <= warmup:
-            scale = float(step) / float(warmup)
-        else:
-            prog = float(step - warmup) / float(max(1, total_steps - warmup))
-            scale = (min_lr / base_lr) + 0.5 * (1.0 - min_lr / base_lr) * (1.0 + math.cos(math.pi * prog))
-        for pg in opt.param_groups:
-            pg["lr"] = base_lr * float(pg.get("lr_mult", 1.0)) * scale
-
-        opt.zero_grad(set_to_none=True)
-        step_loss = 0.0
+    def _sample_step_micros() -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        micros: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for _ in range(accum):
             if cog_prob > 0.0 and rng_py.random() < cog_prob:
-                xb, yb = sample_cognitive_batch(tok, tr_sents, mbs, seq_len, rng_py, device)
+                micros.append(sample_cognitive_batch(tok, tr_sents, mbs, seq_len, rng_py, "cpu"))
             else:
-                xb, yb = sample_memmap_batch(train_mm, mbs, seq_len, rng_np, device)
+                micros.append(sample_memmap_batch(train_mm, mbs, seq_len, rng_np, "cpu"))
+        return micros
 
-            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                logits = model(xb)
-                ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), yb.reshape(-1), ignore_index=-100)
-                loss = ce + (model.get_commitment_loss() if is_calcite else 0.0)
-            (loss / float(accum)).backward()
-            step_loss += float(ce.item()) / float(accum)
+    with BatchPrefetcher(
+        _sample_step_micros,
+        device=device,
+        total_steps=total_steps,
+        prefetch_depth=3,
+        enabled=(total_steps >= 4),
+    ) as prefetcher:
+        for step in range(1, total_steps + 1):
+            model.train()
+            if is_calcite:
+                if keep_crystal_locked:
+                    model.set_crystal_schedule(1, 1)
+                    model.set_snap_alpha(1.0)
+                else:
+                    model.set_crystal_schedule(step, total_steps)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+            if step <= warmup:
+                scale = float(step) / float(warmup)
+            else:
+                prog = float(step - warmup) / float(max(1, total_steps - warmup))
+                scale = (min_lr / base_lr) + 0.5 * (1.0 - min_lr / base_lr) * (1.0 + math.cos(math.pi * prog))
+            for pg in opt.param_groups:
+                pg["lr"] = base_lr * float(pg.get("lr_mult", 1.0)) * scale
 
-        if step in ckpt_set:
-            model.eval()
-            val_bpb = eval_val_memmap_bpb(model, val_mm, seq_len=min(512, seq_len), n_batches=16, batch_size=min(16, mbs), device=device)
-            d_curve.append(
-                {
-                    "step": int(step),
-                    "bytes_seen": int(step * bytes_per_step),
-                    "val_bpb": float(val_bpb),
-                    "elapsed_s": round(time.perf_counter() - t0, 1),
-                }
-            )
-            print(
-                f"  [{tag}] ckpt step={step}/{total_steps} | D={step*bytes_per_step/1e6:.1f}M B | "
-                f"val_bpb={val_bpb:.4f} | {time.perf_counter()-t0:.1f}s",
-                flush=True,
-            )
-        elif step % max(1, total_steps // 5) == 0 or step == total_steps:
-            elapsed = time.perf_counter() - t0
-            ms = 1000.0 * elapsed / step
-            print(
-                f"  [{tag}] step={step}/{total_steps} | ce={step_loss:.4f} | {ms:.1f} ms/step | {elapsed:.1f}s",
-                flush=True,
-            )
+            micros = prefetcher.next_batch()
+            opt.zero_grad(set_to_none=True)
+            step_loss_t: Optional[torch.Tensor] = None
+            for xb, yb in micros:
+                with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(xb)
+                    ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), yb.reshape(-1), ignore_index=-100)
+                    loss = ce + (model.get_commitment_loss() if is_calcite else 0.0)
+                (loss / float(accum)).backward()
+                ce_d = ce.detach()
+                step_loss_t = ce_d if step_loss_t is None else (step_loss_t + ce_d)
+
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            opt.step()
+
+            if step in ckpt_set:
+                model.eval()
+                val_bpb = eval_val_memmap_bpb(model, val_mm, seq_len=min(512, seq_len), n_batches=16, batch_size=min(16, mbs), device=device)
+                d_curve.append(
+                    {
+                        "step": int(step),
+                        "bytes_seen": int(step * bytes_per_step),
+                        "val_bpb": float(val_bpb),
+                        "elapsed_s": round(time.perf_counter() - t0, 1),
+                    }
+                )
+                print(
+                    f"  [{tag}] ckpt step={step}/{total_steps} | D={step*bytes_per_step/1e6:.1f}M B | "
+                    f"val_bpb={val_bpb:.4f} | {time.perf_counter()-t0:.1f}s",
+                    flush=True,
+                )
+            elif step % log_every == 0 or step == total_steps:
+                step_loss = float(step_loss_t.item()) / float(accum) if step_loss_t is not None else 0.0
+                elapsed = time.perf_counter() - t0
+                ms = 1000.0 * elapsed / step
+                print(
+                    f"  [{tag}] step={step}/{total_steps} | ce={step_loss:.4f} | {ms:.1f} ms/step | {elapsed:.1f}s",
+                    flush=True,
+                )
 
     sync_if_cuda(device)
     total_s = time.perf_counter() - t0
@@ -433,7 +538,7 @@ def train_byte_lm(
 
 def run_qat_and_pack_lut(
     model_fp: CalciteV2LM,
-    train_mm: np.memmap,
+    train_mm: np.ndarray,
     tok: ByteBPETokenizer,
     tr_sents: List[str],
     device: str,
@@ -463,6 +568,7 @@ def run_qat_and_pack_lut(
     student.set_ternary_qat(True)
 
     opt = build_optimizer_for_model(student, base_lr=3.5e-4, weight_decay=0.0, device=device)
+    trainable_params = [p for p in student.parameters() if p.requires_grad]
     rng_np = np.random.default_rng(seed + 77)
     rng_py = random.Random(seed + 88)
     mbs = int(micro_bs or batch_size)
@@ -470,33 +576,59 @@ def run_qat_and_pack_lut(
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
     use_amp = device == "cuda" and amp_dtype == torch.bfloat16
 
-    t0 = time.perf_counter()
-    for st in range(1, qat_steps + 1):
-        mix = min(1.0, float(st) / float(max(1, int(0.40 * qat_steps))))
-        student.set_qat_mix(mix)
-        clear_fast_qat_cache()
-        opt.zero_grad(set_to_none=True)
+    def _sample_qat_step() -> Tuple[torch.Tensor, torch.Tensor]:
+        xs, ys = [], []
         for _ in range(accum):
             if rng_py.random() < 0.25:
-                xb, yb = sample_cognitive_batch(tok, tr_sents, mbs, seq_len, rng_py, device)
+                xb_i, yb_i = sample_cognitive_batch(tok, tr_sents, mbs, seq_len, rng_py, "cpu")
             else:
-                xb, yb = sample_memmap_batch(train_mm, mbs, seq_len, rng_np, device)
-            with torch.no_grad(), torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                t_logits = teacher(xb)
-            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                s_logits = student(xb)
-                ce = F.cross_entropy(s_logits.reshape(-1, s_logits.size(-1)), yb.reshape(-1), ignore_index=-100)
-                kl = F.kl_div(
-                    F.log_softmax(s_logits.float(), dim=-1),
-                    F.softmax(t_logits.float(), dim=-1),
-                    reduction="batchmean",
-                ) / float(seq_len)
-                loss = 0.65 * ce + 0.35 * kl + student.get_commitment_loss()
-            (loss / float(accum)).backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-        opt.step()
-        if st % max(1, qat_steps // 4) == 0 or st == qat_steps:
-            print(f"  [QAT] step={st}/{qat_steps} mix={mix:.2f} | {time.perf_counter()-t0:.1f}s", flush=True)
+                xb_i, yb_i = sample_memmap_batch(train_mm, mbs, seq_len, rng_np, "cpu")
+            xs.append(xb_i)
+            ys.append(yb_i)
+        return (xs[0] if len(xs) == 1 else torch.cat(xs, dim=0)), (ys[0] if len(ys) == 1 else torch.cat(ys, dim=0))
+
+    t0 = time.perf_counter()
+    with BatchPrefetcher(
+        _sample_qat_step,
+        device=device,
+        total_steps=qat_steps,
+        prefetch_depth=3,
+        enabled=(qat_steps >= 4),
+    ) as prefetcher:
+        for st in range(1, qat_steps + 1):
+            mix = min(1.0, float(st) / float(max(1, int(0.40 * qat_steps))))
+            student.set_qat_mix(mix)
+            clear_fast_qat_cache()
+            xb_full, yb_full = prefetcher.next_batch()
+            t_bs = min(int(xb_full.size(0)), max(mbs, 32))
+            t_chunks: List[torch.Tensor] = []
+            with torch.inference_mode(), torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                for ts0 in range(0, int(xb_full.size(0)), t_bs):
+                    t_chunks.append(teacher(xb_full[ts0 : ts0 + t_bs]))
+            t_logits_raw = t_chunks[0] if len(t_chunks) == 1 else torch.cat(t_chunks, dim=0)
+            t_logits_full = t_logits_raw.clone() if t_logits_raw.is_inference() else t_logits_raw
+
+            opt.zero_grad(set_to_none=True)
+            for ai in range(accum):
+                s0 = ai * mbs
+                s1 = s0 + mbs
+                xb = xb_full[s0:s1]
+                yb = yb_full[s0:s1]
+                t_logits = t_logits_full[s0:s1]
+                with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                    s_logits = student(xb)
+                    ce = F.cross_entropy(s_logits.reshape(-1, s_logits.size(-1)), yb.reshape(-1), ignore_index=-100)
+                    kl = F.kl_div(
+                        F.log_softmax(s_logits.float(), dim=-1),
+                        F.softmax(t_logits.float(), dim=-1),
+                        reduction="batchmean",
+                    ) / float(seq_len)
+                    loss = 0.65 * ce + 0.35 * kl + student.get_commitment_loss()
+                (loss / float(accum)).backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            opt.step()
+            if st % max(1, qat_steps // 4) == 0 or st == qat_steps:
+                print(f"  [QAT] step={st}/{qat_steps} mix={mix:.2f} | {time.perf_counter()-t0:.1f}s", flush=True)
 
     student.set_ternary_qat(False)
     student.eval()
@@ -504,14 +636,14 @@ def run_qat_and_pack_lut(
     return lut_model
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_long_context_stress(
     model: nn.Module,
-    val_mm: np.memmap,
+    val_mm: np.ndarray,
     device: str,
     lengths: Tuple[int, ...] = (2048, 8192, 32768),
 ) -> Dict[str, object]:
-    """Evaluates long-context BPB & head-vs-tail drift up to `L = 32,768` bytes."""
+    """Evaluates long-context BPB & head-vs-tail drift up to `L = 32,768` bytes (batched with OOM fallback)."""
     model.eval()
     rng = np.random.default_rng(4242)
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
@@ -520,46 +652,59 @@ def eval_long_context_stress(
     for L in lengths:
         if L + 8 >= len(val_mm):
             continue
-        try:
-            bpb_all, bpb_head, bpb_tail = [], [], []
-            n_seq = 4 if L <= 8192 else 2
-            for _ in range(n_seq):
-                xb, yb = sample_memmap_batch(val_mm, 1, L, rng, device)
-                with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                    logits = model(xb)
-                per_tok = F.cross_entropy(
-                    logits.float().reshape(-1, logits.size(-1)),
-                    yb.reshape(-1),
-                    reduction="none",
-                ) / math.log(2.0)
-                span = min(512, L // 2)
-                bpb_all.append(float(per_tok.mean().item()))
-                bpb_head.append(float(per_tok[:span].mean().item()))
-                bpb_tail.append(float(per_tok[-span:].mean().item()))
-            out[f"L_{L}"] = {
-                "bpb": round(float(np.mean(bpb_all)), 4),
-                "head_bpb": round(float(np.mean(bpb_head)), 4),
-                "tail_bpb": round(float(np.mean(bpb_tail)), 4),
-                "tail_minus_head": round(float(np.mean(bpb_tail) - np.mean(bpb_head)), 4),
-            }
-        except RuntimeError as exc:
-            out[f"L_{L}"] = {"error": str(exc)[:180]}
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        n_seq = 4 if L <= 8192 else 2
+        # Preserve exact RNG draw order (`size=1` per sequence) while batching forward passes!
+        pairs = [sample_memmap_batch(val_mm, 1, L, rng, "cpu") for _ in range(n_seq)]
+        x_all_cpu = torch.cat([p[0] for p in pairs], dim=0)
+        y_all_cpu = torch.cat([p[1] for p in pairs], dim=0)
+        bs_l = min(4, n_seq) if L <= 2048 else (min(2, n_seq) if L <= 8192 else 1)
+        span = min(512, L // 2)
+        while True:
+            try:
+                bpb_all, bpb_head, bpb_tail = [], [], []
+                for s0 in range(0, n_seq, bs_l):
+                    xb = x_all_cpu[s0 : s0 + bs_l].to(device=device, non_blocking=(device == "cuda"))
+                    yb = y_all_cpu[s0 : s0 + bs_l].to(device=device, non_blocking=(device == "cuda"))
+                    with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                        logits = model(xb)
+                    per_tok = (
+                        F.cross_entropy(logits.float().transpose(1, 2), yb, reduction="none") / math.log(2.0)
+                    )
+                    bpb_all.extend(per_tok.mean(dim=1).cpu().tolist())
+                    bpb_head.extend(per_tok[:, :span].mean(dim=1).cpu().tolist())
+                    bpb_tail.extend(per_tok[:, -span:].mean(dim=1).cpu().tolist())
+                out[f"L_{L}"] = {
+                    "bpb": round(float(np.mean(bpb_all)), 4),
+                    "head_bpb": round(float(np.mean(bpb_head)), 4),
+                    "tail_bpb": round(float(np.mean(bpb_tail)), 4),
+                    "tail_minus_head": round(float(np.mean(bpb_tail) - np.mean(bpb_head)), 4),
+                }
+                break
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower() and bs_l > 1:
+                    bs_l = max(1, bs_l // 2)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                out[f"L_{L}"] = {"error": str(exc)[:180]}
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                break
     return out
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def benchmark_stream_engine_live(
     model_lut: CalciteV2LM,
     device: str,
     n_bytes: int = 256,
 ) -> Dict[str, object]:
-    """Benchmarks live `CalciteStreamEngine` throughput, parity, and exact O(1) RAM."""
+    """Benchmarks live `CalciteStreamEngine` prefill + pure-decode throughput, parity, and exact O(1) RAM."""
     model_lut.eval()
     eng = CalciteStreamEngine(model_lut)
     prompt = "Calcite v2 post-transformer streaming check: Привет, мир! 東京 🚀 2026 "
     p_ids = torch.tensor([[b + 3 for b in prompt.encode("utf-8")]], device=device, dtype=torch.long)
+    n_prompt = int(p_ids.size(1))
 
     lg_stream, st = eng.prefill(p_ids, return_all_logits=True)
     # When Latent Feedback is active, streaming computes the exact causal fixed point (`M` chunks);
@@ -569,11 +714,34 @@ def benchmark_stream_engine_live(
     max_err = float((lg_batch.float() - lg_stream.float()).abs().max().item())
     mem_prompt = st.memory_bytes()
 
+    # Time prefill and pure autoregressive decode separately so `bytes_per_sec` reflects pure decode!
     sync_if_cuda(device)
-    t0 = time.perf_counter()
-    gen_ids, gen_st = eng.generate(p_ids, max_new_bytes=n_bytes, temperature=0.8, top_p=0.9, eos_token_id=None)
+    t_pre0 = time.perf_counter()
+    logits, gen_st = eng.prefill(p_ids, return_all_logits=False)
     sync_if_cuda(device)
-    dt = time.perf_counter() - t0
+    dt_prefill = time.perf_counter() - t_pre0
+
+    generated = [p_ids]
+    sync_if_cuda(device)
+    t_dec0 = time.perf_counter()
+    for _ in range(n_bytes):
+        next_logits = logits / 0.8
+        sorted_logits, sorted_idx = torch.sort(next_logits, descending=True, dim=-1)
+        cum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        remove = cum_probs > 0.9
+        remove[:, 1:] = remove[:, :-1].clone()
+        remove[:, 0] = False
+        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+        probs = torch.softmax(sorted_logits, dim=-1)
+        pick = torch.multinomial(probs, num_samples=1)
+        next_tok = sorted_idx.gather(-1, pick).squeeze(-1)
+        generated.append(next_tok.unsqueeze(1))
+        logits, gen_st = eng.step(next_tok, gen_st)
+    sync_if_cuda(device)
+    dt_decode = time.perf_counter() - t_dec0
+    dt_e2e = dt_prefill + dt_decode
+
+    gen_ids = torch.cat(generated, dim=1)
     mem_end = gen_st.memory_bytes()
 
     raw_bytes = bytes([int(v) - 3 for v in gen_ids[0].tolist() if 3 <= int(v) <= 258])
@@ -586,11 +754,17 @@ def benchmark_stream_engine_live(
         "strict_o1_ram_invariant": bool(mem_prompt == mem_end),
         "state_kb": round(mem_end / 1024.0, 2),
         "generated_bytes": int(n_bytes),
+        "prompt_bytes": n_prompt,
         "backbone_ticks": int(gen_st.backbone_ticks),
         "total_bytes_processed": int(gen_st.total_bytes),
         "effective_chunk_ratio": round(gen_st.total_bytes / max(1, gen_st.backbone_ticks), 2),
-        "bytes_per_sec": round(n_bytes / max(1e-6, dt), 1),
-        "ms_per_byte": round(1000.0 * dt / max(1, n_bytes), 3),
+        "prefill_ms": round(1000.0 * dt_prefill, 2),
+        "prefill_bytes_per_sec": round(n_prompt / max(1e-6, dt_prefill), 1),
+        "decode_ms": round(1000.0 * dt_decode, 2),
+        "bytes_per_sec": round(n_bytes / max(1e-6, dt_decode), 1),
+        "ms_per_byte": round(1000.0 * dt_decode / max(1, n_bytes), 3),
+        "e2e_bytes_per_sec": round(n_bytes / max(1e-6, dt_e2e), 1),
+        "e2e_ms_per_byte": round(1000.0 * dt_e2e / max(1, n_bytes), 3),
         "sample_preview": sample_text,
     }
 
@@ -667,7 +841,7 @@ def fit_skaling_vs_chinchilla(points: List[Dict[str, float]]) -> Dict[str, objec
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_cognitive_v2(
     model: nn.Module,
     tok: ByteBPETokenizer,
@@ -689,8 +863,6 @@ def eval_cognitive_v2(
             ex_pct, tk_pct, k_ok, n_tot = evaluate_suite_batched(
                 model, suite, pad_id=tok.PAD_ID, batch_size=batch_size, device=device
             )
-            if device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
             print(
                 f"      [cog] {grp_name}.{k}: {ex_pct:.1f}% ({k_ok}/{n_tot}) in {time.perf_counter()-t_s:.1f}s",
                 flush=True,
@@ -739,7 +911,7 @@ def eval_cognitive_v2(
 
 def evaluate_full_model(
     model: nn.Module,
-    val_mm: np.memmap,
+    val_mm: np.ndarray,
     eval_wins: Dict[str, List[List[int]]],
     tok: ByteBPETokenizer,
     s5_suites: Dict[str, list],
@@ -759,14 +931,13 @@ def evaluate_full_model(
     )
     print(f"    [eval] val_bpb={val_bpb:.4f}", flush=True)
     ext = eval_length_extrapolation_bpb(
-        model, val_mm, device, l_in=512, l_ood=2048, n_batches=6 if quick else 16, batch_size_ood=min(4, bs)
+        model, val_mm, device, l_in=512, l_ood=2048, n_batches=6 if quick else 16, batch_size_ood=min(4, bs),
+        reuse_l_in_bpb=val_bpb,
     )
     print(f"    [eval] L2048={ext['bpb_L2048']:.4f} (t-h={ext['tail_minus_head_bpb']:+.4f})", flush=True)
     ow_wins = {k: v[:8] for k, v in eval_wins.items()} if quick else eval_wins
     ow = eval_openweb_6domains_any_byte_lm(model, ow_wins, device=device, batch_size=bs)
     print(f"    [eval] OW6={ow['mean_openweb_bpb']:.4f}", flush=True)
-    if device == "cuda" and torch.cuda.is_available():
-        torch.cuda.empty_cache()
     cog = eval_cognitive_v2(
         model, tok, s5_suites, ov_suites, trap_suites, device=device, batch_size=c_bs
     )
@@ -862,11 +1033,13 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     train_bin, val_bin = ensure_phase_k_corpus(Path(args.data_dir))
-    train_mm = np.memmap(train_bin, dtype=np.uint16, mode="r")
-    val_mm = np.memmap(val_bin, dtype=np.uint16, mode="r")
+    train_mm = load_utf8_corpus_array(train_bin)
+    val_mm = load_utf8_corpus_array(val_bin)
     tok = ByteBPETokenizer(merges=[])
-    tr_sents, eval_wins, s5_quick, ov_quick, trap_quick = build_eval_bundles(ROOT_DIR, tok, n_eval=60, seq_len=512)
-    _, _, s5_full, ov_full, trap_full = build_eval_bundles(ROOT_DIR, tok, n_eval=150, seq_len=512)
+    tr_sents, eval_wins, s5_full, ov_full, trap_full = build_eval_bundles(ROOT_DIR, tok, n_eval=150, seq_len=512)
+    s5_quick = {k: v[:60] for k, v in s5_full.items()}
+    ov_quick = {k: v[:60] for k, v in ov_full.items()}
+    trap_quick = {k: v[:60] for k, v in trap_full.items()}
 
     router_path = out_dir / "frozen_utf8_router.pt"
     if router_path.is_file():
@@ -1181,7 +1354,10 @@ def main() -> None:
 
         print("  [Stage 3] Evaluating FP Champion...", flush=True)
         ev_fp = evaluate_full_model(fp_eval_m, val_mm, eval_wins, tok, s5_full, ov_full, trap_full, device=device, quick=False, eval_bs=16)
-        long_fp = eval_long_context_stress(fp_eval_m, val_mm, device=device, lengths=(2048, 8192, 32768))
+        long_fp = inject_l2048_from_extrap(
+            eval_long_context_stress(fp_eval_m, val_mm, device=device, lengths=(8192, 32768)),
+            ev_fp.get("extrap_4x"),
+        )
         print(f"  [Stage 3] FP long-context: {long_fp}", flush=True)
 
         lut_25m = run_qat_and_pack_lut(
@@ -1202,7 +1378,10 @@ def main() -> None:
 
         print("  [Stage 3] Evaluating 2-bit LUT Champion (bs=8 VRAM-safe)...", flush=True)
         ev_lut = evaluate_full_model(lut_25m, val_mm, eval_wins, tok, s5_full, ov_full, trap_full, device=device, quick=False, eval_bs=8)
-        long_lut = eval_long_context_stress(lut_25m, val_mm, device=device, lengths=(2048, 8192, 32768))
+        long_lut = inject_l2048_from_extrap(
+            eval_long_context_stress(lut_25m, val_mm, device=device, lengths=(8192, 32768)),
+            ev_lut.get("extrap_4x"),
+        )
         print(f"  [Stage 3] LUT long-context: {long_lut}", flush=True)
 
         stream_gpu = benchmark_stream_engine_live(lut_25m, device=device, n_bytes=256)
@@ -1239,7 +1418,10 @@ def main() -> None:
             "train_seconds": round(tr_rope_a["train_seconds"] + tr_rope_b["train_seconds"], 2),
         }
         ev_rope = evaluate_full_model(rope_25m, val_mm, eval_wins, tok, s5_full, ov_full, trap_full, device=device, quick=False)
-        long_rope = eval_long_context_stress(rope_25m, val_mm, device=device, lengths=(2048, 8192, 32768))
+        long_rope = inject_l2048_from_extrap(
+            eval_long_context_stress(rope_25m, val_mm, device=device, lengths=(8192, 32768)),
+            ev_rope.get("extrap_4x"),
+        )
 
         summary = {
             "winning_axes": winning_axes,

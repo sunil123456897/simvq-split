@@ -4,13 +4,15 @@ Automated Repository Guardrail (`scripts/repo_guardrail.py`).
 Shared deterministic checks used by `.git/hooks/pre-commit` and phase validators:
 1. Zero diff on untouched `simvq_split/baselines.py` vs `HEAD`.
 2. Ruff syntax/fatal lint check (`E9,F63,F7,F82`) across core package, kernels, tests, scripts, and runners.
-3. 17-law Zero-Cheat `pytest tests/test_anti_cheat.py -q` + v3 CUDA/QAT `tests/test_fast_calcite_scans.py -q`.
+3. 17-law Zero-Cheat `pytest tests/test_anti_cheat.py -q`, v3 CUDA/QAT `tests/test_fast_calcite_scans.py -q`,
+   and CPU-fast `tests/test_phase_g_lut_and_scale.py` + `tests/test_calcite_v31_optimizations.py` regression suites.
 4. `AGENTS.md` size cap (`<= 24,000 B`, prevents silent context truncation).
 5. UTF-8 (no BOM / U+FFFD) and Russian lexical quarantine across repository Markdown docs & workspace skills.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -190,6 +192,43 @@ def check_fast_kernels_pytest(root: Path) -> str:
     return res.stdout.strip()
 
 
+def check_lut_and_v31_pytest(root: Path) -> str:
+    """
+    Run CPU-fast deterministic `tests/test_phase_g_lut_and_scale.py` and
+    `tests/test_calcite_v31_optimizations.py` (`CUDA_VISIBLE_DEVICES="-1"`) so pre-commit
+    verifies `kernels/fast_packed_lut.py`, `CalciteStreamEngine`, and Wave 2+3 v3.1 invariants
+    without contending with GPU workloads or triggering slow Triton cold compiles.
+    """
+    specs = (
+        (root / "tests" / "test_phase_g_lut_and_scale.py", 5),
+        (root / "tests" / "test_calcite_v31_optimizations.py", 8),
+    )
+    paths: list[str] = []
+    min_passed = 0
+    for p, min_cnt in specs:
+        if p.exists():
+            paths.append(str(p))
+            min_passed += min_cnt
+    if not paths:
+        return "skipped (not present)"
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = "-1"
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", *paths, "-q"],
+        cwd=str(root),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    m = re.search(r"(\d+)\s+passed", res.stdout)
+    if res.returncode != 0 or m is None or int(m.group(1)) < min_passed or "failed" in res.stdout:
+        detail = (res.stdout + "\n" + res.stderr).strip()
+        raise AssertionError(
+            f"LUT & Calcite v3.1 pytest suite (>= {min_passed} tests) failed!\n{detail}"
+        )
+    return res.stdout.strip()
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     check_baselines_untouched(root)
@@ -200,6 +239,8 @@ def main() -> int:
     print(f"OK pytest: {pytest_out.splitlines()[-1]}", flush=True)
     fk_out = check_fast_kernels_pytest(root)
     print(f"OK fast_kernels: {fk_out.splitlines()[-1]}", flush=True)
+    v31_out = check_lut_and_v31_pytest(root)
+    print(f"OK lut_v31: {v31_out.splitlines()[-1]}", flush=True)
     agents_b = check_agents_md_size(root)
     print(f"OK AGENTS.md: {agents_b:,} B <= {AGENTS_MD_MAX_BYTES:,} B", flush=True)
     n_docs = check_markdown_quarantine(root)

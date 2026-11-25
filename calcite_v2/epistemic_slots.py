@@ -25,14 +25,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
-from simvq_split.baselines import RMSNorm
+from .norm import CalciteRMSNorm
 
 
 @dataclass
 class EpistemicSlotsStreamState:
     kvf_bank: torch.Tensor  # (B, H, S, d_k + d_v + 1) fp32
-    k_ring: torch.Tensor    # (B, 3, H, d_k) fp32  ([t-3, t-2, t-1])
+    k_ring: torch.Tensor    # (B, 3, H, d_k) fp32  ([t-3, t-2, t-1] chronologically when k_ptr == 0)
     step_count: int
+    k_ptr: int = 0          # circular write pointer for k_ring (chronological when 0)
 
     def memory_bytes(self) -> int:
         b = max(1, int(self.kvf_bank.size(0)))
@@ -55,8 +56,8 @@ def _hillis_steele_block(
         a_cur = a[:, step:]
         a_new = a_cur * a[:, :-step]
         b_new = a_cur * b[:, :-step] + b[:, step:]
-        a = torch.cat([a[:, :step], a_new], dim=1)
-        b = torch.cat([b[:, :step], b_new], dim=1)
+        a = torch.cat((a[:, :step], a_new), dim=1)
+        b = torch.cat((b[:, :step], b_new), dim=1)
         step *= 2
     return a, b
 
@@ -79,7 +80,7 @@ def _scan_and_read_block(
     a_scan, b_scan = _hillis_steele_block(a_blk, b_blk)
     s_abs = a_scan * s_prev.unsqueeze(1) + b_scan                   # (B, L, H, S, D_u)
     if L > 1:
-        s_before = torch.cat([s_prev.unsqueeze(1), s_abs[:, :-1]], dim=1)
+        s_before = torch.cat((s_prev.unsqueeze(1), s_abs[:, :-1]), dim=1)
     else:
         s_before = s_prev.unsqueeze(1)
     s_next = s_abs[:, -1]
@@ -90,13 +91,13 @@ def _scan_and_read_block(
 
     k_hat = k_b * torch.rsqrt(k_b.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
     r_sc = read_scale.clamp(2.0, 32.0).view(1, 1, H, 1)
-    sim = torch.einsum("blhd,blhsd->blhs", q_blk, k_hat) * r_sc
+    sim = torch.matmul(k_hat, q_blk.unsqueeze(-1)).squeeze(-1) * r_sc
     sim = sim + (1.0 - f_b) * (-20.0)
 
     null_col = null_logit.view(1, 1, H, 1).expand(B, L, H, 1)
-    probs_all = F.softmax(torch.cat([sim, null_col], dim=-1), dim=-1)
+    probs_all = F.softmax(torch.cat((sim, null_col), dim=-1), dim=-1)
     probs = probs_all[..., :S]                                      # (B, L, H, S)
-    out_blk = torch.einsum("blhs,blhsd->blhd", probs, v_b)          # (B, L, H, d_v)
+    out_blk = torch.matmul(probs.unsqueeze(-2), v_b).squeeze(-2)    # (B, L, H, d_v)
     return out_blk, s_next
 
 
@@ -159,18 +160,50 @@ class EpistemicSlotMemory(nn.Module):
         self.read_scale = nn.Parameter(torch.full((self.n_heads,), 10.0, dtype=torch.float32))
         self.null_logit = nn.Parameter(torch.full((self.n_heads,), 2.0, dtype=torch.float32))
 
-        self.out_norm = RMSNorm(self.n_heads * self.d_v)
+        self.out_norm = CalciteRMSNorm(self.n_heads * self.d_v)
         self.out_proj = nn.Linear(self.n_heads * self.d_v, d_model, bias=False)
         with torch.no_grad():
             self.out_proj.weight.mul_(0.25)
 
         self.last_aux_loss: torch.Tensor | None = None
-        self.last_write_rate: float = 0.0
+        self._last_write_rate_val: float = 0.0
+        self._last_write_rate_t: torch.Tensor | None = None
+        self._anchor_cache_key: tuple[int, int, str] | None = None
+        self._anchor_cache_val: torch.Tensor | None = None
+
+    @property
+    def last_write_rate(self) -> float:
+        if self._last_write_rate_t is not None:
+            self._last_write_rate_val = float(self._last_write_rate_t.item())
+            self._last_write_rate_t = None
+        return self._last_write_rate_val
+
+    @last_write_rate.setter
+    def last_write_rate(self, val: float) -> None:
+        self._last_write_rate_val = float(val)
+        self._last_write_rate_t = None
 
     @staticmethod
     def _safe_unit(v: torch.Tensor) -> torch.Tensor:
         vf = v.float()
         return vf * torch.rsqrt(vf.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
+
+    def _get_unit_anchors(self) -> torch.Tensor:
+        if self.training and torch.is_grad_enabled():
+            return self._safe_unit(self.slot_anchors)
+        a = self.slot_anchors
+        key = (int(a.data_ptr()), int(a._version), str(a.device))
+        if (
+            self._anchor_cache_key == key
+            and self._anchor_cache_val is not None
+            and not self._anchor_cache_val.is_inference()
+        ):
+            return self._anchor_cache_val
+        with torch.inference_mode(False), torch.no_grad():
+            val = self._safe_unit(a.detach()).clone()
+        self._anchor_cache_key = key
+        self._anchor_cache_val = val
+        return val
 
     def compute_state_bytes(self) -> int:
         bank_b = self.n_heads * self.n_slots * self.d_u * 4
@@ -199,8 +232,8 @@ class EpistemicSlotMemory(nn.Module):
         self, k_lag: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Routes unit keys `(..., H, d_k)` to 1 of `S` slots via straight-through top-1."""
-        anchors = self._safe_unit(self.slot_anchors)  # (H, S, d_k)
-        r_logits = torch.einsum("...hd,hsd->...hs", k_lag, anchors) * 6.0
+        anchors = self._get_unit_anchors()  # (H, S, d_k)
+        r_logits = torch.matmul(k_lag.unsqueeze(-2), anchors.transpose(-1, -2)).squeeze(-2) * 6.0
         r_probs = F.softmax(r_logits, dim=-1)
         top_idx = r_probs.argmax(dim=-1, keepdim=True)
         r_hard = torch.zeros_like(r_probs).scatter_(-1, top_idx, 1.0)
@@ -267,10 +300,11 @@ class EpistemicSlotMemory(nn.Module):
         else:
             self.last_aux_loss = None
         if L > 1:
-            self.last_write_rate = float((beta_eff[:, 1:].detach() > 0.0).float().mean().item())
+            # Lazy 0-d tensor: ZERO `.item()` GPU sync / graph break
+            self._last_write_rate_t = (beta_eff[:, 1:].detach() > 0.0).float().mean()
 
         ones = torch.ones((B, L, H, 1), device=x.device, dtype=torch.float32)
-        u_all = torch.cat([k_lag, v, ones], dim=-1)       # (B, L, H, d_u)
+        u_all = torch.cat((k_lag, v, ones), dim=-1)       # (B, L, H, d_u)
 
         Bc = self.block_size
         n_blocks = (L + Bc - 1) // Bc
@@ -309,7 +343,7 @@ class EpistemicSlotMemory(nn.Module):
                         d_v,
                     )
                 outs.append(o_b)
-            out_flat = torch.cat(outs, dim=1).reshape(B, L, H * d_v).to(dt)
+            out_flat = (outs[0] if n_blocks == 1 else torch.cat(outs, dim=1)).reshape(B, L, H * d_v).to(dt)
 
         return self.out_proj(self.out_norm(out_flat))
 
@@ -325,6 +359,7 @@ class EpistemicSlotMemory(nn.Module):
                 batch_size, 3, self.n_heads, self.d_k, device=device, dtype=torch.float32
             ),
             step_count=0,
+            k_ptr=0,
         )
 
     @torch.no_grad()
@@ -339,6 +374,7 @@ class EpistemicSlotMemory(nn.Module):
         B = x_t.size(0)
         H, S, d_k, d_v = self.n_heads, self.n_slots, self.d_k, self.d_v
         dt = x_t.dtype
+        kp = state.k_ptr
 
         with torch.amp.autocast(x_t.device.type, enabled=False):
             z_qk_t = self._blend_key_input(x_t, h_lex_t)
@@ -354,32 +390,50 @@ class EpistemicSlotMemory(nn.Module):
             f_b = state.kvf_bank[..., -1].clamp(0.0, 1.0)
             k_hat = k_b * torch.rsqrt(k_b.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
             r_sc = self.read_scale.float().clamp(2.0, 32.0).view(1, H, 1)
-            sim = torch.einsum("bhd,bhsd->bhs", q_t, k_hat) * r_sc + (1.0 - f_b) * (-20.0)
+            sim = torch.matmul(k_hat, q_t.unsqueeze(-1)).squeeze(-1) * r_sc + (1.0 - f_b) * (-20.0)
             null_col = self.null_logit.float().view(1, H, 1).expand(B, H, 1)
-            probs = F.softmax(torch.cat([sim, null_col], dim=-1), dim=-1)[..., :S]
-            out_t = torch.einsum("bhs,bhsd->bhd", probs, v_b).reshape(B, H * d_v).to(dt)
+            probs = F.softmax(torch.cat((sim, null_col), dim=-1), dim=-1)[..., :S]
+            out_t = torch.matmul(probs.unsqueeze(-2), v_b).squeeze(-2).reshape(B, H * d_v).to(dt)
 
-            # 2. Lagged induction WRITE into routed slot (t=0 skipped)
+            # 2. Lagged induction sparse 1-slot WRITE into routed slot (t=0 skipped)
             if state.step_count > 0:
                 lw = F.softmax(self.lag_logits.float(), dim=-1)
                 w1 = lw[:, 0].view(1, H, 1)
                 w2 = lw[:, 1].view(1, H, 1)
                 w3 = lw[:, 2].view(1, H, 1)
                 k_lag_t = self._safe_unit(
-                    w1 * state.k_ring[:, 2] + w2 * state.k_ring[:, 1] + w3 * state.k_ring[:, 0]
+                    w1 * state.k_ring[:, (kp - 1) % 3]
+                    + w2 * state.k_ring[:, (kp - 2) % 3]
+                    + w3 * state.k_ring[:, kp]
                 )
                 u_unc = epistemic_uncert_t
                 if u_unc is not None and u_unc.ndim == 3:
                     u_unc = u_unc[:, -1]
                 beta_t, _ = self._compute_beta(x_t, u_unc)  # (B, H)
-                r_st, _, _ = self._route_slots(k_lag_t)     # (B, H, S)
-                alpha_t = (beta_t.unsqueeze(-1) * r_st).unsqueeze(-1)  # (B, H, S, 1)
-                ones = torch.ones((B, H, 1), device=x_t.device, dtype=torch.float32)
-                u_t = torch.cat([k_lag_t, v_t, ones], dim=-1).unsqueeze(2)  # (B, H, 1, d_u)
-                state.kvf_bank = (1.0 - alpha_t) * state.kvf_bank + alpha_t * u_t
+                anchors = self._get_unit_anchors()
+                r_logits = torch.matmul(k_lag_t.unsqueeze(-2), anchors.transpose(-1, -2)).squeeze(-2) * 6.0
+                top_idx = r_logits.argmax(dim=-1)  # (B, H)
+                if B == 1:
+                    for h_i in range(H):
+                        s_i = top_idx[0, h_i]
+                        bt = beta_t[0, h_i]
+                        upd = state.kvf_bank[0, h_i, s_i] * (1.0 - bt)
+                        upd[:d_k] = upd[:d_k] + bt * k_lag_t[0, h_i]
+                        upd[d_k : d_k + d_v] = upd[d_k : d_k + d_v] + bt * v_t[0, h_i]
+                        upd[-1] = upd[-1] + bt
+                        state.kvf_bank[0, h_i, s_i] = upd
+                else:
+                    b_idx = torch.arange(B, device=x_t.device, dtype=torch.long).unsqueeze(1).expand(B, H)
+                    h_idx = torch.arange(H, device=x_t.device, dtype=torch.long).unsqueeze(0).expand(B, H)
+                    ones = torch.ones((B, H, 1), device=x_t.device, dtype=torch.float32)
+                    u_t = torch.cat((k_lag_t, v_t, ones), dim=-1)
+                    bt = beta_t.unsqueeze(-1)
+                    old = state.kvf_bank[b_idx, h_idx, top_idx]
+                    state.kvf_bank[b_idx, h_idx, top_idx] = (1.0 - bt) * old + bt * u_t
 
-            # 3. Advance lag ring
-            state.k_ring = torch.cat([state.k_ring[:, 1:], k_raw_t.unsqueeze(1)], dim=1)
+            # 3. Advance circular lag ring (zero `torch.cat` allocation)
+            state.k_ring[:, kp] = k_raw_t
+            state.k_ptr = (kp + 1) % 3
             state.step_count += 1
 
         return self.out_proj(self.out_norm(out_t))

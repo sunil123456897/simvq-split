@@ -22,10 +22,12 @@ from .model import (
     build_calcite_v2_tier_config,
     compute_v2_state_cache_kb,
 )
+from .norm import CalciteRMSNorm
 from .stream_engine import CalciteStreamEngine, CalciteStreamState
 from .woodbury import CalciteV2WoodburyLayer, WoodburyStreamState
 
 __all__ = [
+    "CalciteRMSNorm",
     "CalciteV2Chunker",
     "ChunkContext",
     "ChunkerStreamState",

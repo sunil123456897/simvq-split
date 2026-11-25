@@ -146,7 +146,6 @@ def test_k1_ast_hygiene_and_protected_zero_diff():
         "experiments/cram_gsm8k/",
         "experiments/uebr_proto/",
         "experiments/uebr_system2/",
-        "kernels/fast_packed_lut.py",
         "checkpoints/calcite5_tier1_17m_utf8_lut.pt",
         "checkpoints/calcite5_tier1_17m_utf8_qat_h_lut.pt",
         "tests/test_anti_cheat.py",

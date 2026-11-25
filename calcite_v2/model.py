@@ -19,22 +19,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import kernels.fast_calcite_swa_chunker as _swa_chunker_mod
 from kernels.fast_calcite_scans import configure_fast_ternary_qat
 from kernels.fast_calcite_swa_chunker import (
     fast_swa_rope_attn_cuda,
     get_cached_rope_cos_sin,
 )
-from simvq_split.baselines import RMSNorm, SwiGLU, apply_rope
+from simvq_split.baselines import SwiGLU, apply_rope
 from simvq_split.models import _configure_model_ternary_qat
 
-from .chunker import CalciteV2Chunker
+from .chunker import CalciteV2Chunker, resolve_dw_dim
 from .crystal import CalciteV2CrystalLayer
 from .epistemic_slots import EpistemicSlotMemory
+from .norm import CalciteRMSNorm, build_swa_block_masks, sliding_window_sdpa
 from .woodbury import CalciteV2WoodburyLayer
 
 
+def _swa_cuda_ext_ready() -> bool:
+    loader = getattr(_swa_chunker_mod, "_load_swa_chunker_cuda_ext", None)
+    return callable(loader) and (loader() is not None)
+
+
 class LocalSWAAttention(nn.Module):
-    """Sliding-Window RoPE Attention with native CUDA custom_op + exact streaming `step()`."""
+    """Sliding-Window RoPE Attention with native CUDA custom_op + zero-loop SDPA + circular `step()`."""
 
     def __init__(
         self,
@@ -57,59 +64,51 @@ class LocalSWAAttention(nn.Module):
             10000.0 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        m0, mi, bq = build_swa_block_masks(self.window_size)
+        self.register_buffer("_swa_mask0", m0, persistent=False)
+        self.register_buffer("_swa_mask_inner", mi, persistent=False)
+        self._swa_block_q = bq
 
     def _rope_for_pos(self, pos: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        freqs = float(pos) * self.inv_freq.to(device=device, dtype=torch.float32)
-        cos = torch.cos(freqs).to(dtype).view(1, 1, -1)
-        sin = torch.sin(freqs).to(dtype).view(1, 1, -1)
-        return cos, sin
+        cos_tab, sin_tab = get_cached_rope_cos_sin(
+            pos + 1, device, dtype, head_dim=self.head_dim, base=10000.0
+        )
+        return cos_tab[pos : pos + 1].view(1, 1, -1), sin_tab[pos : pos + 1].view(1, 1, -1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         qkv = self.qkv(x)
+        qkv_5d = qkv.view(B, T, 3, self.n_heads, self.head_dim)
+        cos_tab, sin_tab = get_cached_rope_cos_sin(
+            T, qkv_5d.device, qkv_5d.dtype, head_dim=self.head_dim, base=10000.0
+        )
         if (
             self.use_fast_kernels
-            and x.is_cuda
-            and self.head_dim == 64
-            and 1 <= self.window_size <= 16
+            and qkv_5d.is_cuda
+            and self.head_dim in (32, 64)
+            and 1 <= self.window_size <= 32
+            and _swa_cuda_ext_ready()
         ):
-            qkv_5d = qkv.view(B, T, 3, self.n_heads, self.head_dim)
-            cos, sin = get_cached_rope_cos_sin(
-                T, qkv_5d.device, qkv_5d.dtype, head_dim=self.head_dim, base=10000.0
-            )
-            y = fast_swa_rope_attn_cuda(qkv_5d, cos, sin, self.window_size)
+            y = fast_swa_rope_attn_cuda(qkv_5d, cos_tab, sin_tab, self.window_size)
             return self.out_proj(y.view(B, T, C))
 
-        qkv_v = qkv.view(B, T, 3, self.n_heads, self.head_dim)
-        q = qkv_v[:, :, 0].transpose(1, 2)
-        k = qkv_v[:, :, 1].transpose(1, 2)
-        v = qkv_v[:, :, 2].transpose(1, 2)
-
-        t = torch.arange(T, device=x.device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq.to(device=x.device))
-        cos = torch.cos(freqs).to(x.dtype).view(1, 1, T, -1)
-        sin = torch.sin(freqs).to(x.dtype).view(1, 1, T, -1)
+        q = qkv_5d[:, :, 0].transpose(1, 2)
+        k = qkv_5d[:, :, 1].transpose(1, 2)
+        v = qkv_5d[:, :, 2].transpose(1, 2)
+        cos = cos_tab.view(1, 1, T, -1)
+        sin = sin_tab.view(1, 1, T, -1)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        if T <= self.window_size:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            # Strict O(T * W) sliding-window attention (zero O(T^2) mask allocation at L=32K–128K!)
-            W = self.window_size
-            k_pad = F.pad(k, (0, 0, W - 1, 0))
-            v_pad = F.pad(v, (0, 0, W - 1, 0))
-            k_win = k_pad.unfold(2, W, 1)  # (B, H, T, D, W)
-            v_win = v_pad.unfold(2, W, 1)  # (B, H, T, D, W)
-            scale = 1.0 / math.sqrt(float(self.head_dim))
-            scores = torch.einsum("bhtd,bhtdw->bhtw", q.float(), k_win.float()) * scale
-            # Mask left-padded positions for t < W - 1
-            t_idx = torch.arange(T, device=x.device).unsqueeze(1)
-            w_idx = torch.arange(W, device=x.device).unsqueeze(0)
-            valid_w = (t_idx + w_idx) >= (W - 1)  # (T, W)
-            scores = scores.masked_fill(~valid_w.view(1, 1, T, W), -1e4)
-            probs = F.softmax(scores, dim=-1).to(x.dtype)
-            y = torch.einsum("bhtw,bhtdw->bhtd", probs, v_win)
+        y = sliding_window_sdpa(
+            q,
+            k,
+            v,
+            self.window_size,
+            self._swa_mask0,
+            self._swa_mask_inner,
+            self._swa_block_q,
+        )
         return self.out_proj(y.transpose(1, 2).contiguous().view(B, T, C))
 
     @torch.no_grad()
@@ -120,7 +119,7 @@ class LocalSWAAttention(nn.Module):
         v_ring: torch.Tensor,
         pos: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Strict O(1) sliding-window attention step over `(B, W, H, D)` rings."""
+        """Strict O(1) sliding-window attention step over `(B, W, H, D)` circular rings (zero `.clone()`)."""
         B, C = x_t.shape
         W = self.window_size
         qkv = self.qkv(x_t).view(B, 3, self.n_heads, self.head_dim)
@@ -128,29 +127,26 @@ class LocalSWAAttention(nn.Module):
         k = qkv[:, 1]
         v = qkv[:, 2]
 
-        cos, sin = self._rope_for_pos(pos, x_t.device, x_t.dtype)
+        cos, sin = self._rope_for_pos(pos, x_t.device, qkv.dtype)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
+        # Circular write pointer: softmax attention over ring slots is permutation-invariant
+        slot = pos % W
+        k_ring[:, slot] = k
+        v_ring[:, slot] = v
         if pos < W:
-            k_ring[:, pos] = k
-            v_ring[:, pos] = v
-            n_valid = pos + 1
-            k_use = k_ring[:, :n_valid]
-            v_use = v_ring[:, :n_valid]
+            k_use = k_ring[:, : pos + 1]
+            v_use = v_ring[:, : pos + 1]
         else:
-            k_ring[:, :-1] = k_ring[:, 1:].clone()
-            k_ring[:, -1] = k
-            v_ring[:, :-1] = v_ring[:, 1:].clone()
-            v_ring[:, -1] = v
             k_use = k_ring
             v_use = v_ring
 
         # Scaled dot-product attention over `<= W` keys
         scale = 1.0 / math.sqrt(float(self.head_dim))
-        scores = torch.einsum("bhd,bwhd->bhw", q.float(), k_use.float()) * scale
-        probs = F.softmax(scores, dim=-1).to(x_t.dtype)
-        y = torch.einsum("bhw,bwhd->bhd", probs, v_use).reshape(B, C)
+        scores = torch.matmul(q.float().unsqueeze(2), k_use.float().permute(0, 2, 3, 1)) * scale
+        probs = F.softmax(scores, dim=-1).to(qkv.dtype)
+        y = torch.matmul(probs, v_use.permute(0, 2, 1, 3)).reshape(B, C)
         return self.out_proj(y), k_ring, v_ring
 
 
@@ -159,7 +155,7 @@ class DepthAttnMix(nn.Module):
 
     def __init__(self, d_model: int):
         super().__init__()
-        self.k_norm = RMSNorm(d_model)
+        self.k_norm = CalciteRMSNorm(d_model)
         self.query = nn.Parameter(torch.randn(d_model, dtype=torch.float32) * 0.02)
         self.mix_logit = nn.Parameter(torch.tensor(-1.5, dtype=torch.float32))
 
@@ -168,7 +164,7 @@ class DepthAttnMix(nn.Module):
             return h_cur
         v = torch.stack(hist, dim=-2)
         k = self.k_norm(v)
-        scores = torch.einsum("...ld,d->...l", k.float(), self.query.float())
+        scores = torch.matmul(k.float(), self.query.float())
         alpha = F.softmax(scores, dim=-1).to(v.dtype)
         attn_mix = (v * alpha.unsqueeze(-1)).sum(dim=-2)
         g = torch.sigmoid(self.mix_logit.float()).to(h_cur.dtype)
@@ -189,11 +185,11 @@ class LocalSWABlock(nn.Module):
         super().__init__()
         self.swa_drop_prob = float(max(0.0, min(0.95, swa_drop_prob)))
         self.use_canon = bool(use_canon)
-        self.norm1 = RMSNorm(d_model)
+        self.norm1 = CalciteRMSNorm(d_model)
         self.attn = LocalSWAAttention(
             d_model, n_heads, window_size=window_size, use_fast_kernels=use_fast_kernels
         )
-        self.norm2 = RMSNorm(d_model)
+        self.norm2 = CalciteRMSNorm(d_model)
         self.mlp = SwiGLU(d_model, d_ff)
         if self.use_canon:
             # Allen-Zhu Canon-A (pre-attn) + Canon-C (pre-MLP): 4-tap causal depthwise convs
@@ -330,6 +326,10 @@ class CalciteV2Config:
     tr_train_passes: int = 4               # TR: Jacobi passes during training
     tr_eval_passes: int = 8                # TR: Jacobi passes during batch eval (exact in streaming)
     tr_backprop_passes: int = 2            # TR: Truncated backprop through last K passes
+    # Wave 3 (Tier 2) opt-in architectural ablation axes (defaults preserve 100% Wave 2 identity)
+    dec_dw3_enabled: bool = True           # Axis A1: keep 3rd-scale decoder dw_conv (k=4, d=4) when use_sym_byte_swa=True
+    dw_bottleneck_ratio: float = 1.0       # Axis A2: inner width ratio for 4x full-byte dw_conv mixers (1.0 = full d_model)
+    bf16_residual_stream: bool = False     # Axis C: cast tok_emb output to BF16 under BF16 autocast
 
     def resolved_dff(self) -> int:
         if self.d_ff is not None:
@@ -370,12 +370,14 @@ class CalciteV2LM(nn.Module):
             use_byte_induct_cache=cfg.use_byte_induct_cache,
             byte_induct_slots=cfg.byte_induct_slots,
             byte_induct_dim=cfg.byte_induct_dim,
+            dec_dw3_enabled=cfg.dec_dw3_enabled,
+            dw_bottleneck_ratio=cfg.dw_bottleneck_ratio,
             use_fast_kernels=cfg.use_fast_kernels,
         )
 
         # Optional 1-chunk causal Latent Feedback projection
         if cfg.use_latent_feedback:
-            self.fb_norm = RMSNorm(cfg.d_model)
+            self.fb_norm = CalciteRMSNorm(cfg.d_model)
             self.fb_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
             nn.init.normal_(self.fb_proj.weight, std=0.02)
         else:
@@ -414,7 +416,7 @@ class CalciteV2LM(nn.Module):
 
             # Fast Woodbury (early prose/syntax) + Slow Epistemic Woodbury (deep facts)
             fast_heads = max(2, cfg.mem_heads // 2)
-            self.woodbury_fast_norm = RMSNorm(cfg.d_model)
+            self.woodbury_fast_norm = CalciteRMSNorm(cfg.d_model)
             self.woodbury_fast = CalciteV2WoodburyLayer(
                 d_model=cfg.d_model,
                 mem_heads=fast_heads,
@@ -428,7 +430,7 @@ class CalciteV2LM(nn.Module):
             self.woodbury_fast_gate = nn.Linear(cfg.d_model, 1, bias=True)
             nn.init.constant_(self.woodbury_fast_gate.bias, 0.0 if cfg.use_clean_gates else -0.5)
 
-            self.cryst1_norm = RMSNorm(cfg.d_model)
+            self.cryst1_norm = CalciteRMSNorm(cfg.d_model)
             self.crystal = CalciteV2CrystalLayer(
                 d_model=cfg.d_model,
                 num_spheres=cfg.num_spheres,
@@ -440,7 +442,7 @@ class CalciteV2LM(nn.Module):
             self.cryst1_gate = nn.Linear(cfg.d_model, 1, bias=True)
             nn.init.constant_(self.cryst1_gate.bias, 0.0 if cfg.use_clean_gates else -1.8)
 
-            self.split_norm = RMSNorm(cfg.d_model)
+            self.split_norm = CalciteRMSNorm(cfg.d_model)
             self.woodbury = CalciteV2WoodburyLayer(
                 d_model=cfg.d_model,
                 mem_heads=cfg.mem_heads,
@@ -457,10 +459,10 @@ class CalciteV2LM(nn.Module):
             self.woodbury_slow_gate = nn.Linear(cfg.d_model, 1, bias=True)
             nn.init.constant_(self.woodbury_slow_gate.bias, 0.3 if cfg.use_clean_gates else 0.4)
 
-            self.mid_mlp_norm = RMSNorm(cfg.d_model)
+            self.mid_mlp_norm = CalciteRMSNorm(cfg.d_model)
             self.mid_mlp = SwiGLU(cfg.d_model, d_ff)
 
-            self.cryst2_norm = RMSNorm(cfg.d_model)
+            self.cryst2_norm = CalciteRMSNorm(cfg.d_model)
             self.crystal_2 = CalciteV2CrystalLayer(
                 d_model=cfg.d_model,
                 num_spheres=cfg.num_spheres,
@@ -510,7 +512,7 @@ class CalciteV2LM(nn.Module):
             self.cryst1_gate = None
             self.woodbury_slow_gate = None
 
-            self.split_norm = RMSNorm(cfg.d_model)
+            self.split_norm = CalciteRMSNorm(cfg.d_model)
             self.crystal = CalciteV2CrystalLayer(
                 d_model=cfg.d_model,
                 num_spheres=cfg.num_spheres,
@@ -539,9 +541,9 @@ class CalciteV2LM(nn.Module):
                 else:
                     self.stream_gate.bias.copy_(torch.tensor([-1.8, 0.4]))
 
-            self.mid_mlp_norm = RMSNorm(cfg.d_model)
+            self.mid_mlp_norm = CalciteRMSNorm(cfg.d_model)
             self.mid_mlp = SwiGLU(cfg.d_model, d_ff)
-            self.cryst2_norm = RMSNorm(cfg.d_model)
+            self.cryst2_norm = CalciteRMSNorm(cfg.d_model)
             self.crystal_2 = CalciteV2CrystalLayer(
                 d_model=cfg.d_model,
                 num_spheres=cfg.num_spheres,
@@ -583,7 +585,7 @@ class CalciteV2LM(nn.Module):
             self.tr_rA = nn.Parameter(torch.ones(n_tr, dtype=torch.float32))
             self.tr_rB = nn.Parameter(torch.zeros(n_tr, dtype=torch.float32))
             self.tr_sB = nn.Parameter(torch.ones(n_tr, dtype=torch.float32))
-            self.tr_phi = RMSNorm(cfg.d_model)
+            self.tr_phi = CalciteRMSNorm(cfg.d_model)
             with torch.no_grad():
                 self.tr_phi.weight.fill_(0.35)
         else:
@@ -599,7 +601,7 @@ class CalciteV2LM(nn.Module):
                     if mod is not None:
                         mod.out_proj.weight.mul_(0.35)
 
-        self.norm_f = RMSNorm(cfg.d_model)
+        self.norm_f = CalciteRMSNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
 
@@ -683,23 +685,32 @@ class CalciteV2LM(nn.Module):
         self.set_snap_alpha(alpha)
 
     def get_commitment_loss(self) -> torch.Tensor:
-        loss = torch.tensor(0.0, device=self.tok_emb.weight.device)
+        loss: torch.Tensor | None = None
         c_scale = float(self.cfg.byte_commit_scale) if self.byte_chunker.router_locked else 1.0
         for c in self._all_crystals():
             if c.last_commit_loss is not None:
-                loss = loss + c_scale * c.last_commit_loss
+                term = c_scale * c.last_commit_loss
+                loss = term if loss is None else (loss + term)
         for w in self._all_woodburys():
             if w.last_gate_loss is not None:
-                loss = loss + w.last_gate_loss
+                loss = w.last_gate_loss if loss is None else (loss + w.last_gate_loss)
         if self.epistemic_slots is not None and self.epistemic_slots.last_aux_loss is not None:
-            loss = loss + self.epistemic_slots.last_aux_loss
+            loss = (
+                self.epistemic_slots.last_aux_loss
+                if loss is None
+                else (loss + self.epistemic_slots.last_aux_loss)
+            )
         if (
             self.byte_chunker.byte_induct_cache is not None
             and self.byte_chunker.byte_induct_cache.last_aux_loss is not None
         ):
-            loss = loss + self.byte_chunker.byte_induct_cache.last_aux_loss
+            term = self.byte_chunker.byte_induct_cache.last_aux_loss
+            loss = term if loss is None else (loss + term)
         if self.byte_chunker.last_ratio_loss is not None:
-            loss = loss + float(self.cfg.ratio_loss_scale) * self.byte_chunker.last_ratio_loss
+            term = float(self.cfg.ratio_loss_scale) * self.byte_chunker.last_ratio_loss
+            loss = term if loss is None else (loss + term)
+        if loss is None:
+            return torch.zeros((), device=self.tok_emb.weight.device, dtype=torch.float32)
         return loss
 
     def _forward_core(
@@ -784,7 +795,6 @@ class CalciteV2LM(nn.Module):
 
         def _long_mem_fn(u_in: torch.Tensor) -> torch.Tensor:
             h_split = self.split_norm(u_in)
-            delta_long = torch.zeros_like(u_in)
             if not ablate_crystal and not ablate_woodbury and self.stream_gate is not None:
                 gates = 2.0 * torch.sigmoid(self.stream_gate(h_split))
                 w_out = self.woodbury(h_split, h_lex=e_lex)
@@ -797,16 +807,17 @@ class CalciteV2LM(nn.Module):
                     delta_long = delta_long + es_g * self.epistemic_slots(
                         h_split, self.woodbury.last_epistemic_uncertainty, h_lex=e_lex
                     )
-            else:
-                if not ablate_crystal:
-                    delta_long = delta_long + self.crystal(h_split, h_lex=e_lex)
-                if not ablate_woodbury:
-                    delta_long = delta_long + self.woodbury(h_split, h_lex=e_lex)
-                    if self.epistemic_slots is not None and self.epistemic_slots_gate is not None:
-                        es_g = 2.0 * torch.sigmoid(self.epistemic_slots_gate(h_split))
-                        delta_long = delta_long + es_g * self.epistemic_slots(
-                            h_split, self.woodbury.last_epistemic_uncertainty, h_lex=e_lex
-                        )
+                return delta_long
+            delta_long = torch.zeros_like(u_in)
+            if not ablate_crystal:
+                delta_long = delta_long + self.crystal(h_split, h_lex=e_lex)
+            if not ablate_woodbury:
+                delta_long = delta_long + self.woodbury(h_split, h_lex=e_lex)
+                if self.epistemic_slots is not None and self.epistemic_slots_gate is not None:
+                    es_g = 2.0 * torch.sigmoid(self.epistemic_slots_gate(h_split))
+                    delta_long = delta_long + es_g * self.epistemic_slots(
+                        h_split, self.woodbury.last_epistemic_uncertainty, h_lex=e_lex
+                    )
             return delta_long
 
         if use_ar and self.attnres_mixers is not None:
@@ -886,10 +897,23 @@ class CalciteV2LM(nn.Module):
         feedback_passes: int | None = None,
         tr_passes: int | None = None,
         tr_backprop_passes: int | None = None,
-    ) -> torch.Tensor:
+        precomputed_chunks: dict[str, object] | None = None,
+        return_chunks: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, object]]:
         e_tok = self.tok_emb(token_ids)
+        if (
+            self.cfg.bf16_residual_stream
+            and e_tok.device.type in ("cuda", "cpu")
+            and torch.is_autocast_enabled(e_tok.device.type)
+            and torch.get_autocast_dtype(e_tok.device.type) == torch.bfloat16
+        ):
+            e_tok = e_tok.to(torch.bfloat16)
         z_in, h_lex_chunk, ctx = self.byte_chunker.encode_to_chunks(
-            e_tok, token_ids, self.tok_emb.weight
+            e_tok,
+            token_ids,
+            self.tok_emb.weight,
+            precomputed_router=precomputed_chunks,
+            force_static_m_cap=bool(return_chunks and self.byte_chunker.use_static_m_cap),
         )
 
         if self.cfg.use_temporal_residual and self.tr_phi is not None:
@@ -933,7 +957,10 @@ class CalciteV2LM(nn.Module):
                     else:
                         b_init = torch.zeros_like(z_in)
             h = self.byte_chunker.decode_from_chunks(z_hat, ctx)
-            return self.lm_head(self.norm_f(h))
+            logits = self.lm_head(self.norm_f(h))
+            if return_chunks:
+                return logits, self.byte_chunker.extract_router_chunks(ctx)
+            return logits
 
         if self.cfg.use_latent_feedback and self.fb_norm is not None and self.fb_proj is not None:
             if feedback_passes is not None:
@@ -965,7 +992,10 @@ class CalciteV2LM(nn.Module):
             ablate_woodbury=ablate_woodbury,
         )
         h = self.byte_chunker.decode_from_chunks(z_hat, ctx)
-        return self.lm_head(self.norm_f(h))
+        logits = self.lm_head(self.norm_f(h))
+        if return_chunks:
+            return logits, self.byte_chunker.extract_router_chunks(ctx)
+        return logits
 
 
 def compute_v2_state_cache_kb(cfg: CalciteV2Config, seq_len: int = 2048) -> float:
@@ -1013,6 +1043,8 @@ def compute_v2_state_cache_kb(cfg: CalciteV2Config, seq_len: int = 2048) -> floa
         else 0
     )
 
+    d_dw = resolve_dw_dim(cfg.d_model, cfg.dw_bottleneck_ratio)
+    sym_dw_taps = 6 + (12 if cfg.dec_dw3_enabled else 0)
     chunker_b = (
         7 * cfg.byte_char_dim * 2
         + 3 * cfg.byte_router_char_dim * 2
@@ -1020,9 +1052,9 @@ def compute_v2_state_cache_kb(cfg: CalciteV2Config, seq_len: int = 2048) -> floa
         + 4
         + 2 * cfg.d_model * 4
         + (4 * 4 if cfg.byte_chunk_mode == "utf8" else 4)
-        + (9 * cfg.d_model * 2 if cfg.use_scaled_decoder else 0)
+        + (9 * d_dw * 2 if cfg.use_scaled_decoder else 0)
         + (
-            (18 * cfg.d_model * 2 + 2 * cfg.byte_swa_window * cfg.byte_swa_dim * 2)
+            (sym_dw_taps * d_dw * 2 + 2 * cfg.byte_swa_window * cfg.byte_swa_dim * 2)
             if cfg.use_sym_byte_swa
             else 0
         )
@@ -1070,6 +1102,9 @@ def build_calcite_v2_tier_config(
     tr_train_passes: int = 4,
     tr_eval_passes: int = 8,
     tr_backprop_passes: int = 2,
+    dec_dw3_enabled: bool = True,
+    dw_bottleneck_ratio: float = 1.0,
+    bf16_residual_stream: bool = False,
 ) -> CalciteV2Config:
     """
     Parameter-matched (< 2% vs Phase K tiers) `CalciteV2Config` for `S1_5M`, `S2_25M`, `S3_85M`.
@@ -1140,4 +1175,7 @@ def build_calcite_v2_tier_config(
         tr_train_passes=int(tr_train_passes),
         tr_eval_passes=int(tr_eval_passes),
         tr_backprop_passes=int(tr_backprop_passes),
+        dec_dw3_enabled=bool(dec_dw3_enabled),
+        dw_bottleneck_ratio=float(dw_bottleneck_ratio),
+        bf16_residual_stream=bool(bf16_residual_stream),
     )

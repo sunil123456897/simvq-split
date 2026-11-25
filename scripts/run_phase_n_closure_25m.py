@@ -24,7 +24,7 @@ from pathlib import Path
 import random
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -41,7 +41,11 @@ from calcite_v2 import (  # noqa: E402
     build_calcite_v2_tier_config,
     compute_v2_state_cache_kb,
 )
-from experiments.scaling_phase_k.eval_suite import has_usable_cuda  # noqa: E402
+from experiments.scaling_phase_k.eval_suite import (  # noqa: E402
+    BatchPrefetcher,
+    has_usable_cuda,
+    load_utf8_corpus_array,
+)
 from kernels.fast_calcite_scans import clear_fast_qat_cache, unwrap_compiled_state_dict  # noqa: E402
 from kernels.fast_packed_lut import (  # noqa: E402
     get_lut_backend_info,
@@ -57,21 +61,25 @@ from scripts.colab_phase_k_scaling_runner import (  # noqa: E402
     _fp_micro_ce,
     _make_adamw,
     _qat_micro_step,
+    _run_4tap_qat_step,
     _run_accum_microbatches,
     _snapshot_router_params,
 )
 from scripts.colab_phase_l_v2_runner import (  # noqa: E402
     benchmark_stream_engine_live,
     build_eval_bundles,
+    compile_v2_swa_blocks,
     ensure_phase_k_corpus,
     eval_long_context_stress,
     evaluate_full_model,
+    inject_l2048_from_extrap,
     load_frozen_router_into,
     set_all_seeds,
 )
 from scripts.muon_opt import MuonAdamWHybrid  # noqa: E402
 from scripts.run_phase_l_closure_25m import (  # noqa: E402
     _default_micro_bs,
+    _recommended_lut_cog_bs,
     load_calcite_v2_lut_checkpoint,
 )
 from scripts.run_phase_m_stage_c_v3_5m import _split_v3_qat_4groups  # noqa: E402
@@ -132,7 +140,7 @@ def build_calcite_v31_25m_config(smoke: bool = False, slots: int = 1024) -> Calc
 def _inject_mqar_rows(
     xb_full: torch.Tensor,
     yb_full: torch.Tensor,
-    train_mm: np.memmap,
+    train_mm: np.ndarray,
     n_copy: int,
     rng_py: random.Random,
     rng_np: np.random.Generator,
@@ -143,9 +151,10 @@ def _inject_mqar_rows(
     """
     B, T = xb_full.shape
     n_copy = max(1, min(B - 1, int(n_copy)))
+    dev = xb_full.device
     xb = xb_full.clone()
     yb = yb_full.clone()
-    mb = torch.zeros((B, T), dtype=torch.bool, device=xb.device)
+    mb = torch.zeros((B, T), dtype=torch.bool, device=dev)
     stride = max(1, B // n_copy)
     idxs = [min(B - 1, i * stride) for i in range(n_copy)]
     xs, ys, ms = [], [], []
@@ -154,10 +163,23 @@ def _inject_mqar_rows(
         xs.append(xr)
         ys.append(yr)
         ms.append(mr)
-    idx_t = torch.tensor(idxs, dtype=torch.long, device=xb.device)
-    xb[idx_t] = torch.tensor(xs, dtype=torch.long, device=xb.device)
-    yb[idx_t] = torch.tensor(ys, dtype=torch.long, device=xb.device)
-    mb[idx_t] = torch.tensor(ms, dtype=torch.bool, device=xb.device)
+    idx_t = torch.tensor(idxs, dtype=torch.long)
+    xs_t = torch.from_numpy(np.asarray(xs, dtype=np.int64))
+    ys_t = torch.from_numpy(np.asarray(ys, dtype=np.int64))
+    ms_t = torch.from_numpy(np.asarray(ms, dtype=np.bool_))
+    if dev.type == "cuda":
+        idx_t = idx_t.pin_memory().to(device=dev, non_blocking=True)
+        xs_t = xs_t.pin_memory().to(device=dev, non_blocking=True)
+        ys_t = ys_t.pin_memory().to(device=dev, non_blocking=True)
+        ms_t = ms_t.pin_memory().to(device=dev, non_blocking=True)
+    elif dev.type != "cpu":
+        idx_t = idx_t.to(device=dev)
+        xs_t = xs_t.to(device=dev)
+        ys_t = ys_t.to(device=dev)
+        ms_t = ms_t.to(device=dev)
+    xb[idx_t] = xs_t
+    yb[idx_t] = ys_t
+    mb[idx_t] = ms_t
     return xb, yb, mb
 
 
@@ -180,7 +202,7 @@ def run_v31_closure_25m(
     if device == "cuda":
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         if vram_gb < 12.0:
-            torch.cuda.set_per_process_memory_fraction(0.72, 0)
+            torch.cuda.set_per_process_memory_fraction(0.90, 0)
     use_amp = device == "cuda" and torch.cuda.is_bf16_supported()
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -208,8 +230,8 @@ def run_v31_closure_25m(
         batch_size, seq_len = 8, 128
     else:
         train_bin, val_bin = ensure_phase_k_corpus(data_dir)
-        train_mm = np.memmap(train_bin, dtype=np.uint16, mode="r")
-        val_mm = np.memmap(val_bin, dtype=np.uint16, mode="r")
+        train_mm = load_utf8_corpus_array(train_bin)
+        val_mm = load_utf8_corpus_array(val_bin)
 
     grok_steps = s1a_steps + s1b_steps
     total_fp_steps = grok_steps + s2_steps
@@ -285,55 +307,63 @@ def run_v31_closure_25m(
             warm_1a = min(60, max(1, s1a_steps // 12))
             live_diag = (1000, 1500, s1a_steps) if ((not smoke) and s1a_steps >= 1000) else ()
             t_1a = time.perf_counter()
+            s1a_it = iter(range(1, s1a_steps + 1))
 
-            for step in range(1, s1a_steps + 1):
-                model.train()
-                model.set_crystal_schedule(step, s1a_steps)
-                lr_s = _cosine_lr(step, s1a_steps, warm_1a, base_lr_1a, 2.0e-4)
-                sc = lr_s / base_lr_1a
-                for pg in opt_1a.param_groups:
-                    pg["lr"] = base_lr_1a * float(pg.get("lr_mult", 1.0)) * sc
-                xb_full, yb_full = batcher.sample_batch(
+            def _sample_n_s1a():
+                st = next(s1a_it)
+                return batcher.sample_batch(
                     batch_size,
-                    device,
-                    step=step,
+                    "cpu",
+                    step=st,
                     grok_steps=grok_steps,
                     total_steps=total_fp_steps,
                     s1b_steps=s1b_steps,
                     s1a_offset=0,
                 )
-                micro_bs, ce_sum_t = _run_accum_microbatches(
-                    xb_full,
-                    yb_full,
-                    micro_bs,
-                    opt_1a,
-                    device,
-                    f"S1A s={step}",
-                    lambda xb, yb, cur_acc, m_ref=model: _fp_micro_ce(
-                        m_ref, xb, yb, tok.PAD_ID, use_amp, cur_acc, 0.04
-                    ),
-                )
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt_1a.step()
 
-                if step in (1, s1a_steps) or (step % 250 == 0):
-                    ce_v = float(ce_sum_t.item()) / float(max(1, batch_size // micro_bs)) if ce_sum_t is not None else 0.0
-                    b_ch = model.byte_chunker.last_chunk_ratio
-                    vram_mb = torch.cuda.memory_allocated() / 1e6 if device == "cuda" else 0.0
-                    print(
-                        f"  [S1A] step {step:4d}/{s1a_steps} | b/ch={b_ch:.2f} | ce={ce_v:.4f} | "
-                        f"VRAM={vram_mb:.0f}MB | {(time.perf_counter()-t_1a)/60:.1f}m",
-                        flush=True,
-                    )
-                if step in live_diag:
-                    model.eval()
-                    model.set_snap_alpha(1.0)
-                    pk2, _, _, _ = evaluate_suite_batched(
-                        model, s5_suites["k2"][:32], pad_id=tok.PAD_ID, batch_size=16, device=device
-                    )
-                    print(f"  [S1A LIVE step={step}] s5_k2_32={pk2:.1f}%", flush=True)
+            with BatchPrefetcher(
+                _sample_n_s1a, device=device, total_steps=s1a_steps, prefetch_depth=4, enabled=(s1a_steps >= 4)
+            ) as pf_1a:
+                for step in range(1, s1a_steps + 1):
                     model.train()
                     model.set_crystal_schedule(step, s1a_steps)
+                    lr_s = _cosine_lr(step, s1a_steps, warm_1a, base_lr_1a, 2.0e-4)
+                    sc = lr_s / base_lr_1a
+                    for pg in opt_1a.param_groups:
+                        pg["lr"] = base_lr_1a * float(pg.get("lr_mult", 1.0)) * sc
+                    xb_full, yb_full = pf_1a.next_batch()
+                    micro_bs, ce_sum_t = _run_accum_microbatches(
+                        xb_full,
+                        yb_full,
+                        micro_bs,
+                        opt_1a,
+                        device,
+                        f"S1A s={step}",
+                        lambda xb, yb, cur_acc, m_ref=model: _fp_micro_ce(
+                            m_ref, xb, yb, tok.PAD_ID, use_amp, cur_acc, 0.04
+                        ),
+                    )
+                    torch.nn.utils.clip_grad_norm_(opt_1a.trainable_params, 1.0)
+                    opt_1a.step()
+
+                    if step in (1, s1a_steps) or (step % 250 == 0):
+                        ce_v = float(ce_sum_t.item()) / float(max(1, batch_size // micro_bs)) if ce_sum_t is not None else 0.0
+                        b_ch = model.byte_chunker.last_chunk_ratio
+                        vram_mb = torch.cuda.memory_allocated() / 1e6 if device == "cuda" else 0.0
+                        print(
+                            f"  [S1A] step {step:4d}/{s1a_steps} | b/ch={b_ch:.2f} | ce={ce_v:.4f} | "
+                            f"VRAM={vram_mb:.0f}MB | {(time.perf_counter()-t_1a)/60:.1f}m",
+                            flush=True,
+                        )
+                    if step in live_diag:
+                        model.eval()
+                        model.set_snap_alpha(1.0)
+                        pk2, _, _, _ = evaluate_suite_batched(
+                            model, s5_suites["k2"][:32], pad_id=tok.PAD_ID, batch_size=16, device=device
+                        )
+                        print(f"  [S1A LIVE step={step}] s5_k2_32={pk2:.1f}%", flush=True)
+                        model.train()
+                        model.set_crystal_schedule(step, s1a_steps)
 
             del opt_1a
             if device == "cuda":
@@ -363,38 +393,45 @@ def run_v31_closure_25m(
             )
             warm_1b = min(35, max(1, s1b_steps // 8))
             t_1b = time.perf_counter()
+            s1b_it = iter(range(1, s1b_steps + 1))
 
-            for o_step in range(1, s1b_steps + 1):
-                step = s1a_steps + o_step
-                model.train()
-                model.set_crystal_schedule(s1a_steps, s1a_steps)
-                model.set_snap_alpha(1.0)
-                lr_s = _cosine_lr(o_step, s1b_steps, warm_1b, base_lr_1b, 1.5e-4)
-                sc = lr_s / base_lr_1b
-                for pg in opt_1b.param_groups:
-                    pg["lr"] = base_lr_1b * float(pg.get("lr_mult", 1.0)) * sc
-                xb_full, yb_full = batcher.sample_batch(
-                    batch_size, device, step=step, grok_steps=grok_steps, total_steps=total_fp_steps, s1b_steps=s1b_steps
+            def _sample_n_s1b():
+                st = s1a_steps + next(s1b_it)
+                return batcher.sample_batch(
+                    batch_size, "cpu", step=st, grok_steps=grok_steps, total_steps=total_fp_steps, s1b_steps=s1b_steps
                 )
-                micro_bs, ce_sum_t = _run_accum_microbatches(
-                    xb_full,
-                    yb_full,
-                    micro_bs,
-                    opt_1b,
-                    device,
-                    f"S1B s={o_step}",
-                    lambda xb, yb, cur_acc, m_ref=model: _fp_micro_ce(
-                        m_ref, xb, yb, tok.PAD_ID, use_amp, cur_acc, 0.04
-                    ),
-                )
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt_1b.step()
-                if o_step in (1, max(1, s1b_steps // 2), s1b_steps) or (o_step % 125 == 0):
-                    ce_v = float(ce_sum_t.item()) / float(max(1, batch_size // micro_bs)) if ce_sum_t is not None else 0.0
-                    print(
-                        f"  [S1B] step {o_step:4d}/{s1b_steps} | ce={ce_v:.4f} | {(time.perf_counter()-t_1b)/60:.1f}m",
-                        flush=True,
+
+            with BatchPrefetcher(
+                _sample_n_s1b, device=device, total_steps=s1b_steps, prefetch_depth=4, enabled=(s1b_steps >= 4)
+            ) as pf_1b:
+                for o_step in range(1, s1b_steps + 1):
+                    model.train()
+                    model.set_crystal_schedule(s1a_steps, s1a_steps)
+                    model.set_snap_alpha(1.0)
+                    lr_s = _cosine_lr(o_step, s1b_steps, warm_1b, base_lr_1b, 1.5e-4)
+                    sc = lr_s / base_lr_1b
+                    for pg in opt_1b.param_groups:
+                        pg["lr"] = base_lr_1b * float(pg.get("lr_mult", 1.0)) * sc
+                    xb_full, yb_full = pf_1b.next_batch()
+                    micro_bs, ce_sum_t = _run_accum_microbatches(
+                        xb_full,
+                        yb_full,
+                        micro_bs,
+                        opt_1b,
+                        device,
+                        f"S1B s={o_step}",
+                        lambda xb, yb, cur_acc, m_ref=model: _fp_micro_ce(
+                            m_ref, xb, yb, tok.PAD_ID, use_amp, cur_acc, 0.04
+                        ),
                     )
+                    torch.nn.utils.clip_grad_norm_(opt_1b.trainable_params, 1.0)
+                    opt_1b.step()
+                    if o_step in (1, max(1, s1b_steps // 2), s1b_steps) or (o_step % 125 == 0):
+                        ce_v = float(ce_sum_t.item()) / float(max(1, batch_size // micro_bs)) if ce_sum_t is not None else 0.0
+                        print(
+                            f"  [S1B] step {o_step:4d}/{s1b_steps} | ce={ce_v:.4f} | {(time.perf_counter()-t_1b)/60:.1f}m",
+                            flush=True,
+                        )
 
             del opt_1b
             if device == "cuda":
@@ -447,93 +484,113 @@ def run_v31_closure_25m(
         warm_2 = min(40, max(1, s2_steps // 8))
         n_copy_s2 = max(1, int(round(batch_size * 0.094)))
         t_2 = time.perf_counter()
+        s2_it = iter(range(1, s2_steps + 1))
 
-        for s2 in range(1, s2_steps + 1):
-            step = grok_steps + s2
-            model.train()
-            model.set_crystal_schedule(s1a_steps, s1a_steps)
-            model.set_snap_alpha(1.0)
-            lr_s = _cosine_lr(s2, s2_steps, warm_2, base_lr_2, 8.0e-5)
-            sc = lr_s / base_lr_2
-            for pg in opt_2.param_groups:
-                pg["lr"] = base_lr_2 * float(pg.get("lr_mult", 1.0)) * sc
-
-            xb_full, yb_full = batcher.sample_batch(
-                batch_size, device, step=step, grok_steps=grok_steps, total_steps=total_fp_steps, s1b_steps=s1b_steps
+        def _sample_n_s2():
+            st = grok_steps + next(s2_it)
+            xb_c, yb_c, is_web = batcher.sample_batch(
+                batch_size,
+                "cpu",
+                step=st,
+                grok_steps=grok_steps,
+                total_steps=total_fp_steps,
+                s1b_steps=s1b_steps,
+                return_is_web=True,
             )
-            # Detect pure OpenWeb steps (dense targets > 60%) vs sparse cognitive maintenance steps
-            is_web_step = float((yb_full != tok.PAD_ID).float().mean().item()) > 0.60
-            if is_web_step:
-                xb_full, yb_full, mb_full = _inject_mqar_rows(
-                    xb_full, yb_full, train_mm, n_copy_s2, mqar_rng_py, mqar_rng_np
-                )
-            else:
-                mb_full = None
+            if is_web:
+                return _inject_mqar_rows(xb_c, yb_c, train_mm, n_copy_s2, mqar_rng_py, mqar_rng_np)
+            return xb_c, yb_c, None
 
-            # OOM-safe gradient accumulation supporting optional balanced copy CE
-            while True:
-                opt_2.zero_grad(set_to_none=True)
-                n_acc = max(1, (batch_size + micro_bs - 1) // micro_bs)
-                ce_sum_v = 0.0
-                c_acc_sum = 0.0
-                n_c_m = 0
-                try:
-                    for st in range(0, batch_size, micro_bs):
-                        xb = xb_full[st : st + micro_bs]
-                        yb = yb_full[st : st + micro_bs]
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                            lg = model(xb)
-                            lg_f = lg.float()
-                            if mb_full is not None:
-                                mb = mb_full[st : st + micro_bs]
-                                tok_ce = F.cross_entropy(
-                                    lg_f.reshape(-1, lg_f.size(-1)),
-                                    yb.reshape(-1),
-                                    ignore_index=tok.PAD_ID,
-                                    reduction="none",
-                                ).view_as(yb)
-                                valid = yb != tok.PAD_ID
-                                m_copy = mb & valid
-                                m_pref = (~mb) & valid
-                                ce_p = tok_ce[m_pref].mean() if m_pref.any() else tok_ce[valid].mean()
-                                if m_copy.any():
-                                    ce_c = tok_ce[m_copy].mean()
-                                    ce = 0.85 * ce_p + 0.15 * ce_c
-                                    with torch.no_grad():
-                                        c_acc_sum += float((lg_f.argmax(dim=-1)[m_copy] == yb[m_copy]).float().mean().item())
-                                    n_c_m += 1
-                                else:
-                                    ce = ce_p
-                            else:
-                                ce = F.cross_entropy(
-                                    lg_f.reshape(-1, lg_f.size(-1)),
-                                    yb.reshape(-1),
-                                    ignore_index=tok.PAD_ID,
-                                )
-                            aux = model.get_commitment_loss()
-                            loss = (ce + 0.04 * aux) / float(n_acc)
-                        loss.backward()
-                        ce_sum_v += float(ce.detach().item())
-                    break
-                except torch.cuda.OutOfMemoryError:
-                    if micro_bs <= 2:
-                        raise
-                    micro_bs = max(2, micro_bs // 2)
+        with BatchPrefetcher(
+            _sample_n_s2, device=device, total_steps=s2_steps, prefetch_depth=4, enabled=(s2_steps >= 4)
+        ) as pf_2:
+            for s2 in range(1, s2_steps + 1):
+                model.train()
+                model.set_crystal_schedule(s1a_steps, s1a_steps)
+                model.set_snap_alpha(1.0)
+                lr_s = _cosine_lr(s2, s2_steps, warm_2, base_lr_2, 8.0e-5)
+                sc = lr_s / base_lr_2
+                for pg in opt_2.param_groups:
+                    pg["lr"] = base_lr_2 * float(pg.get("lr_mult", 1.0)) * sc
+
+                xb_full, yb_full, mb_full = pf_2.next_batch()
+                is_log = (s2 in (1, s2_steps)) or (s2 % 200 == 0)
+
+                # OOM-safe gradient accumulation with branchless zero-sync balanced copy CE
+                while True:
                     opt_2.zero_grad(set_to_none=True)
-                    torch.cuda.empty_cache()
-                    print(f"  [OOM adapt] S2 s={s2}: micro_bs -> {micro_bs}", flush=True)
+                    n_acc = max(1, (batch_size + micro_bs - 1) // micro_bs)
+                    ce_acc_t: Optional[torch.Tensor] = None
+                    c_acc_t: Optional[torch.Tensor] = None
+                    n_c_m_t: Optional[torch.Tensor] = None
+                    try:
+                        for st in range(0, batch_size, micro_bs):
+                            xb = xb_full[st : st + micro_bs]
+                            yb = yb_full[st : st + micro_bs]
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                                lg = model(xb)
+                                lg_f = lg.float()
+                                if mb_full is not None:
+                                    mb = mb_full[st : st + micro_bs]
+                                    tok_ce = F.cross_entropy(
+                                        lg_f.reshape(-1, lg_f.size(-1)),
+                                        yb.reshape(-1),
+                                        ignore_index=tok.PAD_ID,
+                                        reduction="none",
+                                    ).view_as(yb)
+                                    valid = yb != tok.PAD_ID
+                                    v_f = valid.float()
+                                    m_copy_f = (mb & valid).float()
+                                    m_pref_f = ((~mb) & valid).float()
+                                    n_c_tok = m_copy_f.sum()
+                                    n_p_tok = m_pref_f.sum()
+                                    ce_v_all = (tok_ce * v_f).sum() / v_f.sum().clamp(min=1.0)
+                                    ce_p = torch.where(n_p_tok > 0.0, (tok_ce * m_pref_f).sum() / n_p_tok.clamp(min=1.0), ce_v_all)
+                                    has_c = n_c_tok > 0.0
+                                    ce_c = torch.where(has_c, (tok_ce * m_copy_f).sum() / n_c_tok.clamp(min=1.0), torch.zeros_like(ce_p))
+                                    ce = torch.where(has_c, 0.85 * ce_p + 0.15 * ce_c, ce_p)
+                                    if is_log:
+                                        with torch.no_grad():
+                                            eq_c = ((lg_f.argmax(dim=-1) == yb).float() * m_copy_f).sum() / n_c_tok.clamp(min=1.0)
+                                            eq_c = torch.where(has_c, eq_c, torch.zeros_like(eq_c))
+                                            has_c_f = has_c.float()
+                                            c_acc_t = eq_c if c_acc_t is None else (c_acc_t + eq_c)
+                                            n_c_m_t = has_c_f if n_c_m_t is None else (n_c_m_t + has_c_f)
+                                else:
+                                    ce = F.cross_entropy(
+                                        lg_f.reshape(-1, lg_f.size(-1)),
+                                        yb.reshape(-1),
+                                        ignore_index=tok.PAD_ID,
+                                    )
+                                aux = model.get_commitment_loss()
+                                loss = (ce + 0.04 * aux) / float(n_acc)
+                            loss.backward()
+                            if is_log:
+                                ce_d = ce.detach()
+                                ce_acc_t = ce_d if ce_acc_t is None else (ce_acc_t + ce_d)
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        if micro_bs <= 2:
+                            raise
+                        micro_bs = max(2, micro_bs // 2)
+                        opt_2.zero_grad(set_to_none=True)
+                        torch.cuda.empty_cache()
+                        print(f"  [OOM adapt] S2 s={s2}: micro_bs -> {micro_bs}", flush=True)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt_2.step()
-            if s2 in (1, s2_steps) or (s2 % 200 == 0):
-                bic = model.byte_chunker.byte_induct_cache
-                b_info = f" | bwr={bic.last_write_rate:.2f}(s1={bic.last_write_rate_s1:.2f})" if bic is not None else ""
-                c_info = f" | cAcc={100.0*c_acc_sum/n_c_m:5.1f}%" if n_c_m > 0 else ""
-                print(
-                    f"  [S2-utf8] step {s2:4d}/{s2_steps} | ce={ce_sum_v/n_acc:.4f}{c_info}{b_info} | "
-                    f"{(time.perf_counter()-t_2)/60:.1f}m",
-                    flush=True,
-                )
+                torch.nn.utils.clip_grad_norm_(opt_2.trainable_params, 1.0)
+                opt_2.step()
+                if is_log:
+                    ce_sum_v = float(ce_acc_t.item()) if ce_acc_t is not None else 0.0
+                    n_c_m = int(round(float(n_c_m_t.item()))) if n_c_m_t is not None else 0
+                    c_acc_sum = float(c_acc_t.item()) if c_acc_t is not None else 0.0
+                    bic = model.byte_chunker.byte_induct_cache
+                    b_info = f" | bwr={bic.last_write_rate:.2f}(s1={bic.last_write_rate_s1:.2f})" if bic is not None else ""
+                    c_info = f" | cAcc={100.0*c_acc_sum/n_c_m:5.1f}%" if n_c_m > 0 else ""
+                    print(
+                        f"  [S2-utf8] step {s2:4d}/{s2_steps} | ce={ce_sum_v/n_acc:.4f}{c_info}{b_info} | "
+                        f"{(time.perf_counter()-t_2)/60:.1f}m",
+                        flush=True,
+                    )
 
         del opt_2
         if device == "cuda":
@@ -564,8 +621,11 @@ def run_v31_closure_25m(
     eval_fp = evaluate_full_model(
         model, val_mm, eval_wins, tok, s5_suites, ov_suites, trap_suites, device=device, quick=smoke, eval_bs=8
     )
-    long_fp = eval_long_context_stress(
-        model, val_mm, device=device, lengths=(256, 512) if smoke else (2048, 8192, 32768)
+    long_fp = inject_l2048_from_extrap(
+        eval_long_context_stress(
+            model, val_mm, device=device, lengths=(256, 512) if smoke else (8192, 32768)
+        ),
+        None if smoke else eval_fp.get("extrap_4x"),
     )
     ndl_hs = (256,) if smoke else (512, 1500, 4096, 8192, 32768)
     needle_fp = eval_ood_verbatim_ladder(
@@ -594,13 +654,15 @@ def run_v31_closure_25m(
 
     qat_model = CalciteV2LM(cfg).to(device)
     qat_model.load_state_dict(fp_sd_cpu, strict=True)
-    model.byte_chunker.use_static_m_cap = False
-    qat_model.byte_chunker.use_static_m_cap = False
+    model.byte_chunker.use_static_m_cap = True
+    qat_model.byte_chunker.use_static_m_cap = True
     qat_model.byte_chunker.lock_router(True)
     qat_model.set_crystal_schedule(1, 1)
     qat_model.set_snap_alpha(1.0)
     qat_model.set_qat_mix(0.30)
     qat_model.set_ternary_qat(True)
+    if (not smoke) and device == "cuda":
+        compile_v2_swa_blocks(qat_model)
 
     gain_q, cryst_q, chunk_q, core_q = _split_v3_qat_4groups(qat_model)
     all_qp = gain_q + cryst_q + chunk_q + core_q
@@ -629,42 +691,57 @@ def run_v31_closure_25m(
     n_copy_q = max(1, int(round(batch_size * 0.0625)))
     t_q0 = time.perf_counter()
 
+    def _sample_n_qat():
+        xb_c, yb_c, is_web = batcher.sample_batch(
+            batch_size,
+            "cpu",
+            step=total_fp_steps,
+            grok_steps=grok_steps,
+            total_steps=total_fp_steps,
+            s1b_steps=s1b_steps,
+            return_is_web=True,
+        )
+        if is_web:
+            xb_c, yb_c, _ = _inject_mqar_rows(xb_c, yb_c, train_mm, n_copy_q, mqar_rng_py, mqar_rng_np)
+        return xb_c, yb_c
+
     try:
-        for qs in range(1, qat_steps + 1):
-            qat_model.train()
-            mix = min(1.0, 0.30 + 0.70 * (qs / float(ramp_q)))
-            qat_model.set_qat_mix(mix)
-            clear_fast_qat_cache()
-            for gi, (blr, mlr) in enumerate(zip(q_lrs, q_mins)):
-                opt_q.param_groups[gi]["lr"] = _cosine_lr(qs, qat_steps, warm_q, blr, mlr)
-            xb_full, yb_full = batcher.sample_batch(
-                batch_size, device, step=total_fp_steps, grok_steps=grok_steps, total_steps=total_fp_steps, s1b_steps=s1b_steps
-            )
-            if float((yb_full != tok.PAD_ID).float().mean().item()) > 0.60:
-                xb_full, yb_full, _ = _inject_mqar_rows(
-                    xb_full, yb_full, train_mm, n_copy_q, mqar_rng_py, mqar_rng_np
+        with BatchPrefetcher(
+            _sample_n_qat, device=device, total_steps=qat_steps, prefetch_depth=4, enabled=(qat_steps >= 4)
+        ) as pf_q:
+            for qs in range(1, qat_steps + 1):
+                qat_model.train()
+                mix = min(1.0, 0.30 + 0.70 * (qs / float(ramp_q)))
+                qat_model.set_qat_mix(mix)
+                clear_fast_qat_cache()
+                for gi, (blr, mlr) in enumerate(zip(q_lrs, q_mins)):
+                    opt_q.param_groups[gi]["lr"] = _cosine_lr(qs, qat_steps, warm_q, blr, mlr)
+                xb_full, yb_full = pf_q.next_batch()
+                micro_bs_q, q_ce_sum_t = _run_4tap_qat_step(
+                    model,
+                    qat_model,
+                    taps_fp,
+                    taps_q,
+                    xb_full,
+                    yb_full,
+                    micro_bs_q,
+                    opt_q,
+                    tok.PAD_ID,
+                    kl_temp,
+                    use_amp,
+                    device,
+                    f"4Tap-QAT qs={qs}",
                 )
-            micro_bs_q, q_ce_sum_t = _run_accum_microbatches(
-                xb_full,
-                yb_full,
-                micro_bs_q,
-                opt_q,
-                device,
-                f"4Tap-QAT qs={qs}",
-                lambda xb, yb, cur_acc, t_m=model, s_m=qat_model: _qat_micro_step(
-                    t_m, s_m, taps_fp, taps_q, kl_temp, xb, yb, tok.PAD_ID, use_amp, cur_acc
-                ),
-            )
-            torch.nn.utils.clip_grad_norm_(all_qp, 1.0)
-            opt_q.step()
-            clear_fast_qat_cache()
-            if qs in (1, max(1, qat_steps // 2), qat_steps) or (qs % 100 == 0):
-                qce = float(q_ce_sum_t.item()) / float(max(1, batch_size // micro_bs_q)) if q_ce_sum_t is not None else 0.0
-                print(
-                    f"  [4Tap-QAT] step {qs:4d}/{qat_steps} | mix={mix:.2f} | ce={qce:.4f} | "
-                    f"{(time.perf_counter()-t_q0)/60:.1f}m",
-                    flush=True,
-                )
+                torch.nn.utils.clip_grad_norm_(all_qp, 1.0)
+                opt_q.step()
+                clear_fast_qat_cache()
+                if qs in (1, max(1, qat_steps // 2), qat_steps) or (qs % 100 == 0):
+                    qce = float(q_ce_sum_t.item()) / float(max(1, batch_size // micro_bs_q)) if q_ce_sum_t is not None else 0.0
+                    print(
+                        f"  [4Tap-QAT] step {qs:4d}/{qat_steps} | mix={mix:.2f} | ce={qce:.4f} | "
+                        f"{(time.perf_counter()-t_q0)/60:.1f}m",
+                        flush=True,
+                    )
     finally:
         for h in hk_fp + hk_q:
             h.remove()
@@ -740,15 +817,19 @@ def run_v31_closure_25m(
     del lut_cpu_rt
     gc.collect()
 
+    lut_cog_bs = _recommended_lut_cog_bs(device, binfo)
     lut_gpu_rt, _, _, _ = load_calcite_v2_lut_checkpoint(lut_ckpt, device=device, backend=lut_bk)
-    print("  [Eval] Evaluating 2-bit LUT Calcite v3.1 (25M) from disk roundtrip...", flush=True)
+    print(f"  [Eval] Evaluating 2-bit LUT Calcite v3.1 (25M) from disk roundtrip (cog_bs={lut_cog_bs})...", flush=True)
     eval_lut = evaluate_full_model(
-        lut_gpu_rt, val_mm, eval_wins, tok, s5_suites, ov_suites, trap_suites, device=device, quick=smoke, eval_bs=8, cog_bs=2
+        lut_gpu_rt, val_mm, eval_wins, tok, s5_suites, ov_suites, trap_suites, device=device, quick=smoke, eval_bs=8, cog_bs=lut_cog_bs
     )
     if device == "cuda":
         torch.cuda.empty_cache()
-    long_lut = eval_long_context_stress(
-        lut_gpu_rt, val_mm, device=device, lengths=(256, 512) if smoke else (2048, 8192, 32768)
+    long_lut = inject_l2048_from_extrap(
+        eval_long_context_stress(
+            lut_gpu_rt, val_mm, device=device, lengths=(256, 512) if smoke else (8192, 32768)
+        ),
+        None if smoke else eval_lut.get("extrap_4x"),
     )
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -795,7 +876,7 @@ def run_v31_closure_25m(
             "smoke": smoke,
             "elapsed_s": round(time.perf_counter() - t_all, 1),
             "router_max_abs_diff": router_mut_diff,
-            "lut_checkpoint": str(lut_ckpt.relative_to(ROOT_DIR)),
+            "lut_checkpoint": str(lut_ckpt.relative_to(ROOT_DIR)) if lut_ckpt.is_relative_to(ROOT_DIR) else str(lut_ckpt),
             "lut_checkpoint_bytes": ckpt_bytes,
             "qat_seconds": qat_s,
             "stage1_gates": {

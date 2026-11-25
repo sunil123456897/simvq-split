@@ -26,10 +26,14 @@ fast_calcite_scans.py — Нативные CUDA-ядра обучения v3 д�
 from __future__ import annotations
 
 from functools import lru_cache
+import importlib.util
 import itertools
 import math
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import sysconfig
 import tempfile
 import types
@@ -1727,6 +1731,18 @@ torch::Tensor crystal_scan_fwd_cuda_impl(
                 pec.data_ptr<float>(), s_out.data_ptr<float>(), M, G_h, sc_f
             );
         }
+    } else if (G_h == 16) {
+        if (is_hard) {
+            crystal_scan_fwd_kernel<16, true><<<grid, block, 0, stream>>>(
+                s0c.data_ptr<float>(), kwc.data_ptr<float>(), vsc.data_ptr<float>(),
+                pec.data_ptr<float>(), s_out.data_ptr<float>(), M, G_h, sc_f
+            );
+        } else {
+            crystal_scan_fwd_kernel<16, false><<<grid, block, 0, stream>>>(
+                s0c.data_ptr<float>(), kwc.data_ptr<float>(), vsc.data_ptr<float>(),
+                pec.data_ptr<float>(), s_out.data_ptr<float>(), M, G_h, sc_f
+            );
+        }
     } else {
         if (is_hard) {
             crystal_scan_fwd_kernel<0, true><<<grid, block, 0, stream>>>(
@@ -1788,6 +1804,22 @@ std::vector<torch::Tensor> crystal_scan_bwd_cuda_impl(
             );
         } else {
             crystal_scan_bwd_kernel<12, false><<<grid, block, 0, stream>>>(
+                soc.data_ptr<float>(), kwc.data_ptr<float>(), kvc.data_ptr<float>(),
+                vsc.data_ptr<float>(), pec.data_ptr<float>(), goc.data_ptr<float>(),
+                g_s0.data_ptr<float>(), g_kwe.data_ptr<float>(), g_vs.data_ptr<float>(),
+                g_P.data_ptr<float>(), M, G_h, sc_f
+            );
+        }
+    } else if (G_h == 16) {
+        if (is_hard) {
+            crystal_scan_bwd_kernel<16, true><<<grid, block, 0, stream>>>(
+                soc.data_ptr<float>(), kwc.data_ptr<float>(), kvc.data_ptr<float>(),
+                vsc.data_ptr<float>(), pec.data_ptr<float>(), goc.data_ptr<float>(),
+                g_s0.data_ptr<float>(), g_kwe.data_ptr<float>(), g_vs.data_ptr<float>(),
+                g_P.data_ptr<float>(), M, G_h, sc_f
+            );
+        } else {
+            crystal_scan_bwd_kernel<16, false><<<grid, block, 0, stream>>>(
                 soc.data_ptr<float>(), kwc.data_ptr<float>(), kvc.data_ptr<float>(),
                 vsc.data_ptr<float>(), pec.data_ptr<float>(), goc.data_ptr<float>(),
                 g_s0.data_ptr<float>(), g_kwe.data_ptr<float>(), g_vs.data_ptr<float>(),
@@ -2081,25 +2113,319 @@ def _has_python_headers() -> bool:
     return bool(inc) and (Path(inc) / "Python.h").is_file()
 
 
+def _prepend_env_path(var_name: str, dirs: list[str]) -> None:
+    if not dirs:
+        return
+    sep = os.pathsep
+    cur = os.environ.get(var_name, "")
+    existing = [p for p in cur.split(sep) if p]
+    existing_norm = {os.path.normcase(os.path.normpath(p)) for p in existing}
+    to_add: list[str] = []
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        nd = os.path.normcase(os.path.normpath(d))
+        if nd not in existing_norm:
+            to_add.append(d)
+            existing_norm.add(nd)
+    if to_add:
+        os.environ[var_name] = sep.join(to_add + existing)
+
+
+def _find_vs2022_vcvars64() -> Path | None:
+    if sys.platform != "win32":
+        return None
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = Path(pf86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        try:
+            proc = subprocess.run(
+                [
+                    str(vswhere),
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            inst = proc.stdout.strip().splitlines()
+            if inst:
+                cand = Path(inst[0].strip()) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if cand.is_file():
+                    return cand
+        except Exception:
+            pass
+
+    for root in (
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft Visual Studio",
+        Path(pf86) / "Microsoft Visual Studio",
+    ):
+        for year in ("2022", "2019"):
+            for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+                cand = root / year / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if cand.is_file():
+                    return cand
+    return None
+
+
 @lru_cache(maxsize=1)
+def _activate_windows_msvc_env() -> str | None:
+    if sys.platform != "win32":
+        return shutil.which("g++") or shutil.which("clang++")
+    cl_now = shutil.which("cl")
+    if cl_now and os.environ.get("INCLUDE") and os.environ.get("LIB"):
+        return cl_now
+    vcvars = _find_vs2022_vcvars64()
+    if vcvars is None:
+        return cl_now
+    try:
+        proc = subprocess.run(
+            f'call "{vcvars}" >nul && set',
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            for line in proc.stdout.splitlines():
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if not k:
+                    continue
+                ku = k.upper()
+                if ku == "PATH":
+                    _prepend_env_path("PATH", [p for p in v.split(os.pathsep) if p])
+                elif ku in ("INCLUDE", "LIB", "LIBPATH"):
+                    _prepend_env_path(k, [p for p in v.split(os.pathsep) if p])
+                else:
+                    os.environ[k] = v
+            os.environ["DISTUTILS_USE_SDK"] = "1"
+            os.environ["MSSdk"] = "1"
+    except Exception:
+        pass
+    return shutil.which("cl")
+
+
+def _discover_nvidia_pip_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    cand_dirs: list[Path] = []
+    try:
+        spec = importlib.util.find_spec("nvidia")
+        if spec is not None and spec.submodule_search_locations:
+            for loc in spec.submodule_search_locations:
+                cand_dirs.append(Path(loc))
+    except Exception:
+        pass
+    for key in ("platlib", "purelib"):
+        p = sysconfig.get_path(key)
+        if p:
+            cand_dirs.append(Path(p) / "nvidia")
+    for d in cand_dirs:
+        if d.is_dir():
+            nd = os.path.normcase(str(d.resolve()))
+            if nd not in seen:
+                seen.add(nd)
+                roots.append(d.resolve())
+    return roots
+
+
+@lru_cache(maxsize=1)
+def prepare_cuda_build_env() -> dict[str, object]:
+    """
+    Auto-discovers MSVC (`vcvars64.bat`/`cl.exe`) on Windows and `nvcc` + CUDA headers/libs
+    (supporting standard CUDA Toolkits and pip `nvidia-cuda-*-cu13` wheels). Updates
+    `os.environ` and `torch.utils.cpp_extension.CUDA_HOME` idempotently and returns build flags.
+    """
+    is_win = sys.platform == "win32"
+    nvcc_exe = "nvcc.exe" if is_win else "nvcc"
+    cxx_path = _activate_windows_msvc_env() if is_win else (shutil.which("g++") or shutil.which("clang++"))
+
+    include_paths: list[str] = []
+    lib_paths: list[str] = []
+    bin_paths: list[str] = []
+    nvcc_path: str | None = shutil.which("nvcc")
+    cuda_home: str | None = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+
+    # 1. Inspect standard CUDA Toolkit installs (prefer matching torch.version.cuda major.minor)
+    torch_cu = str(getattr(torch.version, "cuda", "") or "")
+    toolkit_cands: list[Path] = []
+    if cuda_home:
+        toolkit_cands.append(Path(cuda_home))
+    if is_win:
+        tk_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+        if tk_root.is_dir():
+            found = sorted(tk_root.glob("v*"), reverse=True)
+            if torch_cu:
+                found.sort(key=lambda p: (not p.name.startswith(f"v{torch_cu}"), p.name), reverse=False)
+            toolkit_cands.extend(found)
+    else:
+        for p_str in ("/usr/local/cuda", "/usr/local/cuda-13.0", "/usr/local/cuda-12.8"):
+            p = Path(p_str)
+            if p.is_dir():
+                toolkit_cands.append(p)
+
+    for tk in toolkit_cands:
+        cand_nvcc = tk / "bin" / nvcc_exe
+        if cand_nvcc.is_file():
+            if nvcc_path is None:
+                nvcc_path = str(cand_nvcc)
+            if not cuda_home or not (Path(cuda_home) / "bin" / nvcc_exe).is_file():
+                cuda_home = str(tk)
+            bin_paths.append(str(tk / "bin"))
+            if (tk / "include").is_dir():
+                include_paths.append(str(tk / "include"))
+            for sub in ("lib/x64", "lib64", "lib"):
+                lp = tk / sub
+                if lp.is_dir():
+                    lib_paths.append(str(lp))
+            break
+
+    # 2. Inspect pip `nvidia/cuda_*` wheel directories (`nvidia/cu13`, `nvidia-cuda-nvcc-cu13`, `cuda_runtime`, `cuda_cccl`, etc.)
+    for nv_root in _discover_nvidia_pip_roots():
+        for pkg_name in (
+            "cu13",
+            "cuda_nvcc",
+            "cuda_runtime",
+            "cuda_cccl",
+            "cublas",
+            "cusparse",
+            "cusolver",
+            "curand",
+        ):
+            pdir = nv_root / pkg_name
+            if not pdir.is_dir():
+                continue
+            for extra_nvcc in (pdir / "bin" / nvcc_exe, pdir / "bin" / "x86_64" / nvcc_exe):
+                if extra_nvcc.is_file():
+                    if nvcc_path is None:
+                        nvcc_path = str(extra_nvcc)
+                    if not cuda_home or not (Path(cuda_home) / "bin" / nvcc_exe).is_file():
+                        cuda_home = str(pdir)
+                    bin_paths.append(str(extra_nvcc.parent))
+            for inc_sub in ("include", "include/cccl"):
+                inc_d = pdir / inc_sub
+                if inc_d.is_dir():
+                    include_paths.append(str(inc_d))
+            for bin_sub in ("bin", "bin/x64", "nvvm/bin"):
+                bd = pdir / bin_sub
+                if bd.is_dir():
+                    bin_paths.append(str(bd))
+            for lib_sub in ("lib/x64", "lib64", "lib"):
+                ld = pdir / lib_sub
+                if ld.is_dir():
+                    lib_paths.append(str(ld))
+
+    # Deduplicate preserving order
+    def _dedup(items: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for it in items:
+            if not it or not os.path.isdir(it):
+                continue
+            norm = os.path.normcase(os.path.normpath(it))
+            if norm not in seen:
+                seen.add(norm)
+                out.append(it)
+        return out
+
+    bin_paths = _dedup(bin_paths)
+    include_paths = _dedup(include_paths)
+    lib_paths = _dedup(lib_paths)
+
+    _prepend_env_path("PATH", bin_paths)
+    if is_win:
+        _prepend_env_path("INCLUDE", include_paths)
+        _prepend_env_path("LIB", lib_paths)
+    if nvcc_path is None:
+        nvcc_path = shutil.which("nvcc")
+    if cuda_home:
+        cur_ch = os.environ.get("CUDA_HOME")
+        if not cur_ch or not (Path(cur_ch) / "bin" / nvcc_exe).is_file():
+            os.environ["CUDA_HOME"] = cuda_home
+        cur_cp = os.environ.get("CUDA_PATH")
+        if not cur_cp or not (Path(cur_cp) / "bin" / nvcc_exe).is_file():
+            os.environ["CUDA_PATH"] = cuda_home
+        try:
+            import torch.utils.cpp_extension as _ce
+
+            if not _ce.CUDA_HOME or not (Path(_ce.CUDA_HOME) / "bin" / nvcc_exe).is_file():
+                _ce.CUDA_HOME = cuda_home
+        except Exception:
+            pass
+
+    if is_win:
+        extra_cflags = ["/O2", "/EHsc", "/Zc:preprocessor", "/wd4267", "/wd4244", "/wd4068"]
+        extra_cuda_cflags = [
+            "-O3",
+            "--use_fast_math",
+            "-allow-unsupported-compiler",
+            "-Xcompiler",
+            "/O2",
+            "-Xcompiler",
+            "/EHsc",
+            "-Xcompiler",
+            "/Zc:preprocessor",
+        ]
+        extra_ldflags = [f"/LIBPATH:{lp}" for lp in lib_paths]
+    else:
+        extra_cflags = ["-O3"]
+        extra_cuda_cflags = ["-O3", "--use_fast_math"]
+        extra_ldflags = [f"-L{lp}" for lp in lib_paths]
+
+    return {
+        "nvcc_path": nvcc_path,
+        "cuda_home": cuda_home,
+        "cxx_path": cxx_path,
+        "include_paths": include_paths,
+        "lib_paths": lib_paths,
+        "extra_cflags": extra_cflags,
+        "extra_cuda_cflags": extra_cuda_cflags,
+        "extra_ldflags": extra_ldflags,
+    }
+
+
+_SCANS_EXT_UNSET = object()
+_SCANS_EXT_CACHE: object = _SCANS_EXT_UNSET
+
+
 def _load_fast_scans_cuda_ext():
-    global _CUDA_BUILD_ERROR
+    global _CUDA_BUILD_ERROR, _SCANS_EXT_CACHE
+    if _SCANS_EXT_CACHE is not _SCANS_EXT_UNSET:
+        return _SCANS_EXT_CACHE
     if not torch.cuda.is_available():
         _CUDA_BUILD_ERROR = "CUDA device unavailable"
+        _SCANS_EXT_CACHE = None
         return None
-    if shutil.which("nvcc") is None:
-        _CUDA_BUILD_ERROR = "nvcc not found in PATH"
+    env_info = prepare_cuda_build_env()
+    if env_info["nvcc_path"] is None:
+        _CUDA_BUILD_ERROR = "nvcc not found in PATH or CUDA/pip directories"
+        _SCANS_EXT_CACHE = None
+        return None
+    if sys.platform == "win32" and env_info["cxx_path"] is None:
+        _CUDA_BUILD_ERROR = "MSVC cl.exe not found (Visual Studio Build Tools missing)"
+        _SCANS_EXT_CACHE = None
         return None
     if not _has_python_headers():
         _CUDA_BUILD_ERROR = "Python.h dev headers missing"
+        _SCANS_EXT_CACHE = None
         return None
     try:
         from torch.utils.cpp_extension import load_inline
 
-        build_dir = Path(tempfile.gettempdir()) / "calcite5_fast_scans_cuda_v3"
+        build_dir = Path(tempfile.gettempdir()) / "calcite5_fast_scans_cuda_v3_1"
         build_dir.mkdir(parents=True, exist_ok=True)
         mod = load_inline(
-            name="calcite5_fast_scans_cuda_ext_v3",
+            name="calcite5_fast_scans_cuda_ext_v3_1",
             cpp_sources=[_CUDA_CPP_SOURCE],
             cuda_sources=[_CUDA_KERNEL_SOURCE],
             functions=[
@@ -2113,24 +2439,31 @@ def _load_fast_scans_cuda_ext():
                 "woodbury_tern_m_bwd_cuda",
                 "fused_ternary_ste_cuda",
             ],
-            extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_cflags=list(env_info["extra_cflags"]),
+            extra_cuda_cflags=list(env_info["extra_cuda_cflags"]),
+            extra_ldflags=list(env_info["extra_ldflags"]) or None,
+            extra_include_paths=list(env_info["include_paths"]) or None,
             build_directory=str(build_dir),
             with_cuda=True,
             verbose=False,
         )
         _CUDA_BUILD_ERROR = None
+        _SCANS_EXT_CACHE = mod
         return mod
     except Exception as exc:
         _CUDA_BUILD_ERROR = f"{type(exc).__name__}: {exc}"
+        _SCANS_EXT_CACHE = None
         return None
 
 
 def get_fast_scans_backend_info() -> dict[str, object]:
+    env_info = prepare_cuda_build_env()
     ext = _load_fast_scans_cuda_ext()
     return {
         "cuda_available": bool(torch.cuda.is_available()),
-        "nvcc_found": shutil.which("nvcc") is not None,
+        "nvcc_found": env_info["nvcc_path"] is not None,
+        "nvcc_path": env_info["nvcc_path"],
+        "cxx_path": env_info["cxx_path"],
         "cuda_ext_available": ext is not None,
         "cuda_build_error": _CUDA_BUILD_ERROR,
         "version": "v3",
@@ -2140,6 +2473,339 @@ def get_fast_scans_backend_info() -> dict[str, object]:
 # ---------------------------------------------------------------------------
 # Autograd Functions & Python Dispatch Wrappers
 # ---------------------------------------------------------------------------
+
+
+_HAS_CUSTOM_OP = hasattr(torch, "library") and hasattr(torch.library, "custom_op")
+
+if _HAS_CUSTOM_OP:
+
+    @torch.library.custom_op("calcite5::utf8_chunk_span", mutates_args=())
+    def _utf8_chunk_span_op(
+        raw_cand: torch.Tensor,
+        valid_mask: torch.Tensor,
+        can_fire_mask: torch.Tensor,
+        is_lead: torch.Tensor,
+        char_len: torch.Tensor,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+    ) -> torch.Tensor:
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        return ext.utf8_chunk_span_cuda(
+            raw_cand,
+            valid_mask,
+            can_fire_mask,
+            is_lead,
+            char_len,
+            int(max_cp_span),
+            int(max_byte_span),
+            int(refill_int),
+            int(cost_int),
+            int(burst_int),
+        )
+
+    @_utf8_chunk_span_op.register_fake
+    def _utf8_chunk_span_fake(
+        raw_cand: torch.Tensor,
+        valid_mask: torch.Tensor,
+        can_fire_mask: torch.Tensor,
+        is_lead: torch.Tensor,
+        char_len: torch.Tensor,
+        max_cp_span: int,
+        max_byte_span: int,
+        refill_int: int,
+        cost_int: int,
+        burst_int: int,
+    ) -> torch.Tensor:
+        del valid_mask, can_fire_mask, is_lead, char_len
+        del max_cp_span, max_byte_span, refill_int, cost_int, burst_int
+        return torch.empty_like(raw_cand, dtype=torch.bool)
+
+    @torch.library.custom_op("calcite5::causal_refractory_gate_fwd", mutates_args=())
+    def _causal_refractory_gate_fwd_op(
+        p_raw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        out, mult = ext.causal_refractory_gate_cuda(p_raw)
+        return out.to(p_raw.dtype), mult
+
+    @_causal_refractory_gate_fwd_op.register_fake
+    def _causal_refractory_gate_fwd_fake(
+        p_raw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty_like(p_raw), torch.empty_like(p_raw, dtype=torch.float32)
+
+    def _refractory_setup_context(ctx, inputs, output) -> None:
+        del inputs
+        _, mult = output
+        ctx.save_for_backward(mult)
+
+    def _refractory_bwd(
+        ctx, grad_out: torch.Tensor | None, grad_mult: torch.Tensor | None
+    ):
+        del grad_mult
+        if grad_out is None:
+            return None
+        (mult,) = ctx.saved_tensors
+        return (grad_out.float() * mult).to(grad_out.dtype)
+
+    _causal_refractory_gate_fwd_op.register_autograd(
+        _refractory_bwd, setup_context=_refractory_setup_context
+    )
+
+    @torch.library.custom_op("calcite5::birkhoff_greedy_perm", mutates_args=())
+    def _birkhoff_greedy_perm_op(scores: torch.Tensor) -> torch.Tensor:
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        return ext.birkhoff_greedy_perm_cuda(scores).to(scores.dtype)
+
+    @_birkhoff_greedy_perm_op.register_fake
+    def _birkhoff_greedy_perm_fake(scores: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(scores)
+
+    @torch.library.custom_op("calcite5::crystal_scan_fwd", mutates_args=())
+    def _crystal_scan_fwd_op(
+        s0: torch.Tensor,
+        kw_eff_seq: torch.Tensor,
+        kw_vg_seq: torch.Tensor,
+        v_ste_seq: torch.Tensor,
+        P_eff_seq: torch.Tensor,
+        is_hard: bool,
+        scale_r: float,
+    ) -> torch.Tensor:
+        del kw_vg_seq
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        return ext.crystal_scan_fwd_cuda(
+            s0, kw_eff_seq, v_ste_seq, P_eff_seq, bool(is_hard), float(scale_r)
+        )
+
+    @_crystal_scan_fwd_op.register_fake
+    def _crystal_scan_fwd_fake(
+        s0: torch.Tensor,
+        kw_eff_seq: torch.Tensor,
+        kw_vg_seq: torch.Tensor,
+        v_ste_seq: torch.Tensor,
+        P_eff_seq: torch.Tensor,
+        is_hard: bool,
+        scale_r: float,
+    ) -> torch.Tensor:
+        del kw_eff_seq, kw_vg_seq, P_eff_seq, is_hard, scale_r
+        BH, G_h, d_s = s0.shape
+        M = v_ste_seq.size(1)
+        return torch.empty((BH, M, G_h, d_s), device=s0.device, dtype=torch.float32)
+
+    @torch.library.custom_op("calcite5::crystal_scan_bwd", mutates_args=())
+    def _crystal_scan_bwd_op(
+        s_out: torch.Tensor,
+        kw_eff_seq: torch.Tensor,
+        kw_vg_seq: torch.Tensor,
+        v_ste_seq: torch.Tensor,
+        P_eff_seq: torch.Tensor,
+        grad_out: torch.Tensor,
+        is_hard: bool,
+        scale_r: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        g_s0, g_kwe, g_vs, g_P = ext.crystal_scan_bwd_cuda(
+            s_out,
+            kw_eff_seq,
+            kw_vg_seq,
+            v_ste_seq,
+            P_eff_seq,
+            grad_out,
+            bool(is_hard),
+            float(scale_r),
+        )
+        return g_s0, g_kwe, g_vs, g_P
+
+    @_crystal_scan_bwd_op.register_fake
+    def _crystal_scan_bwd_fake(
+        s_out: torch.Tensor,
+        kw_eff_seq: torch.Tensor,
+        kw_vg_seq: torch.Tensor,
+        v_ste_seq: torch.Tensor,
+        P_eff_seq: torch.Tensor,
+        grad_out: torch.Tensor,
+        is_hard: bool,
+        scale_r: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del kw_vg_seq, grad_out, is_hard, scale_r
+        BH, M, G_h, d_s = s_out.shape
+        opts = {"device": s_out.device, "dtype": torch.float32}
+        return (
+            torch.empty((BH, G_h, d_s), **opts),
+            torch.empty_like(kw_eff_seq, dtype=torch.float32),
+            torch.empty_like(v_ste_seq, dtype=torch.float32),
+            torch.empty_like(P_eff_seq, dtype=torch.float32),
+        )
+
+    def _crystal_setup_context(ctx, inputs, output) -> None:
+        _, kw_eff_seq, kw_vg_seq, v_ste_seq, P_eff_seq, is_hard, scale_r = inputs
+        ctx.save_for_backward(output, kw_eff_seq, kw_vg_seq, v_ste_seq, P_eff_seq)
+        ctx.is_hard = bool(is_hard)
+        ctx.scale_r = float(scale_r)
+
+    def _crystal_bwd_bridge(ctx, grad_out: torch.Tensor | None):
+        if grad_out is None:
+            return None, None, None, None, None, None, None
+        s_out, kw_eff_seq, kw_vg_seq, v_ste_seq, P_eff_seq = ctx.saved_tensors
+        g_s0, g_kwe, g_vs, g_P = _crystal_scan_bwd_op(
+            s_out,
+            kw_eff_seq,
+            kw_vg_seq,
+            v_ste_seq,
+            P_eff_seq,
+            grad_out.contiguous(),
+            ctx.is_hard,
+            ctx.scale_r,
+        )
+        return (
+            g_s0.to(s_out.dtype),
+            g_kwe.to(kw_eff_seq.dtype),
+            torch.zeros_like(kw_vg_seq),
+            g_vs.to(v_ste_seq.dtype),
+            g_P.to(P_eff_seq.dtype),
+            None,
+            None,
+        )
+
+    _crystal_scan_fwd_op.register_autograd(
+        _crystal_bwd_bridge, setup_context=_crystal_setup_context
+    )
+
+    @torch.library.custom_op("calcite5::woodbury_tern_p_uncerts", mutates_args=())
+    def _woodbury_tern_p_uncerts_op(
+        qe_m: torch.Tensor,
+        ke_m: torch.Tensor,
+        bm_d: torch.Tensor,
+        gm_d: torch.Tensor,
+        inv_lam: float,
+        tern_gate: float,
+    ) -> torch.Tensor:
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        return ext.woodbury_tern_p_uncerts_cuda(
+            qe_m, ke_m, bm_d, gm_d, float(inv_lam), float(tern_gate)
+        )
+
+    @_woodbury_tern_p_uncerts_op.register_fake
+    def _woodbury_tern_p_uncerts_fake(
+        qe_m: torch.Tensor,
+        ke_m: torch.Tensor,
+        bm_d: torch.Tensor,
+        gm_d: torch.Tensor,
+        inv_lam: float,
+        tern_gate: float,
+    ) -> torch.Tensor:
+        del ke_m, bm_d, gm_d, inv_lam, tern_gate
+        M_len, BH, _, C = qe_m.shape
+        return torch.empty((M_len, BH, C), device=qe_m.device, dtype=torch.float32)
+
+    @torch.library.custom_op("calcite5::woodbury_tern_m_fwd", mutates_args=())
+    def _woodbury_tern_m_fwd_op(
+        q_m: torch.Tensor,
+        k_m: torch.Tensor,
+        v_m: torch.Tensor,
+        b_m: torch.Tensor,
+        g_m: torch.Tensor,
+        inv_dh: float,
+        Bc: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        out_m, M_starts = ext.woodbury_tern_m_fwd_cuda(
+            q_m, k_m, v_m, b_m, g_m, float(inv_dh), int(Bc)
+        )
+        return out_m, M_starts
+
+    @_woodbury_tern_m_fwd_op.register_fake
+    def _woodbury_tern_m_fwd_fake(
+        q_m: torch.Tensor,
+        k_m: torch.Tensor,
+        v_m: torch.Tensor,
+        b_m: torch.Tensor,
+        g_m: torch.Tensor,
+        inv_dh: float,
+        Bc: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del k_m, b_m, g_m, inv_dh
+        M_len, BH, d_k, C = q_m.shape
+        d_v = v_m.size(2)
+        n_blocks = (M_len + int(Bc) - 1) // int(Bc)
+        opts = {"device": q_m.device, "dtype": torch.float32}
+        return (
+            torch.empty((M_len, BH, d_v, C), **opts),
+            torch.empty((n_blocks, BH, d_v, d_k), **opts),
+        )
+
+    @torch.library.custom_op("calcite5::woodbury_tern_m_bwd", mutates_args=())
+    def _woodbury_tern_m_bwd_op(
+        q_m: torch.Tensor,
+        k_m: torch.Tensor,
+        v_m: torch.Tensor,
+        b_m: torch.Tensor,
+        g_m: torch.Tensor,
+        M_starts: torch.Tensor,
+        grad_out: torch.Tensor,
+        inv_dh: float,
+        Bc: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ext = _load_fast_scans_cuda_ext()
+        assert ext is not None
+        dq, dk, dv, db, dg = ext.woodbury_tern_m_bwd_cuda(
+            q_m, k_m, v_m, b_m, g_m, M_starts, grad_out, float(inv_dh), int(Bc)
+        )
+        return dq, dk, dv, db, dg
+
+    @_woodbury_tern_m_bwd_op.register_fake
+    def _woodbury_tern_m_bwd_fake(
+        q_m: torch.Tensor,
+        k_m: torch.Tensor,
+        v_m: torch.Tensor,
+        b_m: torch.Tensor,
+        g_m: torch.Tensor,
+        M_starts: torch.Tensor,
+        grad_out: torch.Tensor,
+        inv_dh: float,
+        Bc: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del M_starts, grad_out, inv_dh, Bc
+        return (
+            torch.empty_like(q_m, dtype=torch.float32),
+            torch.empty_like(k_m, dtype=torch.float32),
+            torch.empty_like(v_m, dtype=torch.float32),
+            torch.empty_like(b_m, dtype=torch.float32),
+            torch.empty_like(g_m, dtype=torch.float32),
+        )
+
+    def _woodbury_m_setup_context(ctx, inputs, output) -> None:
+        q_m, k_m, v_m, b_m, g_m, inv_dh, Bc = inputs
+        _, M_starts = output
+        ctx.save_for_backward(q_m, k_m, v_m, b_m, g_m, M_starts)
+        ctx.inv_dh = float(inv_dh)
+        ctx.Bc = int(Bc)
+
+    def _woodbury_m_bwd_bridge(
+        ctx, grad_out: torch.Tensor | None, grad_m_starts: torch.Tensor | None
+    ):
+        del grad_m_starts
+        if grad_out is None:
+            return None, None, None, None, None, None, None
+        q_m, k_m, v_m, b_m, g_m, M_starts = ctx.saved_tensors
+        dq, dk, dv, db, dg = _woodbury_tern_m_bwd_op(
+            q_m, k_m, v_m, b_m, g_m, M_starts, grad_out.contiguous(), ctx.inv_dh, ctx.Bc
+        )
+        return dq, dk, dv, db, dg, None, None
+
+    _woodbury_tern_m_fwd_op.register_autograd(
+        _woodbury_m_bwd_bridge, setup_context=_woodbury_m_setup_context
+    )
 
 
 def fast_utf8_chunk_span(
@@ -2157,6 +2823,19 @@ def fast_utf8_chunk_span(
     if raw_cand.is_cuda:
         ext = _load_fast_scans_cuda_ext()
         if ext is not None:
+            if _HAS_CUSTOM_OP:
+                return _utf8_chunk_span_op(
+                    raw_cand,
+                    valid_mask,
+                    can_fire_mask,
+                    is_lead,
+                    char_len,
+                    int(max_cp_span),
+                    int(max_byte_span),
+                    int(refill_int),
+                    int(cost_int),
+                    int(burst_int),
+                )
             return ext.utf8_chunk_span_cuda(
                 raw_cand,
                 valid_mask,
@@ -2201,6 +2880,9 @@ def fast_causal_refractory_gate(p_raw: torch.Tensor) -> torch.Tensor:
     if p_raw.is_cuda and p_raw.dim() == 3:
         ext = _load_fast_scans_cuda_ext()
         if ext is not None:
+            if _HAS_CUSTOM_OP:
+                out, _ = _causal_refractory_gate_fwd_op(p_raw)
+                return out
             return _FastRefractoryGateFn.apply(p_raw)
     return causal_refractory_gate_jit(p_raw)
 
@@ -2209,6 +2891,8 @@ def fast_project_birkhoff_to_perm(scores: torch.Tensor) -> torch.Tensor:
     if scores.is_cuda and scores.dim() == 3 and 0 < scores.size(1) <= 32 and scores.size(1) == scores.size(2):
         ext = _load_fast_scans_cuda_ext()
         if ext is not None:
+            if _HAS_CUSTOM_OP:
+                return _birkhoff_greedy_perm_op(scores.detach())
             return ext.birkhoff_greedy_perm_cuda(scores).to(scores.dtype)
     return project_birkhoff_to_perm_jit(scores)
 
@@ -2276,6 +2960,16 @@ def fast_diag_birkhoff_crystal_scan(
         and _load_fast_scans_cuda_ext() is not None
     ):
         with torch.amp.autocast(s0.device.type, enabled=False):
+            if _HAS_CUSTOM_OP:
+                return _crystal_scan_fwd_op(
+                    s0.float(),
+                    kw_eff_seq.float(),
+                    kw_vg_seq.float(),
+                    v_ste_seq.float(),
+                    P_eff_seq.float(),
+                    bool(is_hard),
+                    float(scale_r),
+                )
             return _FastCrystalScanFn.apply(
                 s0.float(),
                 kw_eff_seq.float(),
@@ -2370,9 +3064,14 @@ def fast_neural_woodbury_chunk_scan(
                     ke_m = k_m.detach()
                 else:
                     ke_m = k_epi_seq.detach().float().permute(1, 0, 2, 3).reshape(M_len, BH, d_k, 1).contiguous()
-                u_m = ext.woodbury_tern_p_uncerts_cuda(
-                    qe_m, ke_m, b_m.detach(), g_m.detach(), float(inv_lam), t_gate
-                )
+                if _HAS_CUSTOM_OP:
+                    u_m = _woodbury_tern_p_uncerts_op(
+                        qe_m, ke_m, b_m.detach(), g_m.detach(), float(inv_lam), t_gate
+                    )
+                else:
+                    u_m = ext.woodbury_tern_p_uncerts_cuda(
+                        qe_m, ke_m, b_m.detach(), g_m.detach(), float(inv_lam), t_gate
+                    )
                 uncerts = (
                     u_m.reshape(M_len, B, H, C)
                     .permute(1, 0, 3, 2)
@@ -2380,7 +3079,10 @@ def fast_neural_woodbury_chunk_scan(
                     .to(v_seq.dtype)
                 )
 
-            out_m = _FastWoodburyTernaryMFn.apply(q_m, k_m, v_m, b_m, g_m, inv_dh, 16)
+            if _HAS_CUSTOM_OP:
+                out_m, _ = _woodbury_tern_m_fwd_op(q_m, k_m, v_m, b_m, g_m, inv_dh, 16)
+            else:
+                out_m = _FastWoodburyTernaryMFn.apply(q_m, k_m, v_m, b_m, g_m, inv_dh, 16)
             out_all = (
                 out_m.reshape(M_len, B, H, d_v, C)
                 .permute(1, 0, 4, 2, 3)
@@ -2534,25 +3236,34 @@ def _crystal_pre_scan_impl(
     )
     v_unit = layer._safe_unit((v_tok * v_pool.unsqueeze(-1)).sum(dim=2))
     v_logits = torch.matmul(v_unit, c_norm_t) * 9.0
-    v_probs = F.softmax(v_logits, dim=-1)
-    v_soft = _sphere_norm_inline(torch.matmul(v_probs, cb), scale_r)
     v_hard = cb[v_logits.argmax(dim=-1)]
 
-    if is_hard:
-        v_cur = v_hard
-    elif use_snap:
-        v_cur = _sphere_norm_inline((1.0 - eff_alpha) * v_soft + eff_alpha * v_hard, scale_r)
+    need_grad = torch.is_grad_enabled()
+    need_commit = bool(layer.training)
+    if is_hard and (not need_grad) and (not need_commit):
+        v_probs = None
+        v_ste = v_hard
     else:
-        v_cur = v_soft
+        v_probs = F.softmax(v_logits, dim=-1)
+        v_soft = _sphere_norm_inline(torch.matmul(v_probs, cb), scale_r)
+        if is_hard:
+            v_cur = v_hard
+        elif use_snap:
+            v_cur = _sphere_norm_inline((1.0 - eff_alpha) * v_soft + eff_alpha * v_hard, scale_r)
+        else:
+            v_cur = v_soft
 
-    vs_u, vq_u = v_soft / scale_r, v_cur / scale_r
-    u_ste = F.normalize(vs_u + vq_u, dim=-1).detach()
-    v_enc = (
-        v_soft
-        - 2.0 * (v_soft * u_ste).sum(-1, keepdim=True) * u_ste
-        + 2.0 * (v_soft * vs_u.detach()).sum(-1, keepdim=True) * vq_u.detach()
-    )
-    v_ste = v_enc + (v_cur - v_enc).detach()
+        if need_grad and (v_soft.requires_grad or v_cur.requires_grad):
+            vs_u, vq_u = v_soft / scale_r, v_cur / scale_r
+            u_ste = F.normalize(vs_u + vq_u, dim=-1).detach()
+            v_enc = (
+                v_soft
+                - 2.0 * (v_soft * u_ste).sum(-1, keepdim=True) * u_ste
+                + 2.0 * (v_soft * vs_u.detach()).sum(-1, keepdim=True) * vq_u.detach()
+            )
+            v_ste = v_enc + (v_cur - v_enc).detach()
+        else:
+            v_ste = v_cur
 
     left_pad = (layer.W_chunks - 1) * C
     w_len = layer.W_chunks * C
@@ -2585,25 +3296,31 @@ def _crystal_pre_scan_impl(
     all_logits = torch.einsum("bmhd,hgd->bmhg", all_vecs, k_slots_u) * s_temp
     k_logits, psi_a, psi_b = all_logits.chunk(3, dim=1)
 
-    k_prob = F.softmax(k_logits, dim=-1)
-    w_peak = k_prob / k_prob.detach().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
-
     w_eta = torch.sigmoid((w_logit + 0.58) * g_tau - 0.58)
-    kw_soft = (w_eta.unsqueeze(-1) * w_peak).unsqueeze(-1)
-    k_hard = F.one_hot(k_prob.argmax(dim=-1), num_classes=Gh).float()
     w_hard_g = (w_eta.detach() >= 0.36).float()
-    kw_targ = (w_hard_g.unsqueeze(-1) * k_hard).unsqueeze(-1)
-
-    if is_hard:
-        kw_eff = kw_soft + (kw_targ - kw_soft).detach()
-        kw_vg = torch.maximum(kw_targ, kw_soft).detach()
-    elif use_snap:
-        kw_cur = (1.0 - eff_alpha) * kw_soft + eff_alpha * kw_targ
-        kw_eff = kw_soft + (kw_cur - kw_soft).detach()
-        kw_vg = torch.maximum(kw_cur, kw_soft).detach()
+    if is_hard and (not need_grad) and (not need_commit):
+        k_prob = None
+        k_hard = F.one_hot(k_logits.argmax(dim=-1), num_classes=Gh).float()
+        kw_targ = (w_hard_g.unsqueeze(-1) * k_hard).unsqueeze(-1)
+        kw_eff = kw_targ
+        kw_vg = kw_targ
     else:
-        kw_eff = kw_soft
-        kw_vg = kw_soft.detach()
+        k_prob = F.softmax(k_logits, dim=-1)
+        w_peak = k_prob / k_prob.detach().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+        kw_soft = (w_eta.unsqueeze(-1) * w_peak).unsqueeze(-1)
+        k_hard = F.one_hot(k_prob.argmax(dim=-1), num_classes=Gh).float()
+        kw_targ = (w_hard_g.unsqueeze(-1) * k_hard).unsqueeze(-1)
+
+        if is_hard:
+            kw_eff = kw_soft + (kw_targ - kw_soft).detach() if need_grad else kw_targ
+            kw_vg = torch.maximum(kw_targ, kw_soft).detach()
+        elif use_snap:
+            kw_cur = (1.0 - eff_alpha) * kw_soft + eff_alpha * kw_targ
+            kw_eff = kw_soft + (kw_cur - kw_soft).detach() if need_grad else kw_cur
+            kw_vg = torch.maximum(kw_cur, kw_soft).detach()
+        else:
+            kw_eff = kw_soft
+            kw_vg = kw_soft.detach()
 
     # Single `_compute_ptr_swap` with resolved well_scale (eliminates redundant QAT/eval call)
     _, _, T_swap = layer._compute_ptr_swap(psi_a, psi_b, well_scale=1.0 if use_well else 0.0)
@@ -2630,23 +3347,26 @@ def _crystal_pre_scan_impl(
     p_logit = -4.5 + F.softplus(p_logit_raw + 4.5)
     p_raw = torch.sigmoid((p_logit + 0.49) * g_tau - 0.49)
 
-    wd = w_eta.detach()
-    w_sum = wd.sum(dim=(0, 1)).clamp(min=1e-3)
-    p_slot_bar = (k_prob * wd.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum.unsqueeze(-1)
-    cap_slot = F.relu(p_slot_bar - max(0.20, 1.35 / float(Gh))).pow(2).sum() * 4.0
-    p_cb_bar = (v_probs * wd.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum.unsqueeze(-1)
-    cap_cb = F.relu(p_cb_bar - max(0.20, 1.35 / float(layer.K))).pow(2).sum() * 4.0
-    sharp_k = (wd * (1.0 - k_prob.max(dim=-1).values)).mean()
-    commit_v = (wd * (1.0 - (v_unit * (v_hard / scale_r).detach()).sum(dim=-1))).mean()
-    w_bimod = (w_eta - w_hard_g).pow(2).mean()
-    pre_commit_loss = (
-        commit_v
-        + cap_slot
-        + cap_cb
-        + sharp_w * sharp_k
-        + snap_a * 0.04 * w_bimod
-        + 0.008 * w_eta.mean()
-    )
+    if need_commit and k_prob is not None and v_probs is not None:
+        wd = w_eta.detach()
+        w_sum = wd.sum(dim=(0, 1)).clamp(min=1e-3)
+        p_slot_bar = (k_prob * wd.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum.unsqueeze(-1)
+        cap_slot = F.relu(p_slot_bar - max(0.20, 1.35 / float(Gh))).pow(2).sum() * 4.0
+        p_cb_bar = (v_probs * wd.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum.unsqueeze(-1)
+        cap_cb = F.relu(p_cb_bar - max(0.20, 1.35 / float(layer.K))).pow(2).sum() * 4.0
+        sharp_k = (wd * (1.0 - k_prob.max(dim=-1).values)).mean()
+        commit_v = (wd * (1.0 - (v_unit * (v_hard / scale_r).detach()).sum(dim=-1))).mean()
+        w_bimod = (w_eta - w_hard_g).pow(2).mean()
+        pre_commit_loss = (
+            commit_v
+            + cap_slot
+            + cap_cb
+            + sharp_w * sharp_k
+            + snap_a * 0.04 * w_bimod
+            + 0.008 * w_eta.mean()
+        )
+    else:
+        pre_commit_loss = x.new_zeros((), dtype=torch.float32)
 
     BH = B * H
     kw_eff_bh = kw_eff.permute(0, 2, 1, 3, 4).reshape(BH, M_len, Gh, 1)
@@ -2670,28 +3390,35 @@ def _crystal_post_gate_impl(
     eff_alpha = sched[3]
     sharp_w = sched[4]
     snap_a = sched[5]
+    need_grad = torch.is_grad_enabled()
 
-    P_soft = eye + p_eta.unsqueeze(-1).unsqueeze(-1) * (P_cand - eye)
     if use_snap and P_perm_hard is not None:
         p_hard_g = (p_eta.detach() >= 0.38).float()
         P_targ = eye + p_hard_g.unsqueeze(-1).unsqueeze(-1) * (P_perm_hard - eye)
-        if is_hard:
-            P_eff = P_soft + (P_targ - P_soft).detach()
+        if is_hard and not need_grad:
+            P_eff = P_targ
         else:
-            P_cur = (1.0 - eff_alpha) * P_soft + eff_alpha * P_targ
-            P_eff = P_soft + (P_cur - P_soft).detach()
+            P_soft = eye + p_eta.unsqueeze(-1).unsqueeze(-1) * (P_cand - eye)
+            if is_hard:
+                P_eff = P_soft + (P_targ - P_soft).detach()
+            else:
+                P_cur = (1.0 - eff_alpha) * P_soft + eff_alpha * P_targ
+                P_eff = P_soft + (P_cur - P_soft).detach() if need_grad else P_cur
     else:
-        P_eff = P_soft
+        P_eff = eye + p_eta.unsqueeze(-1).unsqueeze(-1) * (P_cand - eye)
 
-    pd = p_eta.detach()
-    sharp_p = (pd * (1.0 - P_cand.max(dim=-1).values.mean(dim=-1))).mean()
-    p_bin_d = (pd >= 0.38).float()
-    commit_loss = (
-        pre_commit_loss
-        + sharp_w * sharp_p
-        + snap_a * 0.04 * (p_eta - p_bin_d).pow(2).mean()
-        + 0.015 * F.relu(p_eta.mean() - 0.06)
-    )
+    if layer.training:
+        pd = p_eta.detach()
+        sharp_p = (pd * (1.0 - P_cand.max(dim=-1).values.mean(dim=-1))).mean()
+        p_bin_d = (pd >= 0.38).float()
+        commit_loss = (
+            pre_commit_loss
+            + sharp_w * sharp_p
+            + snap_a * 0.04 * (p_eta - p_bin_d).pow(2).mean()
+            + 0.015 * F.relu(p_eta.mean() - 0.06)
+        )
+    else:
+        commit_loss = pre_commit_loss
     P_eff_bh = P_eff.permute(0, 2, 1, 3, 4).reshape(B * H, M_len, Gh, Gh)
     return P_eff_bh, commit_loss
 
@@ -2794,7 +3521,7 @@ def fast_crystal_forward(
         P_eff_bh, commit_loss = _crystal_post_gate_impl(
             layer, p_eta, P_cand, P_perm_hard, pre_commit_loss, sched, is_hard, use_snap
         )
-    layer.last_commit_loss = commit_loss
+    layer.last_commit_loss = commit_loss if layer.training else None
 
     s_bh = fast_diag_birkhoff_crystal_scan(
         s0_bh, kw_eff_bh, kw_vg_bh, v_ste_bh, P_eff_bh, is_hard, scale_r
@@ -3152,7 +3879,6 @@ def _cached_ternary_ste_core(
     return w_q
 
 
-_HAS_CUSTOM_OP = hasattr(torch, "library") and hasattr(torch.library, "custom_op")
 if _HAS_CUSTOM_OP:
 
     @torch.library.custom_op("calcite5::cached_ternary_ste", mutates_args=())
@@ -3189,19 +3915,25 @@ else:
 def _make_single_pass_qat_forward():
     def _fast_qat_linear_forward(self_lin: nn.Linear, x: torch.Tensor) -> torch.Tensor:
         slot_id: int = self_lin._fast_qat_slot_id
-        out_code = _dtype_to_code(x.dtype)
+        dev_type = x.device.type
+        if torch.is_autocast_enabled(dev_type):
+            target_dtype = torch.get_autocast_dtype(dev_type)
+        else:
+            target_dtype = x.dtype
+        out_code = _dtype_to_code(target_dtype)
         if _cached_ternary_ste_op is not None and out_code >= 0:
             w_q = _cached_ternary_ste_op(self_lin.weight, out_code, slot_id)
         else:
             w_q_det = _cached_ternary_ste_core(self_lin.weight, out_code, slot_id)
             if out_code < 0:
-                w_q_det = w_q_det.to(x.dtype)
+                w_q_det = w_q_det.to(target_dtype)
             if torch.is_grad_enabled() and self_lin.weight.requires_grad:
                 w_q = _FastSTELinearWeightFn.apply(self_lin.weight, w_q_det)
             else:
                 w_q = w_q_det
-        b = self_lin.bias.to(x.dtype) if self_lin.bias is not None else None
-        return F.linear(x, w_q, b)
+        x_in = x.to(target_dtype) if x.dtype != target_dtype else x
+        b = self_lin.bias.to(target_dtype) if self_lin.bias is not None else None
+        return F.linear(x_in, w_q, b)
 
     return _fast_qat_linear_forward
 
@@ -3263,7 +3995,9 @@ def configure_fast_ternary_qat(model: nn.Module, enabled: bool) -> int:
     return count
 
 
-def _make_compiled_crystal_stages(layer: VoronoiCrystalLayer, mode: str) -> None:
+def _make_compiled_crystal_stages(
+    layer: VoronoiCrystalLayer, mode: str, dynamic: bool = True
+) -> None:
     def _pre(
         x: torch.Tensor,
         h_lex: torch.Tensor | None,
@@ -3290,27 +4024,63 @@ def _make_compiled_crystal_stages(layer: VoronoiCrystalLayer, mode: str) -> None
     def _readout(s_bh: torch.Tensor, q_soft: torch.Tensor, T: int, pad: int):
         return _crystal_readout_impl(layer, s_bh, q_soft, T, pad)
 
-    layer.__dict__["_fast_crystal_pre_fn"] = torch.compile(_pre, mode=mode, dynamic=True)
-    layer.__dict__["_fast_crystal_post_fn"] = torch.compile(_post, mode=mode, dynamic=True)
-    layer.__dict__["_fast_crystal_readout_fn"] = torch.compile(_readout, mode=mode, dynamic=True)
+    layer.__dict__["_fast_crystal_pre_fn"] = torch.compile(_pre, mode=mode, dynamic=dynamic)
+    layer.__dict__["_fast_crystal_post_fn"] = torch.compile(_post, mode=mode, dynamic=dynamic)
+    layer.__dict__["_fast_crystal_readout_fn"] = torch.compile(_readout, mode=mode, dynamic=dynamic)
 
 
-def _make_compiled_woodbury_stages(layer: NeuralWoodburyLayer, mode: str) -> None:
-    def _pre(x: torch.Tensor, h_lex: torch.Tensor | None):
-        return _woodbury_pre_scan_impl(layer, x, h_lex)
+def _make_compiled_woodbury_stages(
+    layer: NeuralWoodburyLayer, mode: str, dynamic: bool = True
+) -> None:
+    # Keep `_woodbury_pre_scan_impl` eager: PyTorch 2.11 nightly Inductor corrupts the
+    # backward pass of `_compute_latched_keys` on zero-padded tail chunks (`h_lex == 0`),
+    # causing 19x–256x gradient explosion in `byte_chunker.lex_up.weight.grad` (#59/#63).
+    layer.__dict__.pop("_fast_woodbury_pre_fn", None)
 
     def _post(x: torch.Tensor, read_pad: torch.Tensor, uncert_seq: torch.Tensor, T: int):
         return _woodbury_post_scan_impl(layer, x, read_pad, uncert_seq, T)
 
-    layer.__dict__["_fast_woodbury_pre_fn"] = torch.compile(_pre, mode=mode, dynamic=True)
-    layer.__dict__["_fast_woodbury_post_fn"] = torch.compile(_post, mode=mode, dynamic=True)
+    layer.__dict__["_fast_woodbury_post_fn"] = torch.compile(_post, mode=mode, dynamic=dynamic)
+
+
+def _is_fast_woodbury_eligible(wb: object) -> bool:
+    if wb is None:
+        return False
+    is_wb = isinstance(wb, NeuralWoodburyLayer) or hasattr(wb, "_compute_latched_keys")
+    if not is_wb:
+        return False
+    if getattr(wb, "use_kalman_precond", False):
+        return False
+    if getattr(wb, "use_deltanet2_gates", False):
+        return False
+    if int(getattr(wb, "K_sub", 1)) != 1:
+        return False
+    return True
+
+
+def _has_working_inductor_gpu() -> bool:
+    if not hasattr(torch, "compile") or not torch.cuda.is_available():
+        return False
+    if importlib.util.find_spec("triton") is None:
+        return False
+    if sys.platform == "win32":
+        # Triton's first-run `cuda_utils` build requires MSVC `cl.exe` + SDK headers in PATH/INCLUDE/LIB.
+        prepare_cuda_build_env()
+    try:
+        import torch._inductor.utils as _iu
+
+        if hasattr(_iu, "has_triton") and not _iu.has_triton():
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def compile_calcite_cortex(model: nn.Module, mode: str = "default") -> bool:
     """
     Compiles the pure continuous cortex, SwiGLU MLPs, chunker byte decoder/MLPs, and
     full pre-scan/post-scan Crystal & Woodbury pipelines with `torch.compile(..., dynamic=True)`
-    while keeping custom CUDA scan autograd functions cleanly outside Inductor graph breaks.
+    while keeping custom CUDA scan ops cleanly zero-graph-break.
     """
     if not hasattr(torch, "compile"):
         return False
@@ -3322,11 +4092,17 @@ def compile_calcite_cortex(model: nn.Module, mode: str = "default") -> bool:
         pass
     if getattr(model, "mid_mlp", None) is not None:
         model.mid_mlp = torch.compile(model.mid_mlp, mode=mode, dynamic=True)
-    for attr in ("cortex_pre", "cortex_post"):
-        ml = getattr(model, attr, None)
-        if ml is not None:
-            for i in range(len(ml)):
-                ml[i] = torch.compile(ml[i], mode=mode, dynamic=True)
+    swa_stages = getattr(model, "swa_stages", None)
+    if swa_stages is not None:
+        for stg in swa_stages:
+            for i in range(len(stg)):
+                stg[i] = torch.compile(stg[i], mode=mode, dynamic=True)
+    else:
+        for attr in ("cortex_pre", "cortex_post"):
+            ml = getattr(model, attr, None)
+            if ml is not None:
+                for i in range(len(ml)):
+                    ml[i] = torch.compile(ml[i], mode=mode, dynamic=True)
     bc = getattr(model, "byte_chunker", None)
     if bc is not None:
         if getattr(bc, "enc_mlp", None) is not None:
@@ -3335,13 +4111,91 @@ def compile_calcite_cortex(model: nn.Module, mode: str = "default") -> bool:
             bc.dec_mlp = torch.compile(bc.dec_mlp, mode=mode, dynamic=True)
         if hasattr(bc, "decode_from_chunks"):
             bc.decode_from_chunks = torch.compile(bc.decode_from_chunks, mode=mode, dynamic=True)
-    wb = getattr(model, "woodbury", None)
-    if wb is not None and isinstance(wb, NeuralWoodburyLayer):
-        _make_compiled_woodbury_stages(wb, mode=mode)
+    for wname in ("woodbury", "woodbury_fast"):
+        wb = getattr(model, wname, None)
+        if _is_fast_woodbury_eligible(wb):
+            _make_compiled_woodbury_stages(wb, mode=mode)
     for cname in ("crystal", "crystal_2"):
         cr = getattr(model, cname, None)
         if cr is not None and isinstance(cr, VoronoiCrystalLayer):
             _make_compiled_crystal_stages(cr, mode=mode)
+    return True
+
+
+def compile_calcite_v2(
+    model: nn.Module, mode: str = "default", dynamic: bool = False
+) -> bool:
+    """
+    Safe `Calcite v2 / v3 / v3.1` (`CalciteV2LM`) compiler covering all SWA stages,
+    `mid_mlp`, `byte_chunker` (`enc_mlp`, `decode_from_chunks` incl. `byte_swa`/`Engram`/`BIC`),
+    `Woodbury` (`CalciteV2WoodburyLayer` pre/post), `Crystal 1+2` pre/post/readout, and
+    `EpistemicSlotMemory`. Defaults to `dynamic=False` (matching static training shapes with
+    `use_static_m_cap=True`, generating faster Triton kernels, and avoiding PyTorch 2.11 nightly
+    Inductor `tiling_utils.get_pw_red_splits` crashes on small/BIC/Crystal reductions).
+    Returns `False` cleanly if Triton/Inductor GPU backend is unavailable.
+    """
+    if not _has_working_inductor_gpu():
+        return False
+    # Pre-warm native CUDA extensions outside Dynamo tracing so readiness flags constant-fold
+    _load_fast_scans_cuda_ext()
+    try:
+        from kernels.fast_calcite_swa_chunker import _load_swa_chunker_cuda_ext
+
+        _load_swa_chunker_cuda_ext()
+    except Exception:
+        pass
+    try:
+        from kernels.fast_calcite_bic import fast_bic_scan_available
+
+        fast_bic_scan_available()
+    except Exception:
+        pass
+    try:
+        import torch._dynamo as _dynamo
+
+        _dynamo.config.cache_size_limit = max(64, int(_dynamo.config.cache_size_limit))
+    except Exception:
+        pass
+
+    if getattr(model, "mid_mlp", None) is not None:
+        model.mid_mlp = torch.compile(model.mid_mlp, mode=mode, dynamic=dynamic)
+
+    swa_stages = getattr(model, "swa_stages", None)
+    if swa_stages is not None:
+        for stg in swa_stages:
+            for i in range(len(stg)):
+                stg[i] = torch.compile(stg[i], mode=mode, dynamic=dynamic)
+    else:
+        for attr in ("cortex_pre", "cortex_post"):
+            ml = getattr(model, attr, None)
+            if ml is not None:
+                for i in range(len(ml)):
+                    ml[i] = torch.compile(ml[i], mode=mode, dynamic=dynamic)
+
+    bc = getattr(model, "byte_chunker", None)
+    if bc is not None:
+        if getattr(bc, "enc_mlp", None) is not None:
+            bc.enc_mlp = torch.compile(bc.enc_mlp, mode=mode, dynamic=dynamic)
+        if hasattr(bc, "decode_from_chunks"):
+            dec_dynamic = bool(dynamic) and (getattr(bc, "byte_induct_cache", None) is None)
+            bc.decode_from_chunks = torch.compile(
+                bc.decode_from_chunks, mode=mode, dynamic=dec_dynamic
+            )
+
+    for wname in ("woodbury", "woodbury_fast"):
+        wb = getattr(model, wname, None)
+        if _is_fast_woodbury_eligible(wb):
+            _make_compiled_woodbury_stages(wb, mode=mode, dynamic=dynamic)
+
+    for cname in ("crystal", "crystal_2"):
+        cr = getattr(model, cname, None)
+        if cr is not None and isinstance(cr, VoronoiCrystalLayer):
+            _make_compiled_crystal_stages(cr, mode=mode, dynamic=dynamic)
+
+    es = getattr(model, "epistemic_slots", None)
+    if es is not None:
+        model.epistemic_slots = torch.compile(es, mode=mode, dynamic=dynamic)
+
     return True
 
 
@@ -3359,6 +4213,7 @@ def unwrap_compiled_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
 __all__ = [
     "clear_fast_qat_cache",
     "compile_calcite_cortex",
+    "compile_calcite_v2",
     "configure_fast_ternary_qat",
     "fast_causal_refractory_gate",
     "fast_crystal_forward",
@@ -3370,5 +4225,6 @@ __all__ = [
     "fast_woodbury_forward",
     "get_fast_qat_cache_stats",
     "get_fast_scans_backend_info",
+    "prepare_cuda_build_env",
     "unwrap_compiled_state_dict",
 ]

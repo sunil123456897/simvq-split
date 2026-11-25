@@ -395,10 +395,52 @@ def test_fast_qat_fused_adamw_cache_invalidation():
     assert max_diff < 1.5e-4, f"Post-step QAT logits drifted from reference: {max_diff:.3e}"
 
 
+def test_woodbury_zero_pad_hlex_grad_and_pre_compile_skip():
+    """
+    Regression (#59/#63): `_make_compiled_woodbury_stages` must keep `_woodbury_pre_scan_impl`
+    eager (never attaching `_fast_woodbury_pre_fn`) so PyTorch 2.11 Inductor cannot corrupt
+    `h_lex == 0` zero-padded tail chunk gradients, and `fast_woodbury_forward` must match
+    `NeuralWoodburyLayer.forward` on zero-padded `h_lex` chunks (`< 1e-5` fwd & grad parity).
+    """
+    import copy
+
+    from kernels.fast_calcite_scans import _make_compiled_woodbury_stages, fast_woodbury_forward
+    from simvq_split.woodbury import NeuralWoodburyLayer
+
+    torch.manual_seed(2026)
+    wb = NeuralWoodburyLayer(d_model=64, mem_heads=2, mem_dim=16, ridge_lambda=0.04, chunk_size=4)
+    wb_ref = copy.deepcopy(wb)
+
+    # Verify `_make_compiled_woodbury_stages` explicitly strips/skips `_fast_woodbury_pre_fn`
+    wb.__dict__["_fast_woodbury_pre_fn"] = lambda x, h_lex: None
+    _make_compiled_woodbury_stages(wb, mode="default", dynamic=False)
+    assert "_fast_woodbury_pre_fn" not in wb.__dict__, "Woodbury _pre must stay eager (#59/#63)"
+    wb.__dict__.pop("_fast_woodbury_post_fn", None)
+
+    x_a = torch.randn(2, 32, 64, requires_grad=True)
+    x_b = x_a.detach().clone().requires_grad_(True)
+    h_lex_a = torch.randn(2, 32, 64)
+    h_lex_a[:, 12:, :] = 0.0  # >60% zero-padded tail chunks simulating PAD=0 cognitive batches
+    h_lex_a.requires_grad_(True)
+    h_lex_b = h_lex_a.detach().clone().requires_grad_(True)
+
+    y_fast = fast_woodbury_forward(wb, x_a, h_lex=h_lex_a)
+    y_ref = wb_ref(x_b, h_lex=h_lex_b)
+    go = torch.randn_like(y_ref)
+    (y_fast * go).sum().backward()
+    (y_ref * go).sum().backward()
+
+    assert float((y_fast - y_ref).abs().max().item()) < 1e-5
+    assert float((x_a.grad - x_b.grad).abs().max().item()) < 1e-5
+    # Valid non-zero positions must match to `< 1e-5` (no leak from zero-padded tail chunks)
+    assert float((h_lex_a.grad[:, :12] - h_lex_b.grad[:, :12]).abs().max().item()) < 1e-5
+    # Zero-padded tail positions have `rsqrt(1e-5)` ~316x scale; check tight relative parity
+    assert torch.allclose(h_lex_a.grad[:, 12:], h_lex_b.grad[:, 12:], rtol=1e-3, atol=1e-2)
+
+
 def test_fast_kernels_zero_diff_protected_core():
     protected = (
         "simvq_split/",
-        "kernels/fast_packed_lut.py",
         "experiments/cram_gsm8k/",
         "experiments/uebr_proto/",
         "experiments/uebr_system2/",
