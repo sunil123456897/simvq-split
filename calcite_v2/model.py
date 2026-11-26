@@ -171,6 +171,40 @@ class DepthAttnMix(nn.Module):
         return (1.0 - g) * h_cur + g * attn_mix
 
 
+class DeepCrossAttentionMix(nn.Module):
+    """Input-dependent DeepCrossAttention (`arXiv:2502.06785`) depth routing (+0 streaming RAM)."""
+
+    def __init__(self, d_model: int, max_depth: int):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.max_depth = int(max(1, max_depth))
+        self.norm = CalciteRMSNorm(self.d_model)
+        # Raw `nn.Parameter` + `F.linear` excludes these tiny (<0.2%) routing weights
+        # from 2-bit LUT packing and `FastTernaryQAT` with zero kernel edits.
+        self.w_dyn = nn.Parameter(torch.zeros(self.max_depth, self.d_model, dtype=torch.float32))
+        b_init = torch.full((self.max_depth,), -2.0, dtype=torch.float32)
+        b_init[-1] = 4.0
+        self.b_stat = nn.Parameter(b_init)
+
+    def forward(self, h_cur: torch.Tensor, hist: list[torch.Tensor]) -> torch.Tensor:
+        L = len(hist)
+        if L <= 1:
+            return h_cur
+        if L > self.max_depth:
+            raise ValueError(
+                f"DeepCrossAttentionMix received len(hist)={L} > max_depth={self.max_depth}"
+            )
+        v = torch.stack(hist, dim=-2)
+        with torch.amp.autocast(h_cur.device.type, enabled=False):
+            logits = F.linear(
+                self.norm(h_cur).float(),
+                self.w_dyn[:L].float(),
+                self.b_stat[:L].float(),
+            )
+            alpha = F.softmax(logits, dim=-1).to(v.dtype)
+        return (v * alpha.unsqueeze(-1)).sum(dim=-2)
+
+
 class LocalSWABlock(nn.Module):
     def __init__(
         self,
@@ -330,6 +364,9 @@ class CalciteV2Config:
     dec_dw3_enabled: bool = True           # Axis A1: keep 3rd-scale decoder dw_conv (k=4, d=4) when use_sym_byte_swa=True
     dw_bottleneck_ratio: float = 1.0       # Axis A2: inner width ratio for 4x full-byte dw_conv mixers (1.0 = full d_model)
     bf16_residual_stream: bool = False     # Axis C: cast tok_emb output to BF16 under BF16 autocast
+    # Phase P-1 opt-in architectural axes (defaults preserve 100% Calcite v3.1 identity)
+    use_dca: bool = False                  # P4: Input-dependent DeepCrossAttention depth routing (+0 RAM)
+    engram_use_4gram: bool = False         # P3: Add 4-byte n-gram table to ByteEngram (+8 B ring)
 
     def resolved_dff(self) -> int:
         if self.d_ff is not None:
@@ -367,6 +404,7 @@ class CalciteV2LM(nn.Module):
             use_byte_engram=cfg.use_byte_engram,
             engram_slots=cfg.engram_slots,
             engram_dim=cfg.engram_dim,
+            engram_use_4gram=cfg.engram_use_4gram,
             use_byte_induct_cache=cfg.use_byte_induct_cache,
             byte_induct_slots=cfg.byte_induct_slots,
             byte_induct_dim=cfg.byte_induct_dim,
@@ -568,16 +606,32 @@ class CalciteV2LM(nn.Module):
             self.epistemic_slots = None
             self.epistemic_slots_gate = None
 
-        # Optional Kimi AttnRes depth-wise softmax routing (+0 persistent RAM, excluded from 2-bit LUT)
+        # Optional Kimi AttnRes / DeepCrossAttention depth routing (+0 persistent RAM, excluded from 2-bit LUT)
         if cfg.topology == "interleaved" and (cfg.use_attnres or cfg.use_temporal_residual):
             raise ValueError(
                 "use_attnres and use_temporal_residual are supported only with topology='hourglass'"
             )
+        if cfg.use_dca and cfg.use_attnres:
+            raise ValueError("use_dca and use_attnres are mutually exclusive")
         if cfg.use_attnres:
             n_mix = 4 + int(cfg.n_layers_post)
             self.attnres_mixers = nn.ModuleList([DepthAttnMix(cfg.d_model) for _ in range(n_mix)])
         else:
             self.attnres_mixers = None
+
+        if cfg.use_dca:
+            if cfg.topology == "interleaved" and self.swa_stages is not None:
+                n_dca_stages = sum(len(stg) for stg in self.swa_stages) + 5
+            else:
+                n_dca_stages = len(self.cortex_pre) + 3 + len(self.cortex_post)
+            self.dca_mixers = nn.ModuleList(
+                [
+                    DeepCrossAttentionMix(cfg.d_model, max_depth=depth)
+                    for depth in range(2, n_dca_stages + 2)
+                ]
+            )
+        else:
+            self.dca_mixers = None
 
         # Optional Princeton Temporal Residual (TR): 2nd carried stream B (+1 vec O(1) RAM, exact step-0 identity)
         if cfg.use_temporal_residual:
@@ -608,6 +662,20 @@ class CalciteV2LM(nn.Module):
         self._qat_handles: list = []
         self.ternary_qat_enabled: bool = False
         self.qat_mix: float = 1.0
+        self._dca_active: bool = True
+        self._bic_active: bool = True
+
+    def set_dca_active(self, active: bool) -> None:
+        """Toggles forward-pass DCA depth routing (exact identity bypass when `False`; caller controls `requires_grad`)."""
+        self._dca_active = bool(active)
+
+    def set_bic_active(self, active: bool) -> None:
+        """Toggles forward-pass `ByteInductionCache` execution (exact bypass when `False`; caller controls `requires_grad`)."""
+        flag = bool(active)
+        self._bic_active = flag
+        self.byte_chunker._bic_active = flag
+        if not flag and self.byte_chunker.byte_induct_cache is not None:
+            self.byte_chunker.byte_induct_cache.last_aux_loss = None
 
     def _all_crystals(self) -> tuple[CalciteV2CrystalLayer, ...]:
         return tuple(c for c in (self.crystal, self.crystal_2) if c is not None)
@@ -701,7 +769,8 @@ class CalciteV2LM(nn.Module):
                 else (loss + self.epistemic_slots.last_aux_loss)
             )
         if (
-            self.byte_chunker.byte_induct_cache is not None
+            getattr(self, "_bic_active", True)
+            and self.byte_chunker.byte_induct_cache is not None
             and self.byte_chunker.byte_induct_cache.last_aux_loss is not None
         ):
             term = self.byte_chunker.byte_induct_cache.last_aux_loss
@@ -722,25 +791,52 @@ class CalciteV2LM(nn.Module):
         tr_b_init: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.cfg.topology == "interleaved" and self.swa_stages is not None:
+            use_dca = (self.dca_mixers is not None) and bool(getattr(self, "_dca_active", True))
+            hist: list[torch.Tensor] = [h] if use_dca else []
+            dca_idx = 0
+
+            def _dca_mix(h_cur: torch.Tensor) -> torch.Tensor:
+                nonlocal dca_idx
+                if use_dca and self.dca_mixers is not None and len(hist) >= 2:
+                    h_cur = self.dca_mixers[dca_idx](h_cur, hist)
+                    dca_idx += 1
+                return h_cur
+
             # Stage 0: Early SWA -> Fast Woodbury
             for blk in self.swa_stages[0]:
+                h = _dca_mix(h)
                 h = blk(h)
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix(h)
             if not ablate_woodbury and self.woodbury_fast is not None and self.woodbury_fast_norm is not None and self.woodbury_fast_gate is not None:
                 wf_in = self.woodbury_fast_norm(h)
                 wf_g = 2.0 * torch.sigmoid(self.woodbury_fast_gate(wf_in))
                 h = h + wf_g * self.woodbury_fast(wf_in, h_lex=e_lex)
+            if use_dca:
+                hist.append(h)
 
             # Stage 1: Mid-low SWA -> Crystal 1
             for blk in self.swa_stages[1]:
+                h = _dca_mix(h)
                 h = blk(h)
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix(h)
             if not ablate_crystal and self.cryst1_norm is not None and self.cryst1_gate is not None:
                 c1_in = self.cryst1_norm(h)
                 c1_g = 2.0 * torch.sigmoid(self.cryst1_gate(c1_in))
                 h = h + c1_g * self.crystal(c1_in, h_lex=e_lex)
+            if use_dca:
+                hist.append(h)
 
             # Stage 2: Mid-high SWA -> Slow Epistemic Woodbury + Mid MLP
             for blk in self.swa_stages[2]:
+                h = _dca_mix(h)
                 h = blk(h)
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix(h)
             if not ablate_woodbury and self.woodbury_slow_gate is not None:
                 ws_in = self.split_norm(h)
                 ws_g = 2.0 * torch.sigmoid(self.woodbury_slow_gate(ws_in))
@@ -750,19 +846,32 @@ class CalciteV2LM(nn.Module):
                     h = h + es_g * self.epistemic_slots(
                         ws_in, self.woodbury.last_epistemic_uncertainty, h_lex=e_lex
                     )
+            if use_dca:
+                hist.append(h)
+            h = _dca_mix(h)
             h = h + self.mid_mlp(self.mid_mlp_norm(h))
+            if use_dca:
+                hist.append(h)
 
             # Stage 3: Crystal 2 -> Top SWA
+            h = _dca_mix(h)
             if not ablate_crystal:
                 c2_in = self.cryst2_norm(h)
                 c2_g = 2.0 * torch.sigmoid(self.cryst2_gate(c2_in))
                 h = h + c2_g * self.crystal_2(c2_in, h_lex=e_lex)
+            if use_dca:
+                hist.append(h)
             for blk in self.swa_stages[3]:
+                h = _dca_mix(h)
                 h = blk(h)
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix(h)
             return (h, tr_b_init) if tr_b_init is not None else h
 
-        # Clean hourglass topology (with optional AttnRes + Temporal Residual)
+        # Clean hourglass topology (with optional AttnRes / DeepCrossAttention + Temporal Residual)
         use_ar = self.attnres_mixers is not None
+        use_dca = (self.dca_mixers is not None) and bool(getattr(self, "_dca_active", True))
         use_tr = (
             tr_b_init is not None
             and self.tr_rA is not None
@@ -783,14 +892,25 @@ class CalciteV2LM(nn.Module):
                 return a_next, b_next
             return a_cur + fn(a_cur), b_cur
 
-        hist: list[torch.Tensor] = [h] if use_ar else []
+        hist = [h] if (use_ar or use_dca) else []
+        dca_idx = 0
+
+        def _dca_mix_hg(h_cur: torch.Tensor) -> torch.Tensor:
+            nonlocal dca_idx
+            if use_dca and self.dca_mixers is not None and len(hist) >= 2:
+                h_cur = self.dca_mixers[dca_idx](h_cur, hist)
+                dca_idx += 1
+            return h_cur
+
         for blk in self.cortex_pre:
+            if use_dca:
+                h = _dca_mix_hg(h)
             if use_tr:
                 h, b_stream = _tr_step(h, b_stream, blk._apply_attn)
                 h, b_stream = _tr_step(h, b_stream, blk._apply_mlp)
             else:
                 h = blk(h)
-            if use_ar:
+            if use_ar or use_dca:
                 hist.append(h)
 
         def _long_mem_fn(u_in: torch.Tensor) -> torch.Tensor:
@@ -820,7 +940,11 @@ class CalciteV2LM(nn.Module):
                     )
             return delta_long
 
-        if use_ar and self.attnres_mixers is not None:
+        if use_dca:
+            h = _dca_mix_hg(h)
+            h, b_stream = _tr_step(h, b_stream, _long_mem_fn)
+            hist.append(h)
+        elif use_ar and self.attnres_mixers is not None:
             h_long_in = self.attnres_mixers[0](h, hist)
             if use_tr and b_stream is not None and self.tr_rA is not None and self.tr_rB is not None and self.tr_sB is not None:
                 u = self.tr_rA[tr_idx].to(h.dtype) * h_long_in + self.tr_rB[tr_idx].to(h.dtype) * b_stream
@@ -837,7 +961,11 @@ class CalciteV2LM(nn.Module):
         def _mid_mlp_fn(u_in: torch.Tensor) -> torch.Tensor:
             return self.mid_mlp(self.mid_mlp_norm(u_in))
 
-        if use_ar and self.attnres_mixers is not None:
+        if use_dca:
+            h = _dca_mix_hg(h)
+            h, b_stream = _tr_step(h, b_stream, _mid_mlp_fn)
+            hist.append(h)
+        elif use_ar and self.attnres_mixers is not None:
             h_mid_in = self.attnres_mixers[1](h, hist)
             if use_tr and b_stream is not None and self.tr_rA is not None and self.tr_rB is not None and self.tr_sB is not None:
                 u = self.tr_rA[tr_idx].to(h.dtype) * h_mid_in + self.tr_rB[tr_idx].to(h.dtype) * b_stream
@@ -857,7 +985,11 @@ class CalciteV2LM(nn.Module):
             c2_in = self.cryst2_norm(u_in)
             return (2.0 * torch.sigmoid(self.cryst2_gate(c2_in))) * self.crystal_2(c2_in, h_lex=e_lex)
 
-        if use_ar and self.attnres_mixers is not None:
+        if use_dca:
+            h = _dca_mix_hg(h)
+            h, b_stream = _tr_step(h, b_stream, _c2_fn)
+            hist.append(h)
+        elif use_ar and self.attnres_mixers is not None:
             h_c2_in = self.attnres_mixers[2](h, hist)
             if use_tr and b_stream is not None and self.tr_rA is not None and self.tr_rB is not None and self.tr_sB is not None:
                 u = self.tr_rA[tr_idx].to(h.dtype) * h_c2_in + self.tr_rB[tr_idx].to(h.dtype) * b_stream
@@ -872,17 +1004,21 @@ class CalciteV2LM(nn.Module):
             h, b_stream = _tr_step(h, b_stream, _c2_fn)
 
         for pi, blk in enumerate(self.cortex_post):
-            if use_ar and self.attnres_mixers is not None:
+            if use_dca:
+                h = _dca_mix_hg(h)
+            elif use_ar and self.attnres_mixers is not None:
                 h = self.attnres_mixers[3 + pi](h, hist)
             if use_tr:
                 h, b_stream = _tr_step(h, b_stream, blk._apply_attn)
                 h, b_stream = _tr_step(h, b_stream, blk._apply_mlp)
             else:
                 h = blk(h)
-            if use_ar:
+            if use_ar or use_dca:
                 hist.append(h)
 
-        if use_ar and self.attnres_mixers is not None:
+        if use_dca:
+            h = _dca_mix_hg(h)
+        elif use_ar and self.attnres_mixers is not None:
             h = self.attnres_mixers[-1](h, hist)
         if tr_b_init is not None:
             assert b_stream is not None
@@ -1058,7 +1194,7 @@ def compute_v2_state_cache_kb(cfg: CalciteV2Config, seq_len: int = 2048) -> floa
             if cfg.use_sym_byte_swa
             else 0
         )
-        + (24 if cfg.use_byte_engram else 0)
+        + ((32 if cfg.engram_use_4gram else 24) if cfg.use_byte_engram else 0)
         + (
             (2 * int(cfg.byte_induct_slots) * (8 + int(cfg.byte_induct_dim) + 1) * 4 + 56 + cfg.d_model * 4)
             if cfg.use_byte_induct_cache
@@ -1105,6 +1241,8 @@ def build_calcite_v2_tier_config(
     dec_dw3_enabled: bool = True,
     dw_bottleneck_ratio: float = 1.0,
     bf16_residual_stream: bool = False,
+    use_dca: bool = False,
+    engram_use_4gram: bool = False,
 ) -> CalciteV2Config:
     """
     Parameter-matched (< 2% vs Phase K tiers) `CalciteV2Config` for `S1_5M`, `S2_25M`, `S3_85M`.
@@ -1178,4 +1316,6 @@ def build_calcite_v2_tier_config(
         dec_dw3_enabled=bool(dec_dw3_enabled),
         dw_bottleneck_ratio=float(dw_bottleneck_ratio),
         bf16_residual_stream=bool(bf16_residual_stream),
+        use_dca=bool(use_dca),
+        engram_use_4gram=bool(engram_use_4gram),
     )

@@ -77,3 +77,4 @@ benchmarks/phase_m_v3/smoke_*.pt
 benchmarks/phase_n_needle/*_fp.pt
 benchmarks/phase_n_needle/smoke_*.json
 checkpoints/smoke_*.pt
+checkpoints/phase_p_fp/

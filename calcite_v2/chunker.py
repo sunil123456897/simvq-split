@@ -141,9 +141,9 @@ class ChunkerStreamState:
     ring_dec_conv2: torch.Tensor   # (B, 6, d_dw) if scaled decoder else (B, 0, 1)
     ring_enc_conv2: torch.Tensor   # (B, 6, d_dw) if sym_byte_swa else (B, 0, 1)
     ring_dec_conv3: torch.Tensor   # (B, 12, d_dw) if (sym_byte_swa and dec_dw3_enabled) else (B, 0, 1)
-    ring_byte_k: torch.Tensor      # (B, W_byte, 2, d_b_hd) if sym_byte_swa else (B, 0, 1, 1)
-    ring_byte_v: torch.Tensor      # (B, W_byte, 2, d_b_hd) if sym_byte_swa else (B, 0, 1, 1)
-    ring_tok3: torch.Tensor        # (B, 3) int64 if byte_engram else (B, 0)
+    ring_byte_k: torch.Tensor      # (B, W_byte, byte_swa_heads, d_b_hd) if sym_byte_swa else (B, 0, 1, 1)
+    ring_byte_v: torch.Tensor      # (B, W_byte, byte_swa_heads, d_b_hd) if sym_byte_swa else (B, 0, 1, 1)
+    ring_tok3: torch.Tensor        # (B, 4 if engram_use_4gram else 3) int64 if byte_engram else (B, 0)
     run_len: torch.Tensor          # (B,) int64
     cp_run: torch.Tensor           # (B,) int64
     cont_streak: torch.Tensor      # (B,) int64
@@ -212,6 +212,7 @@ class CalciteV2Chunker(nn.Module):
         use_byte_engram: bool = False,
         engram_slots: int = 4096,
         engram_dim: int = 32,
+        engram_use_4gram: bool = False,
         use_byte_induct_cache: bool = False,
         byte_induct_slots: int = 1024,
         byte_induct_dim: int = 16,
@@ -236,11 +237,17 @@ class CalciteV2Chunker(nn.Module):
         self.use_sym_byte_swa = bool(use_sym_byte_swa)
         self.byte_swa_window = int(byte_swa_window)
         self.byte_swa_dim = int(byte_swa_dim)
-        self.byte_swa_heads = 2
+        self.byte_swa_heads = (
+            max(1, self.byte_swa_dim // 32) if (self.byte_swa_dim % 32 == 0) else 2
+        )
         self.byte_swa_head_dim = self.byte_swa_dim // self.byte_swa_heads
         self.use_byte_engram = bool(use_byte_engram)
         self.engram_slots = int(engram_slots)
         self.engram_dim = int(engram_dim)
+        self.engram_use_4gram = bool(engram_use_4gram)
+        self.engram_ring_len = (
+            (4 if self.engram_use_4gram else 3) if self.use_byte_engram else 0
+        )
         self.use_byte_induct_cache = bool(use_byte_induct_cache)
         self.byte_induct_slots = int(byte_induct_slots)
         self.byte_induct_dim = int(byte_induct_dim)
@@ -403,11 +410,16 @@ class CalciteV2Chunker(nn.Module):
             self._bswa_block_q = 64
 
         if self.use_byte_engram:
-            # Pure-tensor hashed 2-byte + 3-byte lexical n-gram memory (zero dynamic state!)
+            # Pure-tensor hashed 2/3(/4)-byte lexical n-gram memory (zero dynamic state!)
             self.engram_emb2 = nn.Embedding(self.engram_slots, self.engram_dim)
             self.engram_emb3 = nn.Embedding(self.engram_slots, self.engram_dim)
             nn.init.normal_(self.engram_emb2.weight, std=0.02)
             nn.init.normal_(self.engram_emb3.weight, std=0.02)
+            if self.engram_use_4gram:
+                self.engram_emb4 = nn.Embedding(self.engram_slots, self.engram_dim)
+                nn.init.normal_(self.engram_emb4.weight, std=0.02)
+            else:
+                self.engram_emb4 = None
             self.engram_norm = CalciteRMSNorm(self.engram_dim)
             self.engram_proj = nn.Linear(self.engram_dim, d_model, bias=False)
             with torch.no_grad():
@@ -417,6 +429,7 @@ class CalciteV2Chunker(nn.Module):
         else:
             self.engram_emb2 = None
             self.engram_emb3 = None
+            self.engram_emb4 = None
             self.engram_norm = None
             self.engram_proj = None
             self.engram_gate = None
@@ -431,6 +444,7 @@ class CalciteV2Chunker(nn.Module):
             )
         else:
             self.byte_induct_cache = None
+        self._bic_active: bool = True
 
         self.dec_fuse_norm = CalciteRMSNorm(d_model + 8 * self.d_byte)
         self.dec_fuse = nn.Linear(d_model + 8 * self.d_byte, d_model, bias=False)
@@ -558,9 +572,11 @@ class CalciteV2Chunker(nn.Module):
             base += 6 * self.d_dw * 2  # enc_dw2 (6)
             if self.dec_dw3_enabled:
                 base += 12 * self.d_dw * 2  # dec_dw3 (12)
-            base += 2 * self.byte_swa_window * self.byte_swa_dim * 2  # micro byte-SWA K+V ring
+            base += (
+                2 * self.byte_swa_window * (self.byte_swa_heads * self.byte_swa_head_dim) * 2
+            )  # micro byte-SWA K+V ring
         if self.use_byte_engram:
-            base += 3 * 8  # ring_tok3 int64
+            base += (4 if self.engram_use_4gram else 3) * 8  # ring_tok3 int64
         return int(base)
 
     @staticmethod
@@ -1165,7 +1181,11 @@ class CalciteV2Chunker(nn.Module):
             and self.engram_proj is not None
             and self.engram_gate is not None
         )
-        need_bic = self.use_byte_induct_cache and self.byte_induct_cache is not None
+        need_bic = (
+            self.use_byte_induct_cache
+            and self.byte_induct_cache is not None
+            and getattr(self, "_bic_active", True)
+        )
         t_pad6 = F.pad(ctx.token_ids.long(), (6, 0), value=0) if (need_engram or need_bic) else None
 
         if need_engram and t_pad6 is not None:
@@ -1174,17 +1194,24 @@ class CalciteV2Chunker(nn.Module):
             t2 = t_pad6[:, 4 : 4 + T]
             base2 = t1 * 263 + t0 * 1009
             raw3 = t2 * 691 + base2 + 17
+            use_4g = self.engram_use_4gram and self.engram_emb4 is not None
+            raw4 = (t_pad6[:, 3 : 3 + T] * 4099 + raw3 + 31) if use_4g else None
             slots = self.engram_slots
             if slots > 0 and (slots & (slots - 1)) == 0:
                 mask = slots - 1
                 h2 = base2 & mask
                 h3 = raw3 & mask
+                h4 = (raw4 & mask) if raw4 is not None else None
             else:
                 h2 = torch.remainder(base2, slots)
                 h3 = torch.remainder(raw3, slots)
+                h4 = torch.remainder(raw4, slots) if raw4 is not None else None
             assert self.engram_emb2 is not None and self.engram_emb3 is not None
             assert self.engram_norm is not None and self.engram_proj is not None and self.engram_gate is not None
-            e_eng = (self.engram_emb2(h2) + self.engram_emb3(h3)).to(dec_in.dtype)
+            e_sum = self.engram_emb2(h2) + self.engram_emb3(h3)
+            if use_4g and self.engram_emb4 is not None and h4 is not None:
+                e_sum = e_sum + self.engram_emb4(h4)
+            e_eng = e_sum.to(dec_in.dtype)
             eg = torch.sigmoid(self.engram_gate(dec_in))
             dec_in = dec_in + eg * self.engram_proj(self.engram_norm(e_eng))
         if need_bic and self.byte_induct_cache is not None:
@@ -1243,7 +1270,12 @@ class CalciteV2Chunker(nn.Module):
             else torch.zeros(batch_size, 0, 1, 1, device=device, dtype=dtype)
         )
         ring_tok3 = (
-            torch.zeros(batch_size, 3, device=device, dtype=torch.long)
+            torch.zeros(
+                batch_size,
+                4 if self.engram_use_4gram else 3,
+                device=device,
+                dtype=torch.long,
+            )
             if self.use_byte_engram
             else torch.zeros(batch_size, 0, device=device, dtype=torch.long)
         )
@@ -1324,10 +1356,11 @@ class CalciteV2Chunker(nn.Module):
         state.ring_rchar[:, rcp] = rc_t
         state.rchar_ptr = (rcp + 1) % 3
 
-        if self.use_byte_engram and state.ring_tok3.size(1) == 3:
+        ring_len = state.ring_tok3.size(1)
+        if self.use_byte_engram and ring_len >= 3:
             tp = state.tok3_ptr
             state.ring_tok3[:, tp] = token_t
-            state.tok3_ptr = (tp + 1) % 3
+            state.tok3_ptr = (tp + 1) % ring_len
         if self.use_byte_induct_cache:
             state.last_tok = token_t
 
@@ -1543,6 +1576,7 @@ class CalciteV2Chunker(nn.Module):
             probs_b = F.softmax(scores_b, dim=-1).to(qkv_b.dtype)
             yb = torch.matmul(probs_b, v_use.permute(0, 2, 1, 3)).reshape(B_cur, self.byte_swa_dim)
             dec_in = dec_in + self.byte_swa_out(yb)
+        ring_len = state.ring_tok3.size(1)
         if (
             self.use_byte_engram
             and self.engram_emb2 is not None
@@ -1550,28 +1584,40 @@ class CalciteV2Chunker(nn.Module):
             and self.engram_norm is not None
             and self.engram_proj is not None
             and self.engram_gate is not None
-            and state.ring_tok3.size(1) == 3
+            and ring_len >= 3
         ):
             tp = state.tok3_ptr
-            t2 = state.ring_tok3[:, tp]
-            t1 = state.ring_tok3[:, (tp + 1) % 3]
-            t0 = state.ring_tok3[:, (tp + 2) % 3]
+            t0 = state.ring_tok3[:, (tp - 1) % ring_len]
+            t1 = state.ring_tok3[:, (tp - 2) % ring_len]
+            t2 = state.ring_tok3[:, (tp - 3) % ring_len]
             base2 = t1 * 263 + t0 * 1009
             raw3 = t2 * 691 + base2 + 17
+            use_4g = self.engram_use_4gram and self.engram_emb4 is not None and ring_len >= 4
+            raw4 = (
+                (state.ring_tok3[:, (tp - 4) % ring_len] * 4099 + raw3 + 31)
+                if use_4g
+                else None
+            )
             slots = self.engram_slots
             if slots > 0 and (slots & (slots - 1)) == 0:
                 mask = slots - 1
                 h2 = base2 & mask
                 h3 = raw3 & mask
+                h4 = (raw4 & mask) if raw4 is not None else None
             else:
                 h2 = torch.remainder(base2, slots)
                 h3 = torch.remainder(raw3, slots)
-            e_eng = (self.engram_emb2(h2) + self.engram_emb3(h3)).to(dt)
+                h4 = torch.remainder(raw4, slots) if raw4 is not None else None
+            e_sum = self.engram_emb2(h2) + self.engram_emb3(h3)
+            if use_4g and self.engram_emb4 is not None and h4 is not None:
+                e_sum = e_sum + self.engram_emb4(h4)
+            e_eng = e_sum.to(dt)
             eg = torch.sigmoid(self.engram_gate(dec_in))
             dec_in = dec_in + eg * self.engram_proj(self.engram_norm(e_eng))
         if (
             self.use_byte_induct_cache
             and self.byte_induct_cache is not None
+            and getattr(self, "_bic_active", True)
             and state.byte_induct is not None
             and state.last_tok is not None
         ):

@@ -474,12 +474,27 @@ class CalciteStreamEngine:
 
         ring_idx = 0
         if self.cfg.topology == "interleaved" and m.swa_stages is not None:
+            use_dca = m.dca_mixers is not None
+            hist: List[torch.Tensor] = [h] if use_dca else []
+            dca_idx = 0
+
+            def _dca_mix_il(h_cur: torch.Tensor) -> torch.Tensor:
+                nonlocal dca_idx
+                if use_dca and m.dca_mixers is not None and len(hist) >= 2:
+                    h_cur = m.dca_mixers[dca_idx](h_cur, hist)
+                    dca_idx += 1
+                return h_cur
+
             for blk in m.swa_stages[0]:
+                h = _dca_mix_il(h)
                 c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
                     h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il(h)
             if (
                 m.woodbury_fast is not None
                 and m.woodbury_fast_norm is not None
@@ -489,24 +504,36 @@ class CalciteStreamEngine:
                 wf_in = m.woodbury_fast_norm(h)
                 wf_g = 2.0 * torch.sigmoid(m.woodbury_fast_gate(wf_in))
                 h = h + wf_g * m.woodbury_fast.step(wf_in, h_lex_t, state.woodbury_fast)
+            if use_dca:
+                hist.append(h)
 
             for blk in m.swa_stages[1]:
+                h = _dca_mix_il(h)
                 c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
                     h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il(h)
             if m.cryst1_norm is not None and m.cryst1_gate is not None:
                 c1_in = m.cryst1_norm(h)
                 c1_g = 2.0 * torch.sigmoid(m.cryst1_gate(c1_in))
                 h = h + c1_g * m.crystal.step(c1_in, h_lex_t, state.crystal_1)
+            if use_dca:
+                hist.append(h)
 
             for blk in m.swa_stages[2]:
+                h = _dca_mix_il(h)
                 c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
                     h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il(h)
             if m.woodbury_slow_gate is not None:
                 ws_in = m.split_norm(h)
                 ws_g = 2.0 * torch.sigmoid(m.woodbury_slow_gate(ws_in))
@@ -520,20 +547,33 @@ class CalciteStreamEngine:
                     h = h + es_g * m.epistemic_slots.step(
                         ws_in, m.woodbury.last_epistemic_uncertainty, state.epistemic_slots, h_lex_t=h_lex_t
                     )
+            if use_dca:
+                hist.append(h)
+            h = _dca_mix_il(h)
             h = h + m.mid_mlp(m.mid_mlp_norm(h))
+            if use_dca:
+                hist.append(h)
 
+            h = _dca_mix_il(h)
             c2_in = m.cryst2_norm(h)
             c2_g = 2.0 * torch.sigmoid(m.cryst2_gate(c2_in))
             h = h + c2_g * m.crystal_2.step(c2_in, h_lex_t, state.crystal_2)
+            if use_dca:
+                hist.append(h)
 
             for blk in m.swa_stages[3]:
+                h = _dca_mix_il(h)
                 c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                 h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx] = blk.step(
                     h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], pos, canon_rings=c_rng
                 )
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il(h)
         else:
             use_ar = m.attnres_mixers is not None
+            use_dca = m.dca_mixers is not None
             use_tr = (
                 self.cfg.use_temporal_residual
                 and state.tr_carry_B is not None
@@ -600,11 +640,22 @@ class CalciteStreamEngine:
                 state.swa_v_rings[r_i] = vr
                 return a_out, b_cur
 
-            hist: List[torch.Tensor] = [h] if use_ar else []
+            hist = [h] if (use_ar or use_dca) else []
+            dca_idx = 0
+
+            def _dca_mix_hg(h_cur: torch.Tensor) -> torch.Tensor:
+                nonlocal dca_idx
+                if use_dca and m.dca_mixers is not None and len(hist) >= 2:
+                    h_cur = m.dca_mixers[dca_idx](h_cur, hist)
+                    dca_idx += 1
+                return h_cur
+
             for blk in m.cortex_pre:
+                if use_dca:
+                    h = _dca_mix_hg(h)
                 h, b_stream = _step_swa_blk(blk, ring_idx, h, b_stream)
                 ring_idx += 1
-                if use_ar:
+                if use_ar or use_dca:
                     hist.append(h)
 
             def _long_mem_step(u_in: torch.Tensor) -> torch.Tensor:
@@ -627,7 +678,11 @@ class CalciteStreamEngine:
                     )
                 return delta_l
 
-            if use_ar and m.attnres_mixers is not None:
+            if use_dca:
+                h = _dca_mix_hg(h)
+                h, b_stream = _tr_step_stream(h, b_stream, _long_mem_step)
+                hist.append(h)
+            elif use_ar and m.attnres_mixers is not None:
                 h_long_in = m.attnres_mixers[0](h, hist)
                 if (
                     use_tr
@@ -650,7 +705,11 @@ class CalciteStreamEngine:
             def _mid_mlp_step(u_in: torch.Tensor) -> torch.Tensor:
                 return m.mid_mlp(m.mid_mlp_norm(u_in))
 
-            if use_ar and m.attnres_mixers is not None:
+            if use_dca:
+                h = _dca_mix_hg(h)
+                h, b_stream = _tr_step_stream(h, b_stream, _mid_mlp_step)
+                hist.append(h)
+            elif use_ar and m.attnres_mixers is not None:
                 h_mid_in = m.attnres_mixers[1](h, hist)
                 if (
                     use_tr
@@ -676,7 +735,11 @@ class CalciteStreamEngine:
                     c2_in, h_lex_t, state.crystal_2
                 )
 
-            if use_ar and m.attnres_mixers is not None:
+            if use_dca:
+                h = _dca_mix_hg(h)
+                h, b_stream = _tr_step_stream(h, b_stream, _c2_step)
+                hist.append(h)
+            elif use_ar and m.attnres_mixers is not None:
                 h_c2_in = m.attnres_mixers[2](h, hist)
                 if (
                     use_tr
@@ -697,14 +760,18 @@ class CalciteStreamEngine:
                 h, b_stream = _tr_step_stream(h, b_stream, _c2_step)
 
             for pi, blk in enumerate(m.cortex_post):
-                if use_ar and m.attnres_mixers is not None:
+                if use_dca:
+                    h = _dca_mix_hg(h)
+                elif use_ar and m.attnres_mixers is not None:
                     h = m.attnres_mixers[3 + pi](h, hist)
                 h, b_stream = _step_swa_blk(blk, ring_idx, h, b_stream)
                 ring_idx += 1
-                if use_ar:
+                if use_ar or use_dca:
                     hist.append(h)
 
-            if use_ar and m.attnres_mixers is not None:
+            if use_dca:
+                h = _dca_mix_hg(h)
+            elif use_ar and m.attnres_mixers is not None:
                 h = m.attnres_mixers[-1](h, hist)
             if use_tr and b_stream is not None:
                 state.tr_carry_B = b_stream.clone()
@@ -1659,8 +1726,9 @@ class CalciteStreamEngine:
             log_v = math.log(max(2, ch.vocab_size))
             cs.prev_h_ent.copy_((-(lp_last.exp() * lp_last).sum(dim=-1) / log_v).clamp(0.0, 1.5))
 
-            if ch.use_byte_engram and cs.ring_tok3.size(1) == 3:
-                cs.ring_tok3.copy_(_pad_tail_chronological(token_ids.long(), 3))
+            engram_ring_len = cs.ring_tok3.size(1)
+            if ch.use_byte_engram and engram_ring_len >= 3:
+                cs.ring_tok3.copy_(_pad_tail_chronological(token_ids.long(), engram_ring_len))
                 cs.tok3_ptr = 0
             if ch.use_byte_induct_cache:
                 cs.last_tok = token_ids[:, -1].clone()
@@ -1716,12 +1784,27 @@ class CalciteStreamEngine:
             h = z_in
             ring_idx = 0
             if self.cfg.topology == "interleaved" and m.swa_stages is not None:
+                use_dca = m.dca_mixers is not None
+                hist: List[torch.Tensor] = [h] if use_dca else []
+                dca_idx = 0
+
+                def _dca_mix_il_pf(h_cur: torch.Tensor) -> torch.Tensor:
+                    nonlocal dca_idx
+                    if use_dca and m.dca_mixers is not None and len(hist) >= 2:
+                        h_cur = m.dca_mixers[dca_idx](h_cur, hist)
+                        dca_idx += 1
+                    return h_cur
+
                 for blk in m.swa_stages[0]:
+                    h = _dca_mix_il_pf(h)
                     c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                     h = self._swa_block_prefill_with_state(
                         blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], c_rng
                     )
                     ring_idx += 1
+                    if use_dca:
+                        hist.append(h)
+                h = _dca_mix_il_pf(h)
                 if (
                     m.woodbury_fast is not None
                     and m.woodbury_fast_norm is not None
@@ -1733,26 +1816,38 @@ class CalciteStreamEngine:
                     h = h + wf_g * self._woodbury_prefill_with_state(
                         m.woodbury_fast, wf_in, h_lex_chunk, state.woodbury_fast
                     )
+                if use_dca:
+                    hist.append(h)
 
                 for blk in m.swa_stages[1]:
+                    h = _dca_mix_il_pf(h)
                     c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                     h = self._swa_block_prefill_with_state(
                         blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], c_rng
                     )
                     ring_idx += 1
+                    if use_dca:
+                        hist.append(h)
+                h = _dca_mix_il_pf(h)
                 if m.cryst1_norm is not None and m.cryst1_gate is not None:
                     c1_in = m.cryst1_norm(h)
                     c1_g = 2.0 * torch.sigmoid(m.cryst1_gate(c1_in))
                     h = h + c1_g * self._crystal_prefill_with_state(
                         m.crystal, c1_in, h_lex_chunk, state.crystal_1
                     )
+                if use_dca:
+                    hist.append(h)
 
                 for blk in m.swa_stages[2]:
+                    h = _dca_mix_il_pf(h)
                     c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                     h = self._swa_block_prefill_with_state(
                         blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], c_rng
                     )
                     ring_idx += 1
+                    if use_dca:
+                        hist.append(h)
+                h = _dca_mix_il_pf(h)
                 if m.woodbury_slow_gate is not None:
                     ws_in = m.split_norm(h)
                     ws_g = 2.0 * torch.sigmoid(m.woodbury_slow_gate(ws_in))
@@ -1772,33 +1867,63 @@ class CalciteStreamEngine:
                             h_lex_chunk,
                             state.epistemic_slots,
                         )
+                if use_dca:
+                    hist.append(h)
+                h = _dca_mix_il_pf(h)
                 h = h + m.mid_mlp(m.mid_mlp_norm(h))
+                if use_dca:
+                    hist.append(h)
 
+                h = _dca_mix_il_pf(h)
                 c2_in = m.cryst2_norm(h)
                 c2_g = 2.0 * torch.sigmoid(m.cryst2_gate(c2_in))
                 h = h + c2_g * self._crystal_prefill_with_state(
                     m.crystal_2, c2_in, h_lex_chunk, state.crystal_2
                 )
+                if use_dca:
+                    hist.append(h)
 
                 for blk in m.swa_stages[3]:
+                    h = _dca_mix_il_pf(h)
                     c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                     h = self._swa_block_prefill_with_state(
                         blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], c_rng
                     )
                     ring_idx += 1
+                    if use_dca:
+                        hist.append(h)
+                h = _dca_mix_il_pf(h)
             else:
                 use_ar = m.attnres_mixers is not None
-                hist: List[torch.Tensor] = [h] if use_ar else []
+                use_dca = m.dca_mixers is not None
+                hist = [h] if (use_ar or use_dca) else []
+                dca_idx = 0
+
+                def _dca_mix_hg_pf(h_cur: torch.Tensor) -> torch.Tensor:
+                    nonlocal dca_idx
+                    if use_dca and m.dca_mixers is not None and len(hist) >= 2:
+                        h_cur = m.dca_mixers[dca_idx](h_cur, hist)
+                        dca_idx += 1
+                    return h_cur
+
                 for blk in m.cortex_pre:
+                    if use_dca:
+                        h = _dca_mix_hg_pf(h)
                     c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                     h = self._swa_block_prefill_with_state(
                         blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], c_rng
                     )
                     ring_idx += 1
-                    if use_ar:
+                    if use_ar or use_dca:
                         hist.append(h)
 
-                h_long_in = m.attnres_mixers[0](h, hist) if (use_ar and m.attnres_mixers is not None) else h
+                if use_dca:
+                    h = _dca_mix_hg_pf(h)
+                    h_long_in = h
+                elif use_ar and m.attnres_mixers is not None:
+                    h_long_in = m.attnres_mixers[0](h, hist)
+                else:
+                    h_long_in = h
                 h_split = m.split_norm(h_long_in)
                 c_out = self._crystal_prefill_with_state(m.crystal, h_split, h_lex_chunk, state.crystal_1)
                 w_out = self._woodbury_prefill_with_state(m.woodbury, h_split, h_lex_chunk, state.woodbury_slow)
@@ -1821,34 +1946,50 @@ class CalciteStreamEngine:
                         state.epistemic_slots,
                     )
                 h = h + delta_l
-                if use_ar:
+                if use_ar or use_dca:
                     hist.append(h)
 
-                h_mid_in = m.attnres_mixers[1](h, hist) if (use_ar and m.attnres_mixers is not None) else h
+                if use_dca:
+                    h = _dca_mix_hg_pf(h)
+                    h_mid_in = h
+                elif use_ar and m.attnres_mixers is not None:
+                    h_mid_in = m.attnres_mixers[1](h, hist)
+                else:
+                    h_mid_in = h
                 h = h + m.mid_mlp(m.mid_mlp_norm(h_mid_in))
-                if use_ar:
+                if use_ar or use_dca:
                     hist.append(h)
 
-                h_c2_in = m.attnres_mixers[2](h, hist) if (use_ar and m.attnres_mixers is not None) else h
+                if use_dca:
+                    h = _dca_mix_hg_pf(h)
+                    h_c2_in = h
+                elif use_ar and m.attnres_mixers is not None:
+                    h_c2_in = m.attnres_mixers[2](h, hist)
+                else:
+                    h_c2_in = h
                 c2_in = m.cryst2_norm(h_c2_in)
                 h = h + (2.0 * torch.sigmoid(m.cryst2_gate(c2_in))) * self._crystal_prefill_with_state(
                     m.crystal_2, c2_in, h_lex_chunk, state.crystal_2
                 )
-                if use_ar:
+                if use_ar or use_dca:
                     hist.append(h)
 
                 for pi, blk in enumerate(m.cortex_post):
-                    if use_ar and m.attnres_mixers is not None:
+                    if use_dca:
+                        h = _dca_mix_hg_pf(h)
+                    elif use_ar and m.attnres_mixers is not None:
                         h = m.attnres_mixers[3 + pi](h, hist)
                     c_rng = state.swa_canon_rings[ring_idx] if state.swa_canon_rings is not None else None
                     h = self._swa_block_prefill_with_state(
                         blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], c_rng
                     )
                     ring_idx += 1
-                    if use_ar:
+                    if use_ar or use_dca:
                         hist.append(h)
 
-                if use_ar and m.attnres_mixers is not None:
+                if use_dca:
+                    h = _dca_mix_hg_pf(h)
+                elif use_ar and m.attnres_mixers is not None:
                     h = m.attnres_mixers[-1](h, hist)
 
             z_hat = h  # (1, M, D)
@@ -1993,17 +2134,24 @@ class CalciteStreamEngine:
                 t2 = t_pad6[:, 4 : 4 + T]
                 base2 = t1 * 263 + t0 * 1009
                 raw3 = t2 * 691 + base2 + 17
+                use_4g = ch.engram_use_4gram and ch.engram_emb4 is not None
+                raw4 = (t_pad6[:, 3 : 3 + T] * 4099 + raw3 + 31) if use_4g else None
                 slots_e = ch.engram_slots
                 if slots_e > 0 and (slots_e & (slots_e - 1)) == 0:
                     em = slots_e - 1
                     h2 = base2 & em
                     h3 = raw3 & em
+                    h4 = (raw4 & em) if raw4 is not None else None
                 else:
                     h2 = torch.remainder(base2, slots_e)
                     h3 = torch.remainder(raw3, slots_e)
+                    h4 = torch.remainder(raw4, slots_e) if raw4 is not None else None
                 assert ch.engram_emb2 is not None and ch.engram_emb3 is not None
                 assert ch.engram_norm is not None and ch.engram_proj is not None and ch.engram_gate is not None
-                e_eng = (ch.engram_emb2(h2) + ch.engram_emb3(h3)).to(dec_in.dtype)
+                e_sum = ch.engram_emb2(h2) + ch.engram_emb3(h3)
+                if use_4g and ch.engram_emb4 is not None and h4 is not None:
+                    e_sum = e_sum + ch.engram_emb4(h4)
+                e_eng = e_sum.to(dec_in.dtype)
                 eg = torch.sigmoid(ch.engram_gate(dec_in))
                 dec_in = dec_in + eg * ch.engram_proj(ch.engram_norm(e_eng))
 
@@ -2109,7 +2257,7 @@ class CalciteStreamEngine:
         cs.char_ptr = 0
         _canonicalize_circular_ring(cs.ring_rchar, cs.rchar_ptr)
         cs.rchar_ptr = 0
-        if cs.ring_tok3.size(1) == 3:
+        if cs.ring_tok3.size(1) >= 3:
             _canonicalize_circular_ring(cs.ring_tok3, cs.tok3_ptr)
             cs.tok3_ptr = 0
         if cs.ring_enc_conv2.size(1) > 0:
@@ -2235,7 +2383,7 @@ class CalciteStreamEngine:
         r_win4_t = torch.cat([rc_t, cs.ring_rchar[:, 2], cs.ring_rchar[:, 1], cs.ring_rchar[:, 0]], dim=-1)
         _shift_ring_append_graph_safe(cs.ring_rchar, rc_t)
 
-        if ch.use_byte_engram and cs.ring_tok3.size(1) == 3:
+        if ch.use_byte_engram and cs.ring_tok3.size(1) >= 3:
             _shift_ring_append_graph_safe(cs.ring_tok3, token_t)
 
         c_norm_t = ch.enc_norm_in(c_win8_t)
@@ -2374,6 +2522,7 @@ class CalciteStreamEngine:
             yb = torch.matmul(probs_b, cs.ring_byte_v.permute(0, 2, 1, 3)).reshape(1, ch.byte_swa_dim)
             dec_in = dec_in + ch.byte_swa_out(yb)
 
+        engram_ring_len = cs.ring_tok3.size(1)
         if (
             ch.use_byte_engram
             and ch.engram_emb2 is not None
@@ -2381,20 +2530,29 @@ class CalciteStreamEngine:
             and ch.engram_norm is not None
             and ch.engram_proj is not None
             and ch.engram_gate is not None
-            and cs.ring_tok3.size(1) == 3
+            and engram_ring_len >= 3
         ):
-            t2, t1, t0 = cs.ring_tok3[:, 0], cs.ring_tok3[:, 1], cs.ring_tok3[:, 2]
+            t0 = cs.ring_tok3[:, -1]
+            t1 = cs.ring_tok3[:, -2]
+            t2 = cs.ring_tok3[:, -3]
             base2 = t1 * 263 + t0 * 1009
             raw3 = t2 * 691 + base2 + 17
+            use_4g = ch.engram_use_4gram and ch.engram_emb4 is not None and engram_ring_len >= 4
+            raw4 = (cs.ring_tok3[:, -4] * 4099 + raw3 + 31) if use_4g else None
             slots = ch.engram_slots
             if slots > 0 and (slots & (slots - 1)) == 0:
                 em = slots - 1
                 h2 = base2 & em
                 h3 = raw3 & em
+                h4 = (raw4 & em) if raw4 is not None else None
             else:
                 h2 = torch.remainder(base2, slots)
                 h3 = torch.remainder(raw3, slots)
-            e_eng = (ch.engram_emb2(h2) + ch.engram_emb3(h3)).to(dt)
+                h4 = torch.remainder(raw4, slots) if raw4 is not None else None
+            e_sum = ch.engram_emb2(h2) + ch.engram_emb3(h3)
+            if use_4g and ch.engram_emb4 is not None and h4 is not None:
+                e_sum = e_sum + ch.engram_emb4(h4)
+            e_eng = e_sum.to(dt)
             eg = torch.sigmoid(ch.engram_gate(dec_in))
             dec_in = dec_in + eg * ch.engram_proj(ch.engram_norm(e_eng))
 
@@ -2937,9 +3095,24 @@ class CalciteStreamEngine:
         ring_idx = 0
 
         if self.cfg.topology == "interleaved" and m.swa_stages is not None:
+            use_dca = m.dca_mixers is not None
+            hist: List[torch.Tensor] = [h] if use_dca else []
+            dca_idx = 0
+
+            def _dca_mix_il_cg(h_cur: torch.Tensor) -> torch.Tensor:
+                nonlocal dca_idx
+                if use_dca and m.dca_mixers is not None and len(hist) >= 2:
+                    h_cur = m.dca_mixers[dca_idx](h_cur, hist)
+                    dca_idx += 1
+                return h_cur
+
             for blk in m.swa_stages[0]:
+                h = _dca_mix_il_cg(h)
                 h = self._graph_swa_step(blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], b)
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il_cg(h)
             if (
                 m.woodbury_fast is not None
                 and m.woodbury_fast_norm is not None
@@ -2951,18 +3124,30 @@ class CalciteStreamEngine:
                 wf_g = 2.0 * torch.sigmoid(m.woodbury_fast_gate(wf_in))
                 wf_o, _ = self._graph_woodbury_step(m.woodbury_fast, wf_in, h_lex_t, state.woodbury_fast, b.wf_sc, wf_p)
                 h = h + wf_g * wf_o
+            if use_dca:
+                hist.append(h)
 
             for blk in m.swa_stages[1]:
+                h = _dca_mix_il_cg(h)
                 h = self._graph_swa_step(blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], b)
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il_cg(h)
             if m.cryst1_norm is not None and m.cryst1_gate is not None:
                 c1_in = m.cryst1_norm(h)
                 c1_g = 2.0 * torch.sigmoid(m.cryst1_gate(c1_in))
                 h = h + c1_g * self._graph_crystal_step(m.crystal, c1_in, h_lex_t, state.crystal_1, b.c1_sc, c1_p)
+            if use_dca:
+                hist.append(h)
 
             for blk in m.swa_stages[2]:
+                h = _dca_mix_il_cg(h)
                 h = self._graph_swa_step(blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], b)
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il_cg(h)
             if m.woodbury_slow_gate is not None:
                 ws_in = m.split_norm(h)
                 ws_g = 2.0 * torch.sigmoid(m.woodbury_slow_gate(ws_in))
@@ -2973,25 +3158,55 @@ class CalciteStreamEngine:
                     h = h + es_g * self._graph_epistemic_slots_step(
                         m.epistemic_slots, ws_in, u_ws, h_lex_t, state.epistemic_slots
                     )
+            if use_dca:
+                hist.append(h)
+            h = _dca_mix_il_cg(h)
             h = h + m.mid_mlp(m.mid_mlp_norm(h))
+            if use_dca:
+                hist.append(h)
 
+            h = _dca_mix_il_cg(h)
             c2_in = m.cryst2_norm(h)
             c2_g = 2.0 * torch.sigmoid(m.cryst2_gate(c2_in))
             h = h + c2_g * self._graph_crystal_step(m.crystal_2, c2_in, h_lex_t, state.crystal_2, b.c2_sc, c2_p)
+            if use_dca:
+                hist.append(h)
 
             for blk in m.swa_stages[3]:
+                h = _dca_mix_il_cg(h)
                 h = self._graph_swa_step(blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], b)
                 ring_idx += 1
+                if use_dca:
+                    hist.append(h)
+            h = _dca_mix_il_cg(h)
         else:
             use_ar = m.attnres_mixers is not None
-            hist: List[torch.Tensor] = [h] if use_ar else []
+            use_dca = m.dca_mixers is not None
+            hist = [h] if (use_ar or use_dca) else []
+            dca_idx = 0
+
+            def _dca_mix_hg_cg(h_cur: torch.Tensor) -> torch.Tensor:
+                nonlocal dca_idx
+                if use_dca and m.dca_mixers is not None and len(hist) >= 2:
+                    h_cur = m.dca_mixers[dca_idx](h_cur, hist)
+                    dca_idx += 1
+                return h_cur
+
             for blk in m.cortex_pre:
+                if use_dca:
+                    h = _dca_mix_hg_cg(h)
                 h = self._graph_swa_step(blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], b)
                 ring_idx += 1
-                if use_ar:
+                if use_ar or use_dca:
                     hist.append(h)
 
-            h_long_in = m.attnres_mixers[0](h, hist) if (use_ar and m.attnres_mixers is not None) else h
+            if use_dca:
+                h = _dca_mix_hg_cg(h)
+                h_long_in = h
+            elif use_ar and m.attnres_mixers is not None:
+                h_long_in = m.attnres_mixers[0](h, hist)
+            else:
+                h_long_in = h
             h_split = m.split_norm(h_long_in)
             c_out = self._graph_crystal_step(m.crystal, h_split, h_lex_t, state.crystal_1, b.c1_sc, c1_p)
             w_out, u_ws = self._graph_woodbury_step(m.woodbury, h_split, h_lex_t, state.woodbury_slow, b.ws_sc, ws_p)
@@ -3006,31 +3221,47 @@ class CalciteStreamEngine:
                     m.epistemic_slots, h_split, u_ws, h_lex_t, state.epistemic_slots
                 )
             h = h + delta_l
-            if use_ar:
+            if use_ar or use_dca:
                 hist.append(h)
 
-            h_mid_in = m.attnres_mixers[1](h, hist) if (use_ar and m.attnres_mixers is not None) else h
+            if use_dca:
+                h = _dca_mix_hg_cg(h)
+                h_mid_in = h
+            elif use_ar and m.attnres_mixers is not None:
+                h_mid_in = m.attnres_mixers[1](h, hist)
+            else:
+                h_mid_in = h
             h = h + m.mid_mlp(m.mid_mlp_norm(h_mid_in))
-            if use_ar:
+            if use_ar or use_dca:
                 hist.append(h)
 
-            h_c2_in = m.attnres_mixers[2](h, hist) if (use_ar and m.attnres_mixers is not None) else h
+            if use_dca:
+                h = _dca_mix_hg_cg(h)
+                h_c2_in = h
+            elif use_ar and m.attnres_mixers is not None:
+                h_c2_in = m.attnres_mixers[2](h, hist)
+            else:
+                h_c2_in = h
             c2_in = m.cryst2_norm(h_c2_in)
             h = h + (2.0 * torch.sigmoid(m.cryst2_gate(c2_in))) * self._graph_crystal_step(
                 m.crystal_2, c2_in, h_lex_t, state.crystal_2, b.c2_sc, c2_p
             )
-            if use_ar:
+            if use_ar or use_dca:
                 hist.append(h)
 
             for pi, blk in enumerate(m.cortex_post):
-                if use_ar and m.attnres_mixers is not None:
+                if use_dca:
+                    h = _dca_mix_hg_cg(h)
+                elif use_ar and m.attnres_mixers is not None:
                     h = m.attnres_mixers[3 + pi](h, hist)
                 h = self._graph_swa_step(blk, h, state.swa_k_rings[ring_idx], state.swa_v_rings[ring_idx], b)
                 ring_idx += 1
-                if use_ar:
+                if use_ar or use_dca:
                     hist.append(h)
 
-            if use_ar and m.attnres_mixers is not None:
+            if use_dca:
+                h = _dca_mix_hg_cg(h)
+            elif use_ar and m.attnres_mixers is not None:
                 h = m.attnres_mixers[-1](h, hist)
 
         b.z_hat_out.copy_(h)

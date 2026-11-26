@@ -113,6 +113,14 @@ def _make_v31_tiny_cfg(
     d_model: int = 128,
     n_heads: int = 2,
     d_ff: int = 256,
+    topology: str = "hourglass",
+    window_size: int = 8,
+    byte_swa_window: int = 24,
+    byte_swa_dim: int = 64,
+    engram_slots: int = 512,
+    engram_dim: int = 16,
+    engram_use_4gram: bool = False,
+    use_dca: bool = False,
     use_fast_kernels: bool = True,
     byte_induct_slots: int = 128,
     dec_dw3_enabled: bool = True,
@@ -126,7 +134,7 @@ def _make_v31_tiny_cfg(
         d_ff=d_ff,
         n_layers_pre=2,
         n_layers_post=2,
-        window_size=8,
+        window_size=window_size,
         num_spheres=8,
         d_sphere=32,
         codebook_size=16,
@@ -140,24 +148,26 @@ def _make_v31_tiny_cfg(
         byte_router_hidden=32,
         byte_chunk_mode="utf8",
         use_static_m_cap=True,
-        topology="hourglass",
+        topology=topology,
         use_scaled_decoder=True,
         use_kalman_precond=False,
         use_latent_feedback=False,
         use_clean_gates=False,
         use_fast_kernels=use_fast_kernels,
         use_sym_byte_swa=True,
-        byte_swa_window=24,
-        byte_swa_dim=64,
+        byte_swa_window=byte_swa_window,
+        byte_swa_dim=byte_swa_dim,
         use_byte_engram=True,
-        engram_slots=512,
-        engram_dim=16,
+        engram_slots=engram_slots,
+        engram_dim=engram_dim,
+        engram_use_4gram=engram_use_4gram,
         use_byte_induct_cache=True,
         byte_induct_slots=byte_induct_slots,
         byte_induct_dim=16,
         dec_dw3_enabled=dec_dw3_enabled,
         dw_bottleneck_ratio=dw_bottleneck_ratio,
         bf16_residual_stream=bf16_residual_stream,
+        use_dca=use_dca,
     )
 
 
@@ -1017,3 +1027,523 @@ def test_wave3_experiment_velocity_and_agents_guardrail(tmp_path: Path) -> None:
     assert sz <= AGENTS_MD_MAX_BYTES
     n_md = check_markdown_quarantine(ROOT_DIR)
     assert n_md >= 1
+
+
+def test_phase_p_dca_init_ram_lut_immunity_and_streaming() -> None:
+    torch.manual_seed(401)
+    assert CalciteV2Config().use_dca is False
+
+    # Mutual exclusion with legacy static AttnRes
+    bad_cfg = _make_v31_tiny_cfg(use_fast_kernels=False, use_dca=True)
+    bad_cfg.use_attnres = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        CalciteV2LM(bad_cfg)
+
+    utf8_s = "Calcite v3.2 DCA parity check: Привет, мир! 東京 🚀 key=P4DCA99. " * 4
+    x = torch.tensor([[b + 3 for b in utf8_s.encode("utf-8")][:160]], dtype=torch.long)
+    y = torch.roll(x, shifts=-1, dims=1)
+    binfo = get_lut_backend_info()
+
+    for topo in ("hourglass", "interleaved"):
+        cfg_base = _make_v31_tiny_cfg(
+            topology=topo, use_fast_kernels=False, dw_bottleneck_ratio=0.5, use_dca=False
+        )
+        cfg_dca = _make_v31_tiny_cfg(
+            topology=topo, use_fast_kernels=False, dw_bottleneck_ratio=0.5, use_dca=True
+        )
+        m_base = CalciteV2LM(cfg_base).eval()
+        m_dca = CalciteV2LM(cfg_dca).eval()
+        missing, unexpected = m_dca.load_state_dict(m_base.state_dict(), strict=False)
+        assert not unexpected and len(missing) > 0 and all("dca_mixers" in k for k in missing)
+        for mod in (m_base, m_dca):
+            mod.byte_chunker.lock_router(True)
+            mod.set_crystal_schedule(1, 1)
+            mod.set_snap_alpha(1.0)
+
+        # 1. Gate-2 init-std <= 1.05 & exact +0 B O(1) RAM
+        with torch.no_grad():
+            lg_base = m_base(x[:, :96])
+            lg_dca = m_dca(x[:, :96])
+        std_b = float(lg_base.float().std().item())
+        std_d = float(lg_dca.float().std().item())
+        std_ratio = max(std_d / max(1e-6, std_b), std_b / max(1e-6, std_d))
+        assert std_ratio <= 1.05, f"DCA ({topo}) Gate-2 init-std ratio > 1.05: {std_ratio:.4f}"
+
+        assert compute_v2_state_cache_kb(cfg_dca, 32768) == compute_v2_state_cache_kb(cfg_base, 32768)
+        mem_base = CalciteStreamEngine(m_base).init_state(1, torch.device("cpu"), torch.float32).memory_bytes()
+        mem_dca = CalciteStreamEngine(m_dca).init_state(1, torch.device("cpu"), torch.float32).memory_bytes()
+        assert mem_dca == mem_base, f"DCA ({topo}) added persistent streaming RAM: {mem_dca} vs {mem_base}"
+
+        # 2. Two-step live gradient check (w_dyn=0 -> step 0 updates w_dyn/b_stat, step 1 updates norm.weight)
+        m_tr = copy.deepcopy(m_dca).train()
+        opt = torch.optim.SGD(m_tr.parameters(), lr=0.05)
+        assert m_tr.dca_mixers is not None
+        for step_i in range(2):
+            opt.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(m_tr(x[:, :64]).reshape(-1, 259), y[:, :64].reshape(-1))
+            loss.backward()
+            for dm in m_tr.dca_mixers:
+                assert dm.w_dyn.grad is not None and torch.isfinite(dm.w_dyn.grad).all()
+                assert dm.b_stat.grad is not None and torch.isfinite(dm.b_stat.grad).all()
+                assert float(dm.w_dyn.grad.abs().max().item()) > 0.0
+                if step_i == 1:
+                    assert dm.norm.weight.grad is not None and float(dm.norm.weight.grad.abs().max().item()) > 0.0
+            opt.step()
+
+        # 3. Activate non-trivial input-dependent DCA routing and verify FP immunity to 2-bit LUT packing
+        assert m_dca.dca_mixers is not None
+        with torch.no_grad():
+            for dm in m_dca.dca_mixers:
+                dm.w_dyn.normal_(mean=0.0, std=0.25)
+                dm.b_stat.normal_(mean=0.0, std=0.5)
+        w_snap = [dm.w_dyn.detach().clone() for dm in m_dca.dca_mixers]
+        b_snap = [dm.b_stat.detach().clone() for dm in m_dca.dca_mixers]
+
+        m_dca_lut = pack_fast_model_2bit_lut(m_dca, backend="auto").eval()
+        assert m_dca_lut.dca_mixers is not None and len(m_dca_lut.dca_mixers) == len(m_dca.dca_mixers)
+        for dm_l, ws, bs in zip(m_dca_lut.dca_mixers, w_snap, b_snap):
+            assert not any(
+                isinstance(sub, (FastPackedLUT2BitLinear, PackedLUT2BitLinear)) for sub in dm_l.modules()
+            )
+            assert dm_l.w_dyn.is_floating_point() and dm_l.b_stat.is_floating_point()
+            assert torch.equal(dm_l.w_dyn.detach(), ws)
+            assert torch.equal(dm_l.b_stat.detach(), bs)
+
+        # 4. Exact stream == forward (prefill + step + O(1) RAM) on FP, CPU LUT, and GPU CUDA Graph LUT
+        for tag, mod in (("FP", m_dca), ("LUT", m_dca_lut)):
+            with torch.no_grad():
+                lg_fwd = mod(x)
+                eng = CalciteStreamEngine(mod)
+                lg_pre, st = eng.prefill(x[:, :120], return_all_logits=True)
+                mem0 = st.memory_bytes()
+                steps = []
+                for t in range(120, 160):
+                    lt, st = eng.step(x[:, t], st)
+                    steps.append(lt)
+                mem1 = st.memory_bytes()
+                lg_str = torch.cat([lg_pre, torch.stack(steps, dim=1)], dim=1)
+            err = float((lg_fwd - lg_str).abs().max().item())
+            assert mem0 == mem1 == mem_base, f"DCA/{topo}/{tag} O(1) +0 B violation: {mem0}/{mem1} vs {mem_base}"
+            assert err < 2e-5, f"DCA/{topo}/{tag} prefill+step parity failed: {err:.3e}"
+
+        if torch.cuda.is_available() and binfo["cuda_ext_available"]:
+            m_gpu = pack_fast_model_2bit_lut(m_dca, backend="cuda_ext").cuda().eval()
+            xg = x[:, :96].cuda()
+            with torch.no_grad():
+                lg_gf = m_gpu(xg)
+                eng_g = CalciteStreamEngine(m_gpu, use_cuda_graph=True)
+                lg_gp, st_g = eng_g.prefill(xg[:, :64], return_all_logits=True)
+                mem_g0 = st_g.memory_bytes()
+                g_steps = []
+                for t in range(64, 96):
+                    lt, st_g = eng_g.step(xg[:, t], st_g)
+                    g_steps.append(lt)
+                mem_g1 = st_g.memory_bytes()
+                lg_gs = torch.cat([lg_gp, torch.stack(g_steps, dim=1)], dim=1)
+                eng_g.enable_cuda_graph(False, state=st_g)
+            assert mem_g0 == mem_g1 == mem_base
+            assert float((lg_gf - lg_gs).abs().max().item()) < 2e-5
+
+
+def test_phase_p_engram_4gram_8k_parity_ram_and_compat() -> None:
+    torch.manual_seed(402)
+    assert CalciteV2Config().engram_use_4gram is False
+
+    utf8_s = "Calcite v3.2 ByteEngram 4-gram check: Привет, мир! 東京 🚀 code=A7B8C9D0. " * 4
+    x = torch.tensor([[b + 3 for b in utf8_s.encode("utf-8")][:160]], dtype=torch.long)
+    binfo = get_lut_backend_info()
+
+    # 1. Bit-exact default backward compatibility when engram_use_4gram=False
+    cfg_3g = _make_v31_tiny_cfg(
+        use_fast_kernels=False, dw_bottleneck_ratio=0.5, engram_slots=8192, engram_use_4gram=False
+    )
+    m_3g = CalciteV2LM(cfg_3g).eval()
+    m_3g.byte_chunker.lock_router(True)
+    m_3g.set_crystal_schedule(1, 1)
+    m_3g.set_snap_alpha(1.0)
+    assert m_3g.byte_chunker.engram_emb4 is None
+    assert m_3g.byte_chunker.engram_ring_len == 3
+    sd_3g = m_3g.state_dict()
+    assert "byte_chunker.engram_emb4.weight" not in sd_3g
+    m_3g_reload = CalciteV2LM(cfg_3g).eval()
+    m_3g_reload.load_state_dict(sd_3g, strict=True)
+    m_3g_reload.byte_chunker.lock_router(True)
+    m_3g_reload.set_crystal_schedule(1, 1)
+    m_3g_reload.set_snap_alpha(1.0)
+    with torch.no_grad():
+        assert float((m_3g(x) - m_3g_reload(x)).abs().max().item()) == 0.0
+    st_3g = CalciteStreamEngine(m_3g).init_state(1, torch.device("cpu"), torch.float32)
+    assert st_3g.chunker.ring_tok3.shape == (1, 3)
+    mem_3g = st_3g.memory_bytes()
+
+    # 2. engram_use_4gram=True (slots=8192): +8 B O(1) RAM, active 4-gram signal, stream == forward (< 2e-5)
+    cfg_4g = _make_v31_tiny_cfg(
+        use_fast_kernels=False, dw_bottleneck_ratio=0.5, engram_slots=8192, engram_use_4gram=True
+    )
+    m_4g = CalciteV2LM(cfg_4g).eval()
+    missing, unexpected = m_4g.load_state_dict(sd_3g, strict=False)
+    assert missing == ["byte_chunker.engram_emb4.weight"] and not unexpected
+    m_4g.byte_chunker.lock_router(True)
+    m_4g.set_crystal_schedule(1, 1)
+    m_4g.set_snap_alpha(1.0)
+    assert m_4g.byte_chunker.engram_emb4 is not None
+    assert tuple(m_4g.byte_chunker.engram_emb4.weight.shape) == (8192, 16)
+    assert m_4g.byte_chunker.engram_ring_len == 4
+
+    assert (compute_v2_state_cache_kb(cfg_4g, 32768) - compute_v2_state_cache_kb(cfg_3g, 32768)) == pytest.approx(
+        8.0 / 1024.0, abs=1e-6
+    )
+    assert m_4g.byte_chunker.compute_state_bytes() - m_3g.byte_chunker.compute_state_bytes() == 8
+    st_4g = CalciteStreamEngine(m_4g).init_state(1, torch.device("cpu"), torch.float32)
+    assert st_4g.chunker.ring_tok3.shape == (1, 4)
+    mem_4g = st_4g.memory_bytes()
+    assert mem_4g - mem_3g == 8
+
+    # Confirm 4-gram table actively affects logits vs 3-gram-only baseline
+    with torch.no_grad():
+        assert float((m_4g(x) - m_3g(x)).abs().max().item()) > 1e-4
+
+    m_4g_lut = pack_fast_model_2bit_lut(m_4g, backend="auto").eval()
+    for tag, mod in (("FP", m_4g), ("LUT", m_4g_lut)):
+        with torch.no_grad():
+            lg_fwd = mod(x)
+            eng = CalciteStreamEngine(mod)
+            lg_pre, st = eng.prefill(x[:, :120], return_all_logits=True)
+            mem0 = st.memory_bytes()
+            steps = []
+            for t in range(120, 160):
+                lt, st = eng.step(x[:, t], st)
+                steps.append(lt)
+            mem1 = st.memory_bytes()
+            lg_str = torch.cat([lg_pre, torch.stack(steps, dim=1)], dim=1)
+        err = float((lg_fwd - lg_str).abs().max().item())
+        assert mem0 == mem1 == mem_4g, f"Engram4g/{tag} O(1) RAM fail: {mem0} vs {mem1} vs {mem_4g}"
+        assert err < 2e-5, f"Engram4g/{tag} prefill+step parity failed: {err:.3e}"
+
+    if torch.cuda.is_available() and binfo["cuda_ext_available"]:
+        m_gpu = pack_fast_model_2bit_lut(m_4g, backend="cuda_ext").cuda().eval()
+        xg = x[:, :96].cuda()
+        with torch.no_grad():
+            lg_gf = m_gpu(xg)
+            eng_g = CalciteStreamEngine(m_gpu, use_cuda_graph=True)
+            lg_gp, st_g = eng_g.prefill(xg[:, :64], return_all_logits=True)
+            mem_g0 = st_g.memory_bytes()
+            g_steps = []
+            for t in range(64, 96):
+                lt, st_g = eng_g.step(xg[:, t], st_g)
+                g_steps.append(lt)
+            mem_g1 = st_g.memory_bytes()
+            lg_gs = torch.cat([lg_gp, torch.stack(g_steps, dim=1)], dim=1)
+            eng_g.enable_cuda_graph(False, state=st_g)
+        assert mem_g0 == mem_g1 == mem_4g
+        assert float((lg_gf - lg_gs).abs().max().item()) < 2e-5
+
+
+def test_phase_p_byte_swa32_h4_and_chunk_w16_cuda_dispatch_and_stream() -> None:
+    import calcite_v2.chunker as ch_mod
+    import calcite_v2.model as mod_mod
+
+    torch.manual_seed(403)
+    utf8_s = "Calcite v3.2 SWA W=16 + ByteSWA W=32 D=128 (4x32): Привет, мир! 東京 🚀 0123456789. " * 4
+    x = torch.tensor([[b + 3 for b in utf8_s.encode("utf-8")][:180]], dtype=torch.long)
+    binfo = get_lut_backend_info()
+
+    cfg_base = _make_v31_tiny_cfg(use_fast_kernels=False, dw_bottleneck_ratio=0.5)
+    cfg_w16 = _make_v31_tiny_cfg(use_fast_kernels=False, dw_bottleneck_ratio=0.5, window_size=16)
+    cfg_bswa = _make_v31_tiny_cfg(
+        use_fast_kernels=False, dw_bottleneck_ratio=0.5, byte_swa_window=32, byte_swa_dim=128
+    )
+    cfg_both = _make_v31_tiny_cfg(
+        use_fast_kernels=True,
+        dw_bottleneck_ratio=0.5,
+        window_size=16,
+        byte_swa_window=32,
+        byte_swa_dim=128,
+    )
+
+    # 1. Exact head-split & O(1) cache math
+    m_bswa = CalciteV2LM(cfg_bswa).eval()
+    assert m_bswa.byte_chunker.byte_swa_heads == 4
+    assert m_bswa.byte_chunker.byte_swa_head_dim == 32
+    assert (compute_v2_state_cache_kb(cfg_bswa, 32768) - compute_v2_state_cache_kb(cfg_base, 32768)) == pytest.approx(
+        10.0, abs=1e-6
+    )
+    # 4 SWA layers * 2 (K+V) * (16 - 8) * d_model(128) * 2 B = 16,384 B = +16.0 KB
+    assert (compute_v2_state_cache_kb(cfg_w16, 32768) - compute_v2_state_cache_kb(cfg_base, 32768)) == pytest.approx(
+        16.0, abs=1e-6
+    )
+
+    # 2. Exact stream == forward (< 2e-5) for W=16, ByteSWA 32/128 (4x32), and combo (FP + LUT + GPU CG)
+    for tag, cfg_a in (("P1_w16", cfg_w16), ("P2_bswa32_h4", cfg_bswa)):
+        m = CalciteV2LM(cfg_a).eval()
+        m.byte_chunker.lock_router(True)
+        m.set_crystal_schedule(1, 1)
+        m.set_snap_alpha(1.0)
+        m_lut = pack_fast_model_2bit_lut(m, backend="auto").eval()
+        for mtag, mod in (("FP", m), ("LUT", m_lut)):
+            with torch.no_grad():
+                lg_fwd = mod(x)
+                eng = CalciteStreamEngine(mod)
+                lg_pre, st = eng.prefill(x[:, :136], return_all_logits=True)
+                mem0 = st.memory_bytes()
+                steps = []
+                for t in range(136, 180):
+                    lt, st = eng.step(x[:, t], st)
+                    steps.append(lt)
+                mem1 = st.memory_bytes()
+                lg_str = torch.cat([lg_pre, torch.stack(steps, dim=1)], dim=1)
+            err = float((lg_fwd - lg_str).abs().max().item())
+            assert mem0 == mem1, f"{tag}/{mtag} violated O(1) RAM: {mem0} != {mem1}"
+            assert err < 2e-5, f"{tag}/{mtag} stream parity failed: {err:.3e}"
+
+        if torch.cuda.is_available() and binfo["cuda_ext_available"]:
+            m_gpu = pack_fast_model_2bit_lut(m, backend="cuda_ext").cuda().eval()
+            xg = x[:, :128].cuda()
+            with torch.no_grad():
+                lg_gf = m_gpu(xg)
+                eng_g = CalciteStreamEngine(m_gpu, use_cuda_graph=True)
+                lg_gp, st_g = eng_g.prefill(xg[:, :88], return_all_logits=True)
+                mem_g0 = st_g.memory_bytes()
+                g_steps = []
+                for t in range(88, 128):
+                    lt, st_g = eng_g.step(xg[:, t], st_g)
+                    g_steps.append(lt)
+                mem_g1 = st_g.memory_bytes()
+                lg_gs = torch.cat([lg_gp, torch.stack(g_steps, dim=1)], dim=1)
+                eng_g.enable_cuda_graph(False, state=st_g)
+            assert mem_g0 == mem_g1
+            assert float((lg_gf - lg_gs).abs().max().item()) < 2e-5
+
+    # 3. Native CUDA SWA dispatch check for BOTH chunk (D=64, W=16) and byte (4xD=32, W=32)
+    if torch.cuda.is_available() and _load_swa_chunker_cuda_ext() is not None:
+        m_cu = CalciteV2LM(cfg_both).cuda().train()
+        m_cu.byte_chunker.lock_router(True)
+        m_cu.set_crystal_schedule(1, 1)
+        m_cu.set_snap_alpha(1.0)
+        m_ref = copy.deepcopy(m_cu).eval()
+        m_ref.set_fast_kernels(False)
+
+        chunk_calls: list[tuple[int, int, int]] = []
+        byte_calls: list[tuple[int, int, int]] = []
+        orig_mod_fn = mod_mod.fast_swa_rope_attn_cuda
+        orig_ch_fn = ch_mod.fast_swa_rope_attn_cuda
+
+        def _spy_mod(qkv, cos, sin, win):
+            chunk_calls.append((int(qkv.size(3)), int(qkv.size(4)), int(win)))
+            return orig_mod_fn(qkv, cos, sin, win)
+
+        def _spy_ch(qkv, cos, sin, win):
+            byte_calls.append((int(qkv.size(3)), int(qkv.size(4)), int(win)))
+            return orig_ch_fn(qkv, cos, sin, win)
+
+        xg = x.cuda()
+        yg = torch.roll(xg, shifts=-1, dims=1)
+        mod_mod.fast_swa_rope_attn_cuda = _spy_mod
+        ch_mod.fast_swa_rope_attn_cuda = _spy_ch
+        try:
+            m_cu.eval()
+            with torch.no_grad():
+                lg_cu = m_cu(xg)
+                lg_sdpa = m_ref(xg)
+            assert chunk_calls == [(2, 64, 16)] * 4, f"Expected 4x native chunk SWA (2,64,16), got {chunk_calls}"
+            assert byte_calls == [(4, 32, 32)], f"Expected 1x native byte SWA (4,32,32), got {byte_calls}"
+            assert float((lg_cu - lg_sdpa).abs().max().item()) < 2e-5
+
+            m_cu.train()
+            lg_tr = m_cu(xg)
+            F.cross_entropy(lg_tr.reshape(-1, 259), yg.reshape(-1)).backward()
+            assert m_cu.byte_chunker.byte_swa_qkv is not None
+            assert m_cu.byte_chunker.byte_swa_qkv.weight.grad is not None
+            assert torch.isfinite(m_cu.byte_chunker.byte_swa_qkv.weight.grad).all()
+            assert m_cu.cortex_pre[0].attn.qkv.weight.grad is not None
+            assert torch.isfinite(m_cu.cortex_pre[0].attn.qkv.weight.grad).all()
+        finally:
+            mod_mod.fast_swa_rope_attn_cuda = orig_mod_fn
+            ch_mod.fast_swa_rope_attn_cuda = orig_ch_fn
+
+
+def test_phase_p2_stage_toggles_and_bic_2048_slots() -> None:
+    from calcite_v2.model import build_calcite_v2_tier_config
+
+    torch.manual_seed(404)
+    utf8_s = "Calcite v4 Stage-2 toggles & 2048-slot BIC check: Привет, мир! 東京 🚀 key=V4K2048. " * 4
+    x = torch.tensor([[b + 3 for b in utf8_s.encode("utf-8")][:144]], dtype=torch.long)
+    y = torch.roll(x, shifts=-1, dims=1)
+    binfo = get_lut_backend_info()
+
+    # 1. set_dca_active(False) & set_bic_active(False): exact 0.0 bypass parity, zero leaked grads, cleared aux loss
+    for topo in ("hourglass", "interleaved"):
+        cfg_full = _make_v31_tiny_cfg(
+            topology=topo,
+            use_fast_kernels=False,
+            dw_bottleneck_ratio=0.5,
+            use_dca=True,
+            byte_induct_slots=128,
+        )
+        cfg_nodca = copy.deepcopy(cfg_full)
+        cfg_nodca.use_dca = False
+        cfg_nobic = copy.deepcopy(cfg_full)
+        cfg_nobic.use_byte_induct_cache = False
+        cfg_neither = copy.deepcopy(cfg_full)
+        cfg_neither.use_dca = False
+        cfg_neither.use_byte_induct_cache = False
+
+        m_full = CalciteV2LM(cfg_full).train()
+        assert m_full.dca_mixers is not None and m_full.byte_chunker.byte_induct_cache is not None
+        with torch.no_grad():
+            for dm in m_full.dca_mixers:
+                dm.w_dyn.normal_(mean=0.0, std=0.25)
+                dm.b_stat.normal_(mean=0.0, std=0.5)
+        m_full.byte_chunker.lock_router(True)
+        m_full.set_crystal_schedule(1, 1)
+        m_full.set_snap_alpha(1.0)
+        sd_full = m_full.state_dict()
+
+        def _make_twin(cfg_t: CalciteV2Config) -> CalciteV2LM:
+            mt = CalciteV2LM(cfg_t).eval()
+            mt.load_state_dict(
+                {k: v for k, v in sd_full.items() if k in mt.state_dict()}, strict=True
+            )
+            mt.byte_chunker.lock_router(True)
+            mt.set_crystal_schedule(1, 1)
+            mt.set_snap_alpha(1.0)
+            return mt
+
+        m_nodca = _make_twin(cfg_nodca)
+        m_nobic = _make_twin(cfg_nobic)
+        m_neither = _make_twin(cfg_neither)
+
+        # Populate BIC aux loss while active, then verify set_bic_active(False) clears it
+        _ = m_full(x[:, :64])
+        assert m_full.byte_chunker.byte_induct_cache.last_aux_loss is not None
+        m_full.set_bic_active(False)
+        assert m_full.byte_chunker.byte_induct_cache.last_aux_loss is None
+
+        m_full.eval()
+        with torch.no_grad():
+            m_full.set_dca_active(False)
+            m_full.set_bic_active(True)
+            assert float((m_full(x[:, :96]) - m_nodca(x[:, :96])).abs().max().item()) == 0.0
+
+            m_full.set_dca_active(True)
+            m_full.set_bic_active(False)
+            assert float((m_full(x[:, :96]) - m_nobic(x[:, :96])).abs().max().item()) == 0.0
+
+            m_full.set_dca_active(False)
+            m_full.set_bic_active(False)
+            assert float((m_full(x[:, :96]) - m_neither(x[:, :96])).abs().max().item()) == 0.0
+
+        # Stage-1A isolation backward check: zero/None grads on bypassed DCA and BIC
+        m_full.train()
+        m_full.zero_grad(set_to_none=True)
+        lg_s1a = m_full(x[:, :64])
+        loss_s1a = F.cross_entropy(lg_s1a.reshape(-1, 259), y[:, :64].reshape(-1)) + 0.04 * m_full.get_commitment_loss()
+        loss_s1a.backward()
+        assert m_full.byte_chunker.byte_induct_cache.last_aux_loss is None
+        assert all(p.grad is None for p in m_full.dca_mixers.parameters())
+        assert all(p.grad is None for p in m_full.byte_chunker.byte_induct_cache.parameters())
+
+        # Stage-3 QAT frozen-DCA guard: DCA active in forward while requires_grad=False keeps params unchanged
+        m_full.set_dca_active(True)
+        m_full.set_bic_active(True)
+        for p in m_full.dca_mixers.parameters():
+            p.requires_grad_(False)
+        m_full.zero_grad(set_to_none=True)
+        lg_q = m_full(x[:, :64])
+        F.cross_entropy(lg_q.reshape(-1, 259), y[:, :64].reshape(-1)).backward()
+        assert all(p.grad is None for p in m_full.dca_mixers.parameters())
+        assert any(
+            p.grad is not None and float(p.grad.abs().max().item()) > 0.0
+            for p in m_full.byte_chunker.byte_induct_cache.parameters()
+        )
+
+    # 2. byte_induct_slots=2048: S2_25M exact O(1) cache KB + stream == forward (< 2e-5) + CUDA scan parity
+    cfg_25m_1k = build_calcite_v2_tier_config(
+        "S2_25M",
+        topology="hourglass",
+        use_scaled_decoder=True,
+        use_kalman_precond=False,
+        use_latent_feedback=False,
+        use_clean_gates=False,
+        window_size=8,
+        use_sym_byte_swa=True,
+        byte_swa_window=24,
+        byte_swa_dim=64,
+        dec_dw3_enabled=True,
+        dw_bottleneck_ratio=0.5,
+        use_byte_engram=True,
+        engram_slots=4096,
+        engram_dim=32,
+        use_byte_induct_cache=True,
+        byte_induct_slots=1024,
+        byte_induct_dim=16,
+        use_dca=True,
+    )
+    cfg_25m_2k = copy.deepcopy(cfg_25m_1k)
+    cfg_25m_2k.byte_induct_slots = 2048
+    kb_1k = compute_v2_state_cache_kb(cfg_25m_1k, 32768)
+    kb_2k = compute_v2_state_cache_kb(cfg_25m_2k, 32768)
+    assert kb_2k - kb_1k == pytest.approx(200.0, abs=1e-4)
+    assert kb_2k == pytest.approx(631.48, abs=0.02)
+
+    cfg_2048 = _make_v31_tiny_cfg(
+        use_fast_kernels=False,
+        dw_bottleneck_ratio=0.5,
+        use_dca=True,
+        byte_induct_slots=2048,
+    )
+    m_2048 = CalciteV2LM(cfg_2048).eval()
+    m_2048.byte_chunker.lock_router(True)
+    m_2048.set_crystal_schedule(1, 1)
+    m_2048.set_snap_alpha(1.0)
+    m_2048_lut = pack_fast_model_2bit_lut(m_2048, backend="auto").eval()
+    for tag, mod in (("FP", m_2048), ("LUT", m_2048_lut)):
+        with torch.no_grad():
+            lg_fwd = mod(x)
+            eng = CalciteStreamEngine(mod)
+            lg_pre, st = eng.prefill(x[:, :104], return_all_logits=True)
+            mem0 = st.memory_bytes()
+            steps = []
+            for t in range(104, 144):
+                lt, st = eng.step(x[:, t], st)
+                steps.append(lt)
+            mem1 = st.memory_bytes()
+            lg_str = torch.cat([lg_pre, torch.stack(steps, dim=1)], dim=1)
+        assert mem0 == mem1, f"BIC-2048/{tag} violated O(1) RAM: {mem0} != {mem1}"
+        assert float((lg_fwd - lg_str).abs().max().item()) < 2e-5
+
+    if torch.cuda.is_available() and fast_bic_scan_available():
+        sq_c = torch.randint(0, 2048, (2, 128, 2), device="cuda", dtype=torch.long)
+        sw_c = torch.randint(0, 2048, (2, 128, 2), device="cuda", dtype=torch.long)
+        bt_vals = torch.rand(2, 128, 2, device="cuda") * 0.9
+        bt_vals[:, 0, :] = 0.0
+        bt_cu = bt_vals.clone().requires_grad_(True)
+        u_cu = torch.randn(2, 128, 2, 25, device="cuda", requires_grad=True)
+        bt_ref = bt_vals.clone().requires_grad_(True)
+        u_ref = u_cu.detach().clone().requires_grad_(True)
+        out_cu = fast_bic_scan_cuda(sq_c, sw_c, bt_cu, u_cu, n_slots=2048)
+        out_ref = _seq_bic_reference(sq_c, sw_c, bt_ref, u_ref, n_slots=2048)
+        assert float((out_cu - out_ref).abs().max().item()) < 1e-5
+        go = torch.randn_like(out_cu)
+        (out_cu * go).sum().backward()
+        (out_ref * go).sum().backward()
+        assert float((bt_cu.grad - bt_ref.grad).abs().max().item()) < 1e-5
+        assert float((u_cu.grad - u_ref.grad).abs().max().item()) < 1e-5
+
+    if torch.cuda.is_available() and binfo["cuda_ext_available"]:
+        m_gpu = pack_fast_model_2bit_lut(m_2048, backend="cuda_ext").cuda().eval()
+        xg = x[:, :96].cuda()
+        with torch.no_grad():
+            lg_gf = m_gpu(xg)
+            eng_g = CalciteStreamEngine(m_gpu, use_cuda_graph=True)
+            lg_gp, st_g = eng_g.prefill(xg[:, :64], return_all_logits=True)
+            mg0 = st_g.memory_bytes()
+            g_steps = []
+            for t in range(64, 96):
+                lt, st_g = eng_g.step(xg[:, t], st_g)
+                g_steps.append(lt)
+            mg1 = st_g.memory_bytes()
+            lg_gs = torch.cat([lg_gp, torch.stack(g_steps, dim=1)], dim=1)
+            eng_g.enable_cuda_graph(False, state=st_g)
+        assert mg0 == mg1
+        assert float((lg_gf - lg_gs).abs().max().item()) < 2e-5
